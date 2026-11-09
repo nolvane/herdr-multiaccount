@@ -32,3 +32,5 @@ All notable changes to this project are documented here. The format follows
 - Setup of the `claude` shell function and the status line wrapper, and its
   undo.
 - Account labels for spaces and Claude Code panes in Herdr's sidebar.
+- The keys overlay (`?`) shows the version and links to the repository
+  (#1).

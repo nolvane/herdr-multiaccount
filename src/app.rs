@@ -56,7 +56,20 @@ pub enum Hit {
     Row(usize),
     PickRow(usize),
     Key(char),
+    /// The repository link in the keys overlay's bottom border.
+    Link,
 }
+
+/// Runs the system's opener (first argument) on a web link, true when it
+/// could be started. Replaceable, so tests open nothing.
+pub type Opener = fn(&str, &str) -> bool;
+
+/// The program that opens links: `open` on macOS, `xdg-open` elsewhere.
+const OPENER: &str = if cfg!(target_os = "macos") {
+    "open"
+} else {
+    "xdg-open"
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AddKind {
@@ -203,6 +216,7 @@ pub struct App {
     pub signin: Option<SignIn>,
     pub quit: bool,
     pub hits: Vec<(Rect, Hit)>,
+    pub opener: Opener,
     pub cwd: Option<String>,
     pub read_at: Instant,
     next_files: Instant,
@@ -245,6 +259,7 @@ impl App {
             signin: None,
             quit: false,
             hits: vec![],
+            opener: open_in_browser,
             cwd: std::env::current_dir()
                 .ok()
                 .map(|p| p.to_string_lossy().to_string()),
@@ -1344,7 +1359,7 @@ impl App {
                 }
                 KeyCode::Char('o') if code.is_empty() => {
                     if let Some(url) = self.signin.as_ref().and_then(|s| s.url.clone()) {
-                        open_url(&url);
+                        (self.opener)(OPENER, &url);
                     }
                 }
                 KeyCode::Char('y') if code.is_empty() => {
@@ -1481,6 +1496,14 @@ impl App {
                 };
                 self.key(KeyEvent::new(code, KeyModifiers::NONE));
             }
+            Hit::Link => {
+                self.mode = Mode::Normal;
+                if (self.opener)(OPENER, env!("CARGO_PKG_REPOSITORY")) {
+                    self.flash("Opened in the browser", crate::theme::GREEN);
+                } else {
+                    self.flash(format!("Could not run {OPENER}"), crate::theme::RED);
+                }
+            }
         }
     }
 
@@ -1589,18 +1612,15 @@ impl App {
 }
 
 /// Opens a link in the browser.
-fn open_url(url: &str) {
-    let opener = if cfg!(target_os = "macos") {
-        "open"
-    } else {
-        "xdg-open"
-    };
-    let _ = std::process::Command::new(opener)
+/// Starts `opener` (`open`, `xdg-open`) on `url`.
+pub fn open_in_browser(opener: &str, url: &str) -> bool {
+    std::process::Command::new(opener)
         .arg(url)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .spawn();
+        .spawn()
+        .is_ok()
 }
 
 /// Puts text on the clipboard (macOS, or Wayland / X11 tools when there).
@@ -1836,5 +1856,232 @@ mod tests {
             let buffer = format!("{:?}", t.backend().buffer());
             assert!(!buffer.contains("sk-ant"), "a key is never shown");
         }
+    }
+
+    // ---- the repository link in the keys overlay ----------------------
+
+    thread_local! {
+        /// What the test opener was asked to open, per test thread.
+        static OPENED: std::cell::RefCell<Vec<(String, String)>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    /// An opener that starts nothing and only notes what it got.
+    fn opens(opener: &str, url: &str) -> bool {
+        OPENED.with(|o| o.borrow_mut().push((opener.into(), url.into())));
+        true
+    }
+
+    /// An opener that cannot be started.
+    fn cannot_open(opener: &str, url: &str) -> bool {
+        opens(opener, url);
+        false
+    }
+
+    fn opened() -> Vec<(String, String)> {
+        OPENED.with(|o| o.borrow_mut().drain(..).collect())
+    }
+
+    const REPO: &str = "https://github.com/nolvane/herdr-multiaccount";
+
+    /// The keys overlay drawn on a `w`×`h` screen: the app, the rows of the
+    /// screen and the overlay's box.
+    fn help_on(w: u16, h: u16, opener: Opener) -> (App, Vec<String>, Rect, Terminal<TestBackend>) {
+        let mut a = app();
+        a.opener = opener;
+        a.mode = Mode::Help;
+        let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+        t.draw(|f| ui::draw(f, &mut a)).unwrap();
+        let buf = t.backend().buffer().clone();
+        let rows: Vec<String> = (0..h)
+            .map(|y| (0..w).map(|x| buf[(x, y)].symbol().to_string()).collect())
+            .collect();
+        if std::env::var("SHOW_SCREEN").is_ok() {
+            println!("{}", rows.join("\n"));
+        }
+        // The overlay's own target is the last `?` (the footer has one too).
+        let area = a
+            .hits
+            .iter()
+            .rev()
+            .find_map(|(r, h)| (*h == Hit::Key('?')).then_some(*r))
+            .expect("the overlay");
+        (a, rows, area, t)
+    }
+
+    fn link_spot(a: &App) -> Option<Rect> {
+        a.hits
+            .iter()
+            .find_map(|(r, h)| (*h == Hit::Link).then_some(*r))
+    }
+
+    fn row_text(rows: &[String], y: u16) -> String {
+        rows[y as usize].clone()
+    }
+
+    #[test]
+    fn the_overlay_names_version_and_repository_in_its_bottom_border() {
+        let version = env!("CARGO_PKG_VERSION");
+        let (a, rows, area, t) = help_on(160, 40, opens);
+        let bottom = area.bottom() - 1;
+        let full = format!("Herdr Multiaccount {version} · github.com/nolvane/herdr-multiaccount");
+        let line = row_text(&rows, bottom);
+        assert!(line.contains(&full), "{line}");
+        // Starts right after the padding space, two cells past the corner.
+        let start = line.chars().position(|c| c == 'H').unwrap() as u16;
+        assert_eq!(start, area.x + 3, "{line}");
+        let cell = &t.backend().buffer()[(area.x + 3, bottom)];
+        assert!(cell.modifier.contains(ratatui::style::Modifier::UNDERLINED));
+        assert_eq!(cell.fg, crate::theme::ACCENT);
+        // It takes no row of the content: the box is not taller than before.
+        assert!(row_text(&rows, bottom).starts_with(&" ".repeat(area.x as usize)));
+        assert_eq!(link_spot(&a).unwrap().width as usize, full.chars().count());
+    }
+
+    #[test]
+    fn a_narrow_overlay_shortens_the_text_and_keeps_its_corners() {
+        let version = env!("CARGO_PKG_VERSION");
+        let name = format!("Herdr Multiaccount {version}");
+        for (w, want) in [(40, Some(name.as_str())), (20, Some(version)), (10, None)] {
+            let (a, rows, area, _t) = help_on(w, 24, opens);
+            let line = row_text(&rows, area.bottom() - 1);
+            assert!(!line.contains("github.com"), "{w}: {line}");
+            let chars: Vec<char> = line.chars().collect();
+            assert_eq!(chars[area.x as usize], '╰', "{w}: {line}");
+            assert_eq!(chars[(area.right() - 1) as usize], '╯', "{w}: {line}");
+            match want {
+                Some(text) => {
+                    assert!(line.contains(text), "{w}: {line}");
+                    if text == version {
+                        assert!(!line.contains("Herdr"), "{w}: {line}");
+                    }
+                    assert_eq!(link_spot(&a).unwrap().width as usize, text.chars().count());
+                }
+                None => {
+                    assert!(!line.contains(version), "{w}: {line}");
+                    assert_eq!(link_spot(&a), None);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_version_shows_on_a_scrolling_and_a_two_column_overlay() {
+        let version = env!("CARGO_PKG_VERSION");
+        // Low: the content scrolls, the hint stays above the border.
+        let (a, rows, area, _t) = help_on(100, 30, opens);
+        assert!(a.help_max > 0);
+        assert!(row_text(&rows, area.bottom() - 1).contains(&format!("Multiaccount {version}")));
+        assert!(row_text(&rows, area.bottom() - 2).contains("↑ ↓ scroll"));
+        // Wide and low: two columns.
+        let (_a, rows, area, _t) = help_on(130, 30, opens);
+        assert_eq!(area.width, 124, "two columns");
+        assert!(
+            row_text(&rows, area.bottom() - 1).contains("github.com/nolvane/herdr-multiaccount")
+        );
+    }
+
+    #[test]
+    fn clicking_the_version_opens_the_repository() {
+        for end in [false, true] {
+            let (mut a, _rows, _area, _t) = help_on(160, 40, opens);
+            let spot = link_spot(&a).unwrap();
+            let x = if end { spot.right() - 1 } else { spot.x };
+            a.click(x, spot.y);
+            assert_eq!(a.mode, Mode::Normal, "the overlay closes");
+            let opener = if cfg!(target_os = "macos") {
+                "open"
+            } else {
+                "xdg-open"
+            };
+            assert_eq!(opened(), vec![(opener.to_string(), REPO.to_string())]);
+            assert_eq!(
+                a.flash.as_ref().map(|f| f.0.as_str()),
+                Some("Opened in the browser")
+            );
+        }
+    }
+
+    #[test]
+    fn a_failing_opener_is_named_and_the_list_goes_on() {
+        let (mut a, _rows, _area, mut t) = help_on(160, 40, cannot_open);
+        let spot = link_spot(&a).unwrap();
+        a.click(spot.x, spot.y);
+        assert_eq!(a.mode, Mode::Normal);
+        assert_eq!(opened().len(), 1);
+        let opener = if cfg!(target_os = "macos") {
+            "open"
+        } else {
+            "xdg-open"
+        };
+        assert_eq!(
+            a.flash.as_ref().map(|f| f.0.clone()),
+            Some(format!("Could not run {opener}"))
+        );
+        a.key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert_eq!(a.sel, 1, "the list still takes keys");
+        t.draw(|f| ui::draw(f, &mut a)).unwrap();
+    }
+
+    #[test]
+    fn other_clicks_on_the_overlay_only_close_it() {
+        let (mut a, _rows, area, _t) = help_on(160, 40, opens);
+        let spot = link_spot(&a).unwrap();
+        for (x, y) in [
+            (spot.x - 1, spot.y),
+            (spot.right(), spot.y),
+            (area.x + area.width / 2, area.y + 2),
+        ] {
+            a.mode = Mode::Help;
+            a.click(x, y);
+            assert_eq!(a.mode, Mode::Normal, "({x}, {y})");
+        }
+        assert!(opened().is_empty());
+        for code in [
+            KeyCode::Esc,
+            KeyCode::Char('?'),
+            KeyCode::Char('q'),
+            KeyCode::Enter,
+        ] {
+            a.mode = Mode::Help;
+            a.key(KeyEvent::new(code, KeyModifiers::NONE));
+            assert_eq!(a.mode, Mode::Normal, "{code:?}");
+        }
+        assert!(!a.quit);
+        // Scrolling still works on a low screen, with keys and the wheel.
+        let (mut a, _rows, _area, _t) = help_on(100, 30, opens);
+        a.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(a.help_scroll, 1);
+        a.event(Event::Mouse(ratatui::crossterm::event::MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 10,
+            row: 10,
+            modifiers: KeyModifiers::NONE,
+        }));
+        assert_eq!(a.help_scroll, 3);
+        assert!(opened().is_empty());
+    }
+
+    #[test]
+    fn the_sign_in_link_goes_through_the_opener() {
+        let mut a = app();
+        a.opener = opens;
+        a.signin = Some(SignIn::showing("https://example.com/sign-in"));
+        a.mode = Mode::SignIn {
+            code: String::new(),
+        };
+        a.key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE));
+        let opener = if cfg!(target_os = "macos") {
+            "open"
+        } else {
+            "xdg-open"
+        };
+        assert_eq!(
+            opened(),
+            vec![(
+                opener.to_string(),
+                "https://example.com/sign-in".to_string()
+            )]
+        );
     }
 }
