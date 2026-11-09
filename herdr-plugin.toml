@@ -1,0 +1,59 @@
+# Herdr Multiaccount: several Claude accounts side by side, their usage
+# limits, one account per space, and fallback when one is full.
+
+id = "multiaccount"
+name = "Multiaccount"
+version = "1.0.0"
+min_herdr_version = "0.9.0"
+description = "Keeps several Claude accounts side by side: their usage limits, an active account, one account per space, and fallback when one is full"
+platforms = ["linux", "macos"]
+
+# Builds the binary into the plugin root (needs cargo) and copies it to
+# where the claude shell function finds it.
+[[build]]
+command = ["sh", "scripts/build.sh"]
+
+# After Herdr starts: refreshes that copy and the account labels of spaces.
+[[startup]]
+command = ["./herdr-multiaccount", "startup"]
+
+# The list. The "open" action opens it in the focused pane's directory.
+[[panes]]
+id = "list"
+title = "Multiaccount"
+placement = "overlay"
+command = ["./herdr-multiaccount", "list"]
+
+# A reminder that a session moved by fallback can go back to its account.
+[[panes]]
+id = "remind"
+title = "Multiaccount reminder"
+placement = "overlay"
+command = ["./herdr-multiaccount", "remind-pane"]
+
+[[actions]]
+id = "open"
+title = "Multiaccount: open or close"
+description = "Show the Claude accounts, their limits and the spaces that use them"
+contexts = ["global"]
+command = ["./herdr-multiaccount", "open"]
+
+[[actions]]
+id = "open-split"
+title = "Multiaccount: open or close below the pane"
+description = "Show the accounts in a split below the pane"
+contexts = ["global"]
+command = ["./herdr-multiaccount", "open", "split"]
+
+# A pane's account label goes once the Claude Code it was made for ends.
+[[events]]
+on = "pane.agent_detected"
+command = ["./herdr-multiaccount", "pane-event"]
+
+[[events]]
+on = "pane.agent_status_changed"
+command = ["./herdr-multiaccount", "pane-event"]
+
+[[events]]
+on = "pane.exited"
+command = ["./herdr-multiaccount", "pane-event"]

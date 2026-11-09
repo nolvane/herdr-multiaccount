@@ -1,0 +1,1840 @@
+//! The list's state and what the keys and the mouse do.
+
+use crate::config::{self, Config};
+use crate::herdr::{self, Pane, Workspace};
+use crate::info::{self, Info};
+use crate::launch;
+use crate::mirror;
+use crate::paths;
+use crate::secret;
+use crate::setup;
+use crate::signin::SignIn;
+use crate::store::{Account, Kind, Store, MAIN_ID};
+use crate::time;
+use crate::ui;
+use crate::usage::Usage;
+use ratatui::crossterm::event::{
+    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
+};
+use ratatui::layout::Rect;
+use ratatui::style::Color;
+use ratatui::DefaultTerminal;
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::mpsc::{channel, Receiver};
+use std::time::{Duration, Instant};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Section {
+    Accounts,
+    Spaces,
+    Sessions,
+}
+
+impl Section {
+    pub const ORDER: [Section; 3] = [Section::Accounts, Section::Spaces, Section::Sessions];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Section::Accounts => "Accounts",
+            Section::Spaces => "Spaces",
+            Section::Sessions => "Sessions",
+        }
+    }
+
+    fn next(self, by: i32) -> Section {
+        let i = Section::ORDER.iter().position(|s| *s == self).unwrap_or(0) as i32;
+        let n = Section::ORDER.len() as i32;
+        Section::ORDER[(i + by).rem_euclid(n) as usize]
+    }
+}
+
+/// A clickable area.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Hit {
+    Section(Section),
+    Row(usize),
+    PickRow(usize),
+    Key(char),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AddKind {
+    Subscription,
+    SubscriptionSso,
+    ApiKey,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum PickFor {
+    AddKind,
+    Space { workspace: String, label: String },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PickItem {
+    pub label: String,
+    pub detail: String,
+    /// Account id for a space; `None` for "the active account".
+    pub value: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Picker {
+    pub title: String,
+    pub items: Vec<PickItem>,
+    pub sel: usize,
+    pub purpose: PickFor,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum InputFor {
+    NewAccount(AddKind),
+    Rename(String),
+    /// An API key for an account (`id`), or for a new one named `name`.
+    ApiKey {
+        id: Option<String>,
+        name: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Input {
+    pub title: String,
+    pub hint: String,
+    pub text: String,
+    pub purpose: InputFor,
+    /// Shown as dots (an API key).
+    pub secret: bool,
+}
+
+impl Input {
+    fn max_len(&self) -> usize {
+        if self.secret {
+            300
+        } else {
+            40
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ConfirmFor {
+    Remove(String),
+    Setup,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Confirm {
+    pub question: String,
+    pub lines: Vec<String>,
+    pub purpose: ConfirmFor,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Mode {
+    Normal,
+    Help,
+    Pick(Picker),
+    Input(Input),
+    Confirm(Confirm),
+    /// A claude.ai sign-in runs (`App::signin`); `code` is what the page may
+    /// ask to paste back.
+    SignIn {
+        code: String,
+    },
+    /// A note to read, closed with Enter or Esc.
+    Message {
+        title: String,
+        lines: Vec<String>,
+        good: bool,
+    },
+    AskQuit,
+}
+
+type HerdrState = (Option<Vec<Workspace>>, Option<Vec<Pane>>);
+
+/// How the list works, shown on first open and under `?`.
+pub const INTRO: [&str; 6] = [
+    "Main login is the login Claude Code already has in ~/.claude, the one /login sets. This list never changes it; to switch it, run /login in Claude Code.",
+    "Every other account sits next to it in a folder of its own with its own login, and shares your settings, skills, plugins and history.",
+    "New sessions start on the active account; choose it with ⏎. Running sessions keep theirs, and a space can have an account of its own (Spaces).",
+    "When an account is at its limit, new sessions go to the next account in the list that has room (fallback, F).",
+    "Limits come from Claude Code: its /usage, read every minute while this list is open, and the status line of running sessions.",
+    "Sessions shows which account each Claude Code session runs on. ? shows all keys and this note again.",
+];
+
+/// The field an API key is pasted into.
+fn key_input(id: Option<String>, name: String) -> Mode {
+    Mode::Input(Input {
+        title: format!("API key for {name}"),
+        hint: "Paste the key from platform.claude.com (API keys). It is shown as dots and goes straight into the keychain.".into(),
+        text: String::new(),
+        purpose: InputFor::ApiKey { id, name },
+        secret: true,
+    })
+}
+
+pub struct App {
+    pub config: Config,
+    pub dir: PathBuf,
+    pub store: Store,
+    pub usage: HashMap<String, Usage>,
+    /// For each account, the others signed in with the same login.
+    pub twins: HashMap<String, Vec<String>>,
+    pub info: HashMap<String, Info>,
+    pub info_loading: bool,
+    info_rx: Option<Receiver<(String, Info)>>,
+    info_left: usize,
+    herdr_rx: Option<Receiver<HerdrState>>,
+    pub workspaces: Vec<Workspace>,
+    pub panes: Vec<Pane>,
+    pub section: Section,
+    pub sel: usize,
+    pub space_sel: usize,
+    pub session_sel: usize,
+    pub mode: Mode,
+    /// How far the keys are scrolled, and how far they can be (set when
+    /// drawn).
+    pub help_scroll: u16,
+    pub help_max: u16,
+    pub flash: Option<(String, Color, Instant)>,
+    pub setup: setup::State,
+    pub signin: Option<SignIn>,
+    pub quit: bool,
+    pub hits: Vec<(Rect, Hit)>,
+    pub cwd: Option<String>,
+    pub read_at: Instant,
+    next_files: Instant,
+    next_herdr: Instant,
+    next_info: Instant,
+    /// Limit checks through Claude Code's `/usage` (`probe.rs`).
+    probe_rx: Option<Receiver<()>>,
+    pub probing: bool,
+    next_probe: Instant,
+    last_click: Option<(Instant, Hit)>,
+}
+
+impl App {
+    pub fn new(config: Config, dir: PathBuf) -> App {
+        let store = Store::load();
+        let twins = crate::login::twins(&store, &crate::login::all(&store));
+        let usage = launch::load_usage_with(&store, &twins);
+        App {
+            config,
+            dir,
+            store,
+            usage,
+            twins,
+            info: HashMap::new(),
+            info_loading: false,
+            info_rx: None,
+            info_left: 0,
+            herdr_rx: None,
+            workspaces: vec![],
+            panes: vec![],
+            section: Section::Accounts,
+            sel: 0,
+            space_sel: 0,
+            session_sel: 0,
+            mode: Mode::Normal,
+            help_scroll: 0,
+            help_max: 0,
+            flash: None,
+            setup: setup::state(),
+            signin: None,
+            quit: false,
+            hits: vec![],
+            cwd: std::env::current_dir()
+                .ok()
+                .map(|p| p.to_string_lossy().to_string()),
+            read_at: Instant::now(),
+            next_files: Instant::now(),
+            next_herdr: Instant::now(),
+            next_info: Instant::now(),
+            probe_rx: None,
+            probing: false,
+            next_probe: Instant::now(),
+            last_click: None,
+        }
+    }
+
+    // ---- data -------------------------------------------------------
+
+    pub fn now(&self) -> i64 {
+        time::now()
+    }
+
+    pub fn selected(&self) -> Option<&Account> {
+        self.store.accounts.get(self.sel)
+    }
+
+    /// Accounts.json and the usage readings, which the status line writes.
+    fn reload_files(&mut self) {
+        let keep = self.selected().map(|a| a.id.clone());
+        self.store = Store::load();
+        self.twins = crate::login::twins(&self.store, &crate::login::all(&self.store));
+        self.usage = launch::load_usage_with(&self.store, &self.twins);
+        if let Some(id) = keep {
+            if let Some(i) = self.store.accounts.iter().position(|a| a.id == id) {
+                self.sel = i;
+            }
+        }
+        self.sel = self.sel.min(self.store.accounts.len().saturating_sub(1));
+        self.read_at = Instant::now();
+        self.next_files = Instant::now() + Duration::from_secs(3);
+    }
+
+    fn start_herdr(&mut self) {
+        self.next_herdr = Instant::now() + Duration::from_secs(5);
+        if self.herdr_rx.is_some() || !herdr::inside() {
+            return;
+        }
+        let (tx, rx) = channel();
+        std::thread::spawn(move || {
+            let _ = tx.send((herdr::workspaces(), herdr::panes()));
+        });
+        self.herdr_rx = Some(rx);
+    }
+
+    fn receive_herdr(&mut self) {
+        let Some(rx) = &self.herdr_rx else {
+            return;
+        };
+        if let Ok((ws, panes)) = rx.try_recv() {
+            if let Some(ws) = ws {
+                self.workspaces = ws;
+            }
+            if let Some(p) = panes {
+                self.panes = p;
+            }
+            self.space_sel = self.space_sel.min(self.workspaces.len().saturating_sub(1));
+            self.session_sel = self
+                .session_sel
+                .min(self.sessions().len().saturating_sub(1));
+            self.herdr_rx = None;
+        }
+    }
+
+    /// Who each account is signed in as. Slow (Claude Code's command line
+    /// per account), so it runs in threads.
+    pub fn start_info(&mut self) {
+        self.next_info = Instant::now() + Duration::from_secs(600);
+        let (tx, rx) = channel();
+        self.info_left = self.store.accounts.len();
+        for account in self.store.accounts.clone() {
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                let _ = tx.send((account.id.clone(), info::read(&account)));
+            });
+        }
+        self.info_rx = Some(rx);
+        self.info_loading = true;
+    }
+
+    fn receive_info(&mut self) {
+        let Some(rx) = &self.info_rx else {
+            return;
+        };
+        while let Ok((id, info)) = rx.try_recv() {
+            self.info.insert(id, info);
+            self.info_left = self.info_left.saturating_sub(1);
+        }
+        if self.info_left == 0 {
+            self.info_rx = None;
+            self.info_loading = false;
+        }
+    }
+
+    /// The accounts whose limits `/usage` can show: signed-in
+    /// subscriptions, and the main login when it is a claude.ai login.
+    fn probe_targets(&self) -> Vec<(String, Option<PathBuf>)> {
+        self.store
+            .accounts
+            .iter()
+            .filter(|a| {
+                let Some(i) = self.info.get(&a.id) else {
+                    return false;
+                };
+                match a.kind {
+                    Kind::Main => i.signed_in && i.claude_ai,
+                    Kind::Subscription => i.signed_in && !i.borrows_main,
+                    Kind::ApiKey => false,
+                }
+            })
+            .map(|a| {
+                let home = a.kind.has_home().then(|| mirror::home_of(&a.id));
+                (a.id.clone(), home)
+            })
+            .collect()
+    }
+
+    /// Reads the limits of every account through Claude Code's `/usage`,
+    /// one after another in the background.
+    fn start_probe(&mut self) {
+        if self.config.check_limits == 0 || self.probe_rx.is_some() || self.info_loading {
+            return;
+        }
+        self.next_probe = Instant::now() + Duration::from_secs(self.config.check_limits);
+        let targets = self.probe_targets();
+        if targets.is_empty() {
+            return;
+        }
+        let cwd = paths::config_dir().join("probe");
+        let (tx, rx) = channel();
+        std::thread::spawn(move || {
+            for (id, home) in targets {
+                if let Ok(reading) = crate::probe::run(home.as_deref(), &cwd) {
+                    let now = time::now();
+                    let _ = Usage::update(&id, |u| u.record_probe(&reading, now));
+                }
+            }
+            let _ = tx.send(());
+        });
+        self.probe_rx = Some(rx);
+        self.probing = true;
+    }
+
+    fn receive_probe(&mut self) {
+        let Some(rx) = &self.probe_rx else {
+            return;
+        };
+        if rx.try_recv().is_ok() {
+            self.probe_rx = None;
+            self.probing = false;
+            self.reload_files();
+        }
+    }
+
+    /// Claude Code sessions in Herdr, by space and tab.
+    pub fn sessions(&self) -> Vec<Pane> {
+        let order = |ws: &str| {
+            self.workspaces
+                .iter()
+                .find(|w| w.id == ws)
+                .map(|w| w.number)
+                .unwrap_or(u64::MAX)
+        };
+        let mut list: Vec<Pane> = self
+            .panes
+            .iter()
+            .filter(|p| self.is_session(p))
+            .cloned()
+            .collect();
+        list.sort_by(|a, b| {
+            order(&a.workspace)
+                .cmp(&order(&b.workspace))
+                .then_with(|| a.tab.cmp(&b.tab))
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        list
+    }
+
+    pub fn space_label(&self, ws: &str) -> String {
+        self.workspaces
+            .iter()
+            .find(|w| w.id == ws)
+            .map(|w| w.label.clone())
+            .unwrap_or_default()
+    }
+
+    fn go_to_session(&mut self) {
+        let Some(p) = self.sessions().get(self.session_sel).cloned() else {
+            return;
+        };
+        if herdr::focus_tab(&p.tab) {
+            self.flash(
+                format!("Went to {}", self.space_label(&p.workspace)),
+                crate::theme::ACCENT,
+            );
+        } else {
+            self.flash("Herdr could not show that tab", crate::theme::RED);
+        }
+    }
+
+    pub fn refresh_all(&mut self) {
+        self.reload_files();
+        self.setup = setup::state();
+        self.start_herdr();
+        self.start_info();
+        // The limits follow once the accounts are checked.
+        self.next_probe = Instant::now();
+    }
+
+    pub fn flash(&mut self, text: impl Into<String>, color: Color) {
+        self.flash = Some((text.into(), color, Instant::now() + Duration::from_secs(5)));
+    }
+
+    /// Changes the stored accounts (locked, on a fresh read) and takes the
+    /// result. False when it could not be saved.
+    fn update(&mut self, change: impl FnOnce(&mut Store)) -> bool {
+        let keep = self.selected().map(|a| a.id.clone());
+        match Store::update(change) {
+            Ok(store) => {
+                self.store = store;
+                if let Some(id) = keep {
+                    if let Some(i) = self.store.accounts.iter().position(|a| a.id == id) {
+                        self.sel = i;
+                    }
+                }
+                self.sel = self.sel.min(self.store.accounts.len().saturating_sub(1));
+                true
+            }
+            Err(e) => {
+                self.flash(format!("Not saved: {e}"), crate::theme::RED);
+                false
+            }
+        }
+    }
+
+    /// The names of the other accounts with the same login as `id`.
+    pub fn twin_names(&self, id: &str) -> Vec<String> {
+        self.twins
+            .get(id)
+            .map(|t| t.iter().map(|i| self.store.name_of(i)).collect())
+            .unwrap_or_default()
+    }
+
+    /// The account new sessions get, with fallback, for `wanted`.
+    pub fn effective(&self, wanted: &str) -> launch::Choice {
+        let store = &self.store;
+        // Accounts whose login or key is missing take no sessions.
+        let check =
+            |id: &str| store.account(id).is_some() && self.info.get(id).is_none_or(|i| i.signed_in);
+        launch::choose(
+            store,
+            &self.config,
+            &self.usage,
+            &check,
+            wanted.to_string(),
+            launch::Source::Active,
+            self.now(),
+        )
+    }
+
+    /// Whether a pane runs Claude Code. The list itself starts `claude`
+    /// for a moment (to check logins and limits), which Herdr may take for
+    /// a session: its own panes never count.
+    pub fn is_session(&self, p: &Pane) -> bool {
+        let ours =
+            p.label == "Multiaccount" || std::env::var("HERDR_PANE_ID").is_ok_and(|me| me == p.id);
+        !ours && (p.agent.as_deref() == Some("claude") || p.account_id.is_some())
+    }
+
+    /// Live Claude Code sessions per account, from the pane labels.
+    pub fn running(&self, id: &str) -> usize {
+        self.panes
+            .iter()
+            .filter(|p| p.account_id.as_deref() == Some(id))
+            .filter(|p| p.agent.as_deref().is_none_or(|a| a == "claude"))
+            .count()
+    }
+
+    /// How many open spaces start new sessions on this account right now:
+    /// the spaces set to it, for the active account every space without its
+    /// own, and after a fallback the spaces that moved over to it.
+    pub fn spaces_using(&self, id: &str) -> usize {
+        self.workspaces
+            .iter()
+            .filter(|w| {
+                let wanted = self
+                    .store
+                    .space_account(&w.id)
+                    .unwrap_or(self.store.active.as_str());
+                self.effective(wanted).id == id
+            })
+            .count()
+    }
+
+    // ---- actions ----------------------------------------------------
+
+    fn make_active(&mut self) {
+        let Some(a) = self.selected().cloned() else {
+            return;
+        };
+        if self.store.active == a.id {
+            self.flash(format!("{} is already active", a.name), crate::theme::MUTED);
+            return;
+        }
+        if !self.update(|s| s.active = a.id.clone()) {
+            return;
+        }
+        self.flash(
+            format!("New sessions use {} (running ones keep theirs)", a.name),
+            crate::theme::ACCENT,
+        );
+    }
+
+    fn open_add(&mut self) {
+        let items = vec![
+            PickItem {
+                label: "Claude subscription".into(),
+                detail: "Pro, Max, Ultra, Team or Enterprise; signs in in the browser".into(),
+                value: None,
+            },
+            PickItem {
+                label: "Claude subscription with SSO".into(),
+                detail: "Team or Enterprise through your organisation's single sign-on".into(),
+                value: None,
+            },
+            PickItem {
+                label: "API key (Claude Console)".into(),
+                detail: "A key from platform.claude.com; kept in the keychain".into(),
+                value: None,
+            },
+        ];
+        self.mode = Mode::Pick(Picker {
+            title: "Add an account".into(),
+            items,
+            sel: 0,
+            purpose: PickFor::AddKind,
+        });
+    }
+
+    fn open_space_picker(&mut self) {
+        let Some(ws) = self.workspaces.get(self.space_sel).cloned() else {
+            return;
+        };
+        let current = self.store.space_account(&ws.id).map(str::to_string);
+        let mut items = vec![PickItem {
+            label: "The active account".into(),
+            detail: format!("follows it, now {}", self.store.name_of(&self.store.active)),
+            value: None,
+        }];
+        for a in &self.store.accounts {
+            let detail = self
+                .info
+                .get(&a.id)
+                .and_then(|i| i.plan.clone())
+                .unwrap_or_default();
+            items.push(PickItem {
+                label: a.name.clone(),
+                detail,
+                value: Some(a.id.clone()),
+            });
+        }
+        let sel = items.iter().position(|i| i.value == current).unwrap_or(0);
+        self.mode = Mode::Pick(Picker {
+            title: format!("Account for {}", ws.label),
+            items,
+            sel,
+            purpose: PickFor::Space {
+                workspace: ws.id,
+                label: ws.label,
+            },
+        });
+    }
+
+    fn picked(&mut self, p: Picker) {
+        let Some(item) = p.items.get(p.sel).cloned() else {
+            self.mode = Mode::Normal;
+            return;
+        };
+        match p.purpose {
+            PickFor::AddKind => {
+                let kind = match p.sel {
+                    0 => AddKind::Subscription,
+                    1 => AddKind::SubscriptionSso,
+                    _ => AddKind::ApiKey,
+                };
+                if kind != AddKind::ApiKey && !self.subscription_allowed() {
+                    return;
+                }
+                let suggestion = match kind {
+                    AddKind::ApiKey => "API key",
+                    _ => "Personal",
+                };
+                self.mode = Mode::Input(Input {
+                    title: "Name of the account".into(),
+                    hint: match kind {
+                        AddKind::ApiKey => {
+                            "Next you paste the key; it goes straight into the keychain."
+                        }
+                        _ => "Next Claude Code opens the browser: sign in with this account.",
+                    }
+                    .into(),
+                    text: suggestion.into(),
+                    purpose: InputFor::NewAccount(kind),
+                    secret: false,
+                });
+            }
+            PickFor::Space { workspace, label } => {
+                self.mode = Mode::Normal;
+                if !self.update(|s| s.assign(&workspace, &label, item.value.as_deref())) {
+                    return;
+                }
+                let name = item.value.as_deref().map(|id| self.store.name_of(id));
+                herdr::tag_workspace(&workspace, name.as_deref());
+                self.mode = Mode::Normal;
+                self.flash(
+                    match &name {
+                        Some(n) => format!("New sessions in {label} use {n}"),
+                        None => format!("{label} follows the active account"),
+                    },
+                    crate::theme::ACCENT,
+                );
+            }
+        }
+    }
+
+    fn entered(&mut self, input: Input) {
+        if let InputFor::ApiKey { id, name } = input.purpose {
+            self.store_key(id, name, input.text.trim().to_string());
+            return;
+        }
+        let name = input.text.trim().to_string();
+        if name.is_empty() {
+            return;
+        }
+        if self.store.accounts.iter().any(|a| {
+            a.name.eq_ignore_ascii_case(&name) && InputFor::Rename(a.id.clone()) != input.purpose
+        }) {
+            self.flash("An account with that name exists", crate::theme::RED);
+            return;
+        }
+        self.mode = Mode::Normal;
+        match input.purpose {
+            InputFor::Rename(id) => {
+                let new_name = name.clone();
+                if !self.update(|s| {
+                    if let Some(a) = s.accounts.iter_mut().find(|a| a.id == id) {
+                        a.name = new_name;
+                    }
+                }) {
+                    return;
+                }
+                for s in self.store.spaces.clone().iter().filter(|s| s.account == id) {
+                    herdr::tag_workspace(&s.workspace_id, Some(&name));
+                }
+                self.flash(format!("Renamed to {name}"), crate::theme::ACCENT);
+            }
+            InputFor::NewAccount(AddKind::ApiKey) => {
+                // The account is added once its key is stored.
+                self.mode = key_input(None, name);
+            }
+            InputFor::NewAccount(kind) => {
+                let mut account = Account {
+                    id: String::new(),
+                    name,
+                    kind: Kind::Subscription,
+                    sso: kind == AddKind::SubscriptionSso,
+                    fallback: true,
+                };
+                let mut added = None;
+                if !self.update(|s| {
+                    account.id = s.new_id(&account.name);
+                    added = Some(account.clone());
+                    s.accounts.push(account);
+                }) {
+                    return;
+                }
+                if let Some(a) = added {
+                    self.sel = self.store.accounts.len() - 1;
+                    self.start_sign_in(&a, true);
+                }
+            }
+            InputFor::ApiKey { .. } => {}
+        }
+    }
+
+    /// Stores a pasted key, adding its account first when it is new. A key
+    /// the keychain does not take leaves no account behind.
+    fn store_key(&mut self, id: Option<String>, name: String, key: String) {
+        if let Err(e) = secret::plausible(&key) {
+            self.flash(format!("Not stored: {e}"), crate::theme::RED);
+            return;
+        }
+        self.mode = Mode::Normal;
+        let (id, added) = match id {
+            Some(id) => (id, false),
+            None => {
+                let mut new_id = String::new();
+                let account_name = name.clone();
+                if !self.update(|s| {
+                    new_id = s.new_id(&account_name);
+                    s.accounts.push(Account {
+                        id: new_id.clone(),
+                        name: account_name,
+                        kind: Kind::ApiKey,
+                        sso: false,
+                        fallback: true,
+                    });
+                }) {
+                    return;
+                }
+                self.sel = self.store.accounts.len() - 1;
+                (new_id, true)
+            }
+        };
+        match secret::store(&id, &name, &key) {
+            Ok(()) => {
+                self.flash(
+                    format!("The key for {name} is in the keychain"),
+                    crate::theme::GREEN,
+                );
+                self.start_info();
+            }
+            Err(e) => {
+                if added {
+                    self.update(|s| s.accounts.retain(|a| a.id != id));
+                }
+                self.flash(format!("Not stored: {e}"), crate::theme::RED);
+            }
+        }
+    }
+
+    /// A claude.ai sign-in signs out the machine-wide Console profile, so
+    /// none starts while the main login is one.
+    fn subscription_allowed(&mut self) -> bool {
+        if !info::main_uses_profile() {
+            return true;
+        }
+        self.mode = Mode::Message {
+            title: "First change the main login".into(),
+            lines: vec![
+                "Your main login is a Claude Console sign-in without an API key. Claude Code keeps that one for the whole computer, and signing in any claude.ai account (Pro, Max, Team, Enterprise) signs it out.".into(),
+                "Sign the main login in again with an API key: in a terminal run claude auth login --console and choose \"Create an API key\". Then add the subscription here.".into(),
+            ],
+            good: false,
+        };
+        false
+    }
+
+    fn start_sign_in(&mut self, account: &Account, new_account: bool) {
+        match SignIn::start(account, new_account) {
+            Ok(s) => {
+                self.signin = Some(s);
+                self.mode = Mode::SignIn {
+                    code: String::new(),
+                };
+            }
+            Err(e) => {
+                if new_account {
+                    self.drop_new_account(&account.id);
+                }
+                self.mode = Mode::Normal;
+                self.flash(
+                    format!("Could not start the sign-in: {e}"),
+                    crate::theme::RED,
+                );
+            }
+        }
+    }
+
+    /// Removes an account that was added for a sign-in that did not finish.
+    /// The sign-in may have stored a login before it was stopped, so the
+    /// folder is signed out first, and its id is never used again.
+    fn drop_new_account(&mut self, id: &str) {
+        let failed = match self.store.account(id).cloned() {
+            Some(a) if a.kind == Kind::Subscription => !sign_out(&a),
+            _ => false,
+        };
+        let _ = mirror::remove(id);
+        self.update(|s| {
+            s.accounts.retain(|a| a.id != id);
+            if !s.retired.iter().any(|r| r == id) {
+                s.retired.push(id.to_string());
+            }
+        });
+        if failed {
+            self.mode = sign_out_failed(id);
+        }
+    }
+
+    /// Follows a running sign-in and shows how it ended.
+    fn poll_sign_in(&mut self) {
+        let Some(s) = self.signin.as_mut() else {
+            return;
+        };
+        s.poll();
+        let Some(ok) = s.finished else {
+            return;
+        };
+        let s = self.signin.take().expect("checked above");
+        let account = self.store.account(&s.id).cloned();
+        let info = account.as_ref().map(info::read).unwrap_or_default();
+        if ok && info.signed_in && !info.borrows_main {
+            let who = info
+                .email
+                .clone()
+                .or(info.organization.clone())
+                .unwrap_or_else(|| "an account".into());
+            let mut lines = vec![format!(
+                "Signed in as {who}{}.",
+                info.plan
+                    .as_deref()
+                    .map(|p| format!(" ({p})"))
+                    .unwrap_or_default()
+            )];
+            // The browser often signs in with whatever account it already
+            // has open.
+            let mine = account.as_ref().and_then(crate::login::of);
+            let same: Vec<String> = self
+                .store
+                .accounts
+                .iter()
+                .filter(|a| a.id != s.id)
+                .filter(|a| mine.is_some() && crate::login::of(a) == mine)
+                .map(|a| a.name.clone())
+                .collect();
+            if !same.is_empty() {
+                lines.push(format!(
+                    "That is the same login as {}. If you meant another account, sign out in the browser (or use a private window) and press l to sign in again.",
+                    same.join(", ")
+                ));
+            }
+            self.info.insert(s.id.clone(), info);
+            self.mode = Mode::Message {
+                title: format!("{} is signed in", s.name),
+                lines,
+                good: same.is_empty(),
+            };
+        } else {
+            if s.new_account {
+                self.drop_new_account(&s.id);
+            }
+            let reason = if s.code_sent || !s.last_line().is_empty() {
+                s.last_line()
+            } else {
+                String::new()
+            };
+            self.mode = Mode::Normal;
+            self.flash(
+                if reason.is_empty() || reason.to_lowercase().contains("paste code") {
+                    format!("{}: sign-in cancelled", s.name)
+                } else {
+                    format!("{}: not signed in ({reason})", s.name)
+                },
+                crate::theme::RED,
+            );
+        }
+        self.start_info();
+    }
+
+    fn sign_in_again(&mut self) {
+        let Some(a) = self.selected().cloned() else {
+            return;
+        };
+        match a.kind {
+            Kind::Main => {
+                self.mode = Mode::Message {
+                    title: "The main login is Claude Code's own".into(),
+                    lines: vec![
+                        "Sign it in again inside Claude Code with /login, or in a terminal with claude auth login.".into(),
+                        "For a Claude Console account choose \"Create an API key\": a Console sign-in without a key is kept for the whole computer, and it and the claude.ai accounts here sign each other out.".into(),
+                    ],
+                    good: true,
+                };
+            }
+            Kind::ApiKey => self.mode = key_input(Some(a.id), a.name),
+            Kind::Subscription => {
+                if self.subscription_allowed() {
+                    self.start_sign_in(&a, false);
+                }
+            }
+        }
+    }
+
+    fn ask_remove(&mut self) {
+        let Some(a) = self.selected().cloned() else {
+            return;
+        };
+        if a.kind == Kind::Main {
+            self.flash(
+                "The main login stays; sign it out in Claude Code with /logout",
+                crate::theme::MUTED,
+            );
+            return;
+        }
+        let what = match a.kind {
+            Kind::ApiKey => "Its key is deleted from the keychain.",
+            _ => "It is signed out and its folder of links is deleted.",
+        };
+        let mut lines = vec![
+            what.to_string(),
+            "Sessions, memory and settings in ~/.claude are not touched.".to_string(),
+        ];
+        let running = self.running(&a.id);
+        if running > 0 {
+            lines.push(format!(
+                "{running} Claude Code session(s) run on it now and stop working once it is gone: end them first."
+            ));
+        }
+        let own = mirror::own_data(&a.id);
+        if !own.is_empty() {
+            lines.push(format!(
+                "Only in its folder, moved to backups: {}.",
+                own.join(", ")
+            ));
+        }
+        self.mode = Mode::Confirm(Confirm {
+            question: format!("Remove {}?", a.name),
+            lines,
+            purpose: ConfirmFor::Remove(a.id),
+        });
+    }
+
+    fn remove(&mut self, id: &str) {
+        let Some(a) = self.store.account(id).cloned() else {
+            return;
+        };
+        let mut signed_out = true;
+        match a.kind {
+            Kind::Main => return,
+            Kind::ApiKey => {
+                secret::delete(id);
+                if secret::exists(id) {
+                    self.mode = Mode::Message {
+                        title: format!("{} was not removed", a.name),
+                        lines: vec![
+                            "The keychain did not delete its API key, so the account stays in the list.".into(),
+                            format!(
+                                "Delete the item \"{id}\" (service herdr-multiaccount) in Keychain Access, then remove the account again."
+                            ),
+                        ],
+                        good: false,
+                    };
+                    return;
+                }
+            }
+            Kind::Subscription => {
+                signed_out = sign_out(&a);
+                match mirror::remove(id) {
+                    Ok(kept) if !kept.is_empty() => {
+                        self.flash(
+                            format!("Removed {}; kept in backups: {}", a.name, kept.join(", ")),
+                            crate::theme::ACCENT,
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        self.flash(
+                            format!("Could not delete its folder: {e}"),
+                            crate::theme::RED,
+                        );
+                        return;
+                    }
+                }
+            }
+        }
+        for s in self.store.spaces.clone().iter().filter(|s| s.account == id) {
+            herdr::tag_workspace(&s.workspace_id, None);
+        }
+        if !self.update(|s| {
+            s.accounts.retain(|x| x.id != id);
+            s.spaces.retain(|sp| sp.account != id);
+            if s.active == id {
+                s.active = MAIN_ID.into();
+            }
+            if !s.retired.iter().any(|r| r == id) {
+                s.retired.push(id.to_string());
+            }
+        }) {
+            return;
+        }
+        let _ = std::fs::remove_file(paths::usage_dir().join(format!("{id}.json")));
+        self.info.remove(id);
+        if !signed_out {
+            // Removed anyway: its id is never used again, so no new account
+            // can find the login. Saying so keeps the login from being
+            // forgotten.
+            self.mode = sign_out_failed(id);
+        } else if self.flash.is_none() {
+            self.flash(format!("Removed {}", a.name), crate::theme::ACCENT);
+        }
+    }
+
+    fn toggle_account_fallback(&mut self) {
+        let Some(a) = self.selected().cloned() else {
+            return;
+        };
+        if !self.update(|s| {
+            if let Some(x) = s.accounts.iter_mut().find(|x| x.id == a.id) {
+                x.fallback = !a.fallback;
+            }
+        }) {
+            return;
+        }
+        let msg = if !a.fallback {
+            format!("{} takes part in fallback", a.name)
+        } else {
+            format!("Fallback skips {}", a.name)
+        };
+        self.flash(msg, crate::theme::ACCENT);
+    }
+
+    fn toggle_fallback(&mut self) {
+        self.config.fallback = !self.config.fallback;
+        let _ = config::save_value(
+            &self.dir,
+            "fallback",
+            if self.config.fallback {
+                "true"
+            } else {
+                "false"
+            },
+        );
+        self.flash(
+            if self.config.fallback {
+                format!(
+                    "Fallback on: from {:.0}% new sessions move to the next account",
+                    self.config.threshold
+                )
+            } else {
+                "Fallback off".into()
+            },
+            crate::theme::ACCENT,
+        );
+    }
+
+    fn move_selected(&mut self, by: i32) {
+        let Some(id) = self.selected().map(|a| a.id.clone()) else {
+            return;
+        };
+        // `update` keeps the selection on the moved account.
+        self.update(|s| {
+            s.move_account(&id, by);
+        });
+    }
+
+    fn start_claude(&mut self) {
+        let Some(a) = self.selected().cloned() else {
+            return;
+        };
+        if !herdr::inside() {
+            self.flash("Only inside Herdr", crate::theme::MUTED);
+            return;
+        }
+        if !self.setup.shell {
+            self.flash(
+                "Set up first (S): the claude function picks the account",
+                crate::theme::YELLOW,
+            );
+            return;
+        }
+        let ws = std::env::var("HERDR_WORKSPACE_ID").ok();
+        let mut args: Vec<String> = vec!["tab".into(), "create".into()];
+        if let Some(w) = &ws {
+            args.extend(["--workspace".into(), w.clone()]);
+        }
+        if let Some(c) = &self.cwd {
+            args.extend(["--cwd".into(), c.clone()]);
+        }
+        args.push("--focus".into());
+        let out = std::process::Command::new(herdr::bin())
+            .args(&args)
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output();
+        let pane = out
+            .ok()
+            .filter(|o| o.status.success())
+            .and_then(|o| serde_json::from_slice::<serde_json::Value>(&o.stdout).ok())
+            .and_then(|v| {
+                v["result"]["root_pane"]["pane_id"]
+                    .as_str()
+                    .map(str::to_string)
+            });
+        match pane {
+            Some(p) => {
+                let _ = std::process::Command::new(herdr::bin())
+                    // Only for this one start (ids are letters, digits and
+                    // dashes), not for the tab: later sessions there follow
+                    // the space and fallback again.
+                    .args([
+                        "pane",
+                        "run",
+                        &p,
+                        &format!("{}={} claude", launch::ENV_USE, a.id),
+                    ])
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status();
+                self.flash(
+                    format!("Started Claude Code with {} in a new tab", a.name),
+                    crate::theme::ACCENT,
+                );
+            }
+            None => self.flash("Herdr did not open a tab", crate::theme::RED),
+        }
+    }
+
+    fn ask_setup(&mut self) {
+        let lines = setup::plan();
+        if lines.is_empty() {
+            self.flash("Already set up", crate::theme::MUTED);
+            return;
+        }
+        let mut lines = lines;
+        lines.push(
+            "Both are backed up first; `herdr-multiaccount setup --undo` reverts them.".into(),
+        );
+        self.mode = Mode::Confirm(Confirm {
+            question: "Set up the accounts?".into(),
+            lines,
+            purpose: ConfirmFor::Setup,
+        });
+    }
+
+    fn confirmed(&mut self, c: Confirm) {
+        self.mode = Mode::Normal;
+        match c.purpose {
+            ConfirmFor::Remove(id) => self.remove(&id),
+            ConfirmFor::Setup => {
+                match setup::apply() {
+                    Ok(msg) => self.flash(msg, crate::theme::GREEN),
+                    Err(e) => self.flash(e, crate::theme::RED),
+                }
+                self.setup = setup::state();
+                self.store = Store::load();
+            }
+        }
+    }
+
+    fn toggle_icons(&mut self) {
+        self.config.nerd_font = !self.config.nerd_font;
+        let _ = config::save_value(
+            &self.dir,
+            "icons",
+            if self.config.nerd_font {
+                "\"nerd\""
+            } else {
+                "\"plain\""
+            },
+        );
+    }
+
+    // ---- input ------------------------------------------------------
+
+    fn rows_len(&self) -> usize {
+        match self.section {
+            Section::Accounts => self.store.accounts.len(),
+            Section::Spaces => self.workspaces.len(),
+            Section::Sessions => self.sessions().len(),
+        }
+    }
+
+    fn cursor(&mut self) -> &mut usize {
+        match self.section {
+            Section::Accounts => &mut self.sel,
+            Section::Spaces => &mut self.space_sel,
+            Section::Sessions => &mut self.session_sel,
+        }
+    }
+
+    fn step(&mut self, by: i32) {
+        let len = self.rows_len();
+        if len == 0 {
+            return;
+        }
+        let c = self.cursor();
+        *c = (*c as i32 + by).clamp(0, len as i32 - 1) as usize;
+    }
+
+    fn switch(&mut self, section: Section) {
+        self.section = section;
+        if section != Section::Accounts {
+            self.start_herdr();
+        }
+    }
+
+    fn enter(&mut self) {
+        match self.section {
+            Section::Accounts => self.make_active(),
+            Section::Spaces => self.open_space_picker(),
+            Section::Sessions => self.go_to_session(),
+        }
+    }
+
+    pub fn key(&mut self, k: KeyEvent) {
+        if k.kind == KeyEventKind::Release {
+            return;
+        }
+        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+        if ctrl && k.code == KeyCode::Char('c') {
+            self.mode = Mode::AskQuit;
+            return;
+        }
+        match self.mode.clone() {
+            Mode::AskQuit => {
+                self.mode = Mode::Normal;
+                if k.code == KeyCode::Char('y') {
+                    self.quit = true;
+                }
+            }
+            Mode::Help => match k.code {
+                KeyCode::Esc | KeyCode::Char('?') | KeyCode::Char('q') | KeyCode::Enter => {
+                    self.mode = Mode::Normal;
+                }
+                KeyCode::Up | KeyCode::Char('k') => self.scroll_help(-1),
+                KeyCode::Down | KeyCode::Char('j') => self.scroll_help(1),
+                KeyCode::PageUp => self.scroll_help(-10),
+                KeyCode::PageDown | KeyCode::Char(' ') => self.scroll_help(10),
+                KeyCode::Home | KeyCode::Char('g') => self.help_scroll = 0,
+                KeyCode::End | KeyCode::Char('G') => self.help_scroll = self.help_max,
+                _ => {}
+            },
+            Mode::Confirm(c) => match k.code {
+                KeyCode::Char('y') => self.confirmed(c),
+                _ => self.mode = Mode::Normal,
+            },
+            Mode::Pick(mut p) => match k.code {
+                KeyCode::Esc | KeyCode::Char('q') => self.mode = Mode::Normal,
+                KeyCode::Up | KeyCode::Char('k') => {
+                    p.sel = p.sel.saturating_sub(1);
+                    self.mode = Mode::Pick(p);
+                }
+                KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => {
+                    p.sel = (p.sel + 1).min(p.items.len().saturating_sub(1));
+                    self.mode = Mode::Pick(p);
+                }
+                KeyCode::Char(c) if c.is_ascii_digit() && c != '0' => {
+                    let i = c as usize - '1' as usize;
+                    if i < p.items.len() {
+                        p.sel = i;
+                        self.picked(p);
+                    }
+                }
+                KeyCode::Enter | KeyCode::Char(' ') => self.picked(p),
+                _ => {}
+            },
+            Mode::Input(mut input) => match k.code {
+                KeyCode::Esc => self.mode = Mode::Normal,
+                KeyCode::Enter => self.entered(input),
+                KeyCode::Backspace => {
+                    input.text.pop();
+                    self.mode = Mode::Input(input);
+                }
+                KeyCode::Char('u') if ctrl => {
+                    input.text.clear();
+                    self.mode = Mode::Input(input);
+                }
+                KeyCode::Char(c) if !ctrl && input.text.chars().count() < input.max_len() => {
+                    input.text.push(c);
+                    self.mode = Mode::Input(input);
+                }
+                _ => {}
+            },
+            Mode::Message { .. } => {
+                if matches!(
+                    k.code,
+                    KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') | KeyCode::Char(' ')
+                ) {
+                    self.mode = Mode::Normal;
+                }
+            }
+            Mode::SignIn { mut code } => match k.code {
+                KeyCode::Esc => {
+                    if let Some(s) = self.signin.as_mut() {
+                        s.cancel();
+                    }
+                }
+                KeyCode::Enter if !code.trim().is_empty() => {
+                    if let Some(s) = self.signin.as_mut() {
+                        s.send_code(&code);
+                    }
+                    self.mode = Mode::SignIn {
+                        code: String::new(),
+                    };
+                }
+                KeyCode::Backspace => {
+                    code.pop();
+                    self.mode = Mode::SignIn { code };
+                }
+                KeyCode::Char('o') if code.is_empty() => {
+                    if let Some(url) = self.signin.as_ref().and_then(|s| s.url.clone()) {
+                        open_url(&url);
+                    }
+                }
+                KeyCode::Char('y') if code.is_empty() => {
+                    if let Some(url) = self.signin.as_ref().and_then(|s| s.url.clone()) {
+                        if copy(&url) {
+                            self.flash("Link copied", crate::theme::GREEN);
+                        }
+                    }
+                }
+                KeyCode::Char(c) if !ctrl && code.len() < 300 => {
+                    code.push(c);
+                    self.mode = Mode::SignIn { code };
+                }
+                _ => {}
+            },
+            Mode::Normal => self.normal_key(k),
+        }
+    }
+
+    fn normal_key(&mut self, k: KeyEvent) {
+        let shift = k.modifiers.contains(KeyModifiers::SHIFT);
+        match k.code {
+            KeyCode::Char('q') => self.mode = Mode::AskQuit,
+            KeyCode::Esc => {}
+            KeyCode::Char('?') => {
+                self.help_scroll = 0;
+                self.mode = Mode::Help;
+            }
+            KeyCode::Up | KeyCode::Char('k') => self.step(-1),
+            KeyCode::Down | KeyCode::Char('j') => self.step(1),
+            KeyCode::Char('g') | KeyCode::Home => *self.cursor() = 0,
+            KeyCode::Char('G') | KeyCode::End => {
+                let last = self.rows_len().saturating_sub(1);
+                *self.cursor() = last;
+            }
+            KeyCode::Tab | KeyCode::Right => self.switch(self.section.next(1)),
+            KeyCode::BackTab | KeyCode::Left => self.switch(self.section.next(-1)),
+            KeyCode::Char('1') => self.switch(Section::Accounts),
+            KeyCode::Char('2') => self.switch(Section::Spaces),
+            KeyCode::Char('3') => self.switch(Section::Sessions),
+            KeyCode::Enter | KeyCode::Char(' ') => self.enter(),
+            KeyCode::Char('r') => {
+                self.refresh_all();
+                self.flash("Refreshing", crate::theme::MUTED);
+            }
+            KeyCode::Char('F') => self.toggle_fallback(),
+            KeyCode::Char('S') => self.ask_setup(),
+            KeyCode::Char('i') => self.toggle_icons(),
+            KeyCode::Char('a') => self.open_add(),
+            _ if self.section == Section::Accounts => match k.code {
+                KeyCode::Char('l') => self.sign_in_again(),
+                KeyCode::Char('n') => {
+                    if let Some(a) = self.selected().cloned() {
+                        self.mode = Mode::Input(Input {
+                            title: format!("New name for {}", a.name),
+                            hint: "Only the name changes; its login stays.".into(),
+                            text: a.name.clone(),
+                            purpose: InputFor::Rename(a.id),
+                            secret: false,
+                        });
+                    }
+                }
+                KeyCode::Char('d') | KeyCode::Delete => self.ask_remove(),
+                KeyCode::Char('f') => self.toggle_account_fallback(),
+                KeyCode::Char('K') => self.move_selected(-1),
+                KeyCode::Char('J') => self.move_selected(1),
+                KeyCode::Up if shift => self.move_selected(-1),
+                KeyCode::Down if shift => self.move_selected(1),
+                KeyCode::Char('c') => self.start_claude(),
+                _ => {}
+            },
+            _ if self.section == Section::Spaces => match k.code {
+                KeyCode::Char('x') | KeyCode::Backspace | KeyCode::Delete => {
+                    if let Some(ws) = self.workspaces.get(self.space_sel).cloned() {
+                        if !self.update(|s| s.assign(&ws.id, &ws.label, None)) {
+                            return;
+                        }
+                        herdr::tag_workspace(&ws.id, None);
+                        self.flash(
+                            format!("{} follows the active account", ws.label),
+                            crate::theme::ACCENT,
+                        );
+                    }
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+
+    fn click(&mut self, x: u16, y: u16) {
+        let Some(hit) = self
+            .hits
+            .iter()
+            .rev()
+            .find(|(r, _)| x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height)
+            .map(|(_, h)| *h)
+        else {
+            return;
+        };
+        let double = self
+            .last_click
+            .is_some_and(|(at, h)| h == hit && at.elapsed() < Duration::from_millis(400));
+        self.last_click = Some((Instant::now(), hit));
+        match hit {
+            Hit::Section(s) => {
+                if matches!(self.mode, Mode::Normal) {
+                    self.switch(s);
+                }
+            }
+            Hit::Row(i) => {
+                if matches!(self.mode, Mode::Normal) {
+                    *self.cursor() = i;
+                    if double {
+                        self.enter();
+                    }
+                }
+            }
+            Hit::PickRow(i) => {
+                if let Mode::Pick(mut p) = self.mode.clone() {
+                    p.sel = i;
+                    if double {
+                        self.picked(p);
+                    } else {
+                        self.mode = Mode::Pick(p);
+                    }
+                }
+            }
+            Hit::Key(c) => {
+                let code = match c {
+                    '\n' => KeyCode::Enter,
+                    '\u{1b}' => KeyCode::Esc,
+                    c => KeyCode::Char(c),
+                };
+                self.key(KeyEvent::new(code, KeyModifiers::NONE));
+            }
+        }
+    }
+
+    pub fn event(&mut self, e: Event) {
+        match e {
+            Event::Key(k) => self.key(k),
+            Event::Paste(text) => {
+                let clean: String = text
+                    .chars()
+                    .filter(|c| !c.is_control())
+                    .collect::<String>()
+                    .trim()
+                    .to_string();
+                match self.mode.clone() {
+                    Mode::Input(mut input) => {
+                        input.text.push_str(&clean);
+                        input.text = input.text.chars().take(input.max_len()).collect();
+                        self.mode = Mode::Input(input);
+                    }
+                    Mode::SignIn { mut code } => {
+                        code.push_str(&clean);
+                        code = code.chars().take(300).collect();
+                        self.mode = Mode::SignIn { code };
+                    }
+                    _ => {}
+                }
+            }
+            Event::Mouse(m) => match m.kind {
+                MouseEventKind::Down(MouseButton::Left) => self.click(m.column, m.row),
+                MouseEventKind::ScrollDown if self.mode == Mode::Help => self.scroll_help(2),
+                MouseEventKind::ScrollUp if self.mode == Mode::Help => self.scroll_help(-2),
+                MouseEventKind::ScrollDown => {
+                    if let Mode::Pick(mut p) = self.mode.clone() {
+                        p.sel = (p.sel + 1).min(p.items.len().saturating_sub(1));
+                        self.mode = Mode::Pick(p);
+                    } else if matches!(self.mode, Mode::Normal) {
+                        self.step(1);
+                    }
+                }
+                MouseEventKind::ScrollUp => {
+                    if let Mode::Pick(mut p) = self.mode.clone() {
+                        p.sel = p.sel.saturating_sub(1);
+                        self.mode = Mode::Pick(p);
+                    } else if matches!(self.mode, Mode::Normal) {
+                        self.step(-1);
+                    }
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+
+    fn scroll_help(&mut self, by: i32) {
+        self.help_scroll = (self.help_scroll as i32 + by).clamp(0, self.help_max as i32) as u16;
+    }
+
+    /// The note on how the list works, once, on first open.
+    fn show_intro(&mut self) {
+        if self.store.intro_seen || !matches!(self.mode, Mode::Normal) {
+            return;
+        }
+        if self.update(|s| s.intro_seen = true) {
+            self.mode = Mode::Message {
+                title: "How this list works".into(),
+                lines: INTRO.iter().map(|l| l.to_string()).collect(),
+                good: true,
+            };
+        }
+    }
+
+    pub fn run(mut self, terminal: &mut DefaultTerminal) -> std::io::Result<()> {
+        self.refresh_all();
+        self.show_intro();
+        while !self.quit {
+            self.receive_herdr();
+            self.receive_info();
+            self.receive_probe();
+            if Instant::now() >= self.next_probe {
+                self.start_probe();
+            }
+            if Instant::now() >= self.next_files {
+                self.reload_files();
+            }
+            if Instant::now() >= self.next_herdr {
+                self.start_herdr();
+            }
+            if Instant::now() >= self.next_info && self.info_rx.is_none() {
+                self.start_info();
+            }
+            if self
+                .flash
+                .as_ref()
+                .is_some_and(|(_, _, until)| Instant::now() >= *until)
+            {
+                self.flash = None;
+            }
+            self.poll_sign_in();
+            terminal.draw(|frame| ui::draw(frame, &mut self))?;
+            if event::poll(Duration::from_millis(250))? {
+                self.event(event::read()?);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Opens a link in the browser.
+fn open_url(url: &str) {
+    let opener = if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+    let _ = std::process::Command::new(opener)
+        .arg(url)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+}
+
+/// Puts text on the clipboard (macOS, or Wayland / X11 tools when there).
+fn copy(text: &str) -> bool {
+    let tools: &[(&str, &[&str])] = if cfg!(target_os = "macos") {
+        &[("pbcopy", &[])]
+    } else {
+        &[("wl-copy", &[]), ("xclip", &["-selection", "clipboard"])]
+    };
+    for (tool, args) in tools {
+        if let Ok(mut child) = std::process::Command::new(tool)
+            .args(*args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            if let Some(mut stdin) = child.stdin.take() {
+                use std::io::Write;
+                let _ = stdin.write_all(text.as_bytes());
+            }
+            return child.wait().is_ok_and(|s| s.success());
+        }
+    }
+    false
+}
+
+/// Signs an account's folder out of its own claude.ai login, and checks
+/// that it worked. A folder without a login of its own (or one that only
+/// borrows the main login, which must not be signed out) needs nothing.
+/// False when a login is still there afterwards.
+fn sign_out(a: &Account) -> bool {
+    let own_login = |i: &crate::info::Info| i.signed_in && !i.borrows_main;
+    if !own_login(&info::read(a)) {
+        return true;
+    }
+    let Some(claude) = launch::find_claude() else {
+        return false;
+    };
+    let mut cmd = std::process::Command::new(claude);
+    // Clean first: it may remove CLAUDE_CONFIG_DIR, and without it the main
+    // login would be signed out.
+    launch::clean_env(&mut cmd);
+    cmd.args(["auth", "logout"])
+        .env("CLAUDE_CONFIG_DIR", mirror::home_of(&a.id))
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    let _ = cmd.status();
+    !own_login(&info::read(a))
+}
+
+/// The notice when a removed account's login could not be signed out, with
+/// the command that does it by hand.
+fn sign_out_failed(id: &str) -> Mode {
+    Mode::Message {
+        title: "Sign-out did not work".into(),
+        lines: vec![
+            "Claude Code may still keep this account's login. The plugin never reuses its folder, so no other account gets it.".into(),
+            "To remove the login, run in a terminal:".into(),
+            format!(
+                "CLAUDE_CONFIG_DIR=\"{}\" command claude auth logout",
+                mirror::home_of(id).display()
+            ),
+        ],
+        good: false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    fn app() -> App {
+        let mut a = App::new(Config::default(), std::env::temp_dir());
+        a.store = Store::default();
+        a.store.accounts.push(Account {
+            id: "personal".into(),
+            name: "Personal".into(),
+            kind: Kind::Subscription,
+            sso: false,
+            fallback: true,
+        });
+        a.usage = HashMap::new();
+        a.twins = HashMap::new();
+        a.workspaces = vec![Workspace {
+            id: "w1".into(),
+            label: "acme-app".into(),
+            number: 1,
+            focused: true,
+        }];
+        a
+    }
+
+    #[test]
+    fn keys_move_and_switch() {
+        let mut a = app();
+        a.key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert_eq!(a.sel, 1);
+        a.key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert_eq!(a.sel, 1, "stays on the last row");
+        a.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(a.section, Section::Spaces);
+        a.key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!(a.section, Section::Sessions, "→ goes to the next tab");
+        a.key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        a.key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        assert_eq!(a.section, Section::Accounts, "← goes back");
+        a.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        a.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!a.quit, "Esc never closes the list");
+        a.key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
+        assert_eq!(a.mode, Mode::AskQuit);
+        a.key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
+        assert!(!a.quit);
+        a.key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
+        a.key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert!(a.quit);
+    }
+
+    #[test]
+    fn add_flow_reaches_name_input() {
+        let mut a = app();
+        a.key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        assert!(matches!(a.mode, Mode::Pick(_)));
+        a.key(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE));
+        match &a.mode {
+            Mode::Input(i) => assert_eq!(i.purpose, InputFor::NewAccount(AddKind::ApiKey)),
+            m => panic!("unexpected {m:?}"),
+        }
+    }
+
+    #[test]
+    fn main_cannot_be_removed() {
+        let mut a = app();
+        a.sel = 0;
+        a.key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+        assert_eq!(a.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn sign_out_failure_names_the_command() {
+        for (w, h) in [(100, 30), (60, 20)] {
+            let mut a = app();
+            a.mode = sign_out_failed("ultra");
+            let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+            t.draw(|f| ui::draw(f, &mut a)).unwrap();
+            let buf = t.backend().buffer();
+            let rows: Vec<String> = (0..h)
+                .map(|y| (0..w).map(|x| buf[(x, y)].symbol().to_string()).collect())
+                .collect();
+            if std::env::var("SHOW_SCREEN").is_ok() {
+                println!("{}", rows.join("\n"));
+            }
+            let screen = rows.join("");
+            assert!(screen.contains("Sign-out did not work"), "{screen}");
+            assert!(screen.contains("auth logout"), "{screen}");
+        }
+    }
+
+    #[test]
+    fn twins_are_named_in_the_list() {
+        let mut a = app();
+        a.twins = [
+            (MAIN_ID.to_string(), vec!["personal".to_string()]),
+            ("personal".to_string(), vec![MAIN_ID.to_string()]),
+        ]
+        .into();
+        let mut t = Terminal::new(TestBackend::new(160, 30)).unwrap();
+        t.draw(|f| ui::draw(f, &mut a)).unwrap();
+        let screen: String = t
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(screen.contains("same login as Personal"), "{screen}");
+        assert!(screen.contains("same login as Main login"), "{screen}");
+    }
+
+    #[test]
+    fn draws_at_many_sizes() {
+        for (w, h) in [(160, 40), (100, 30), (60, 20), (40, 12)] {
+            let mut a = app();
+            let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+            t.draw(|f| ui::draw(f, &mut a)).unwrap();
+            a.section = Section::Spaces;
+            t.draw(|f| ui::draw(f, &mut a)).unwrap();
+            a.section = Section::Sessions;
+            a.panes = vec![Pane {
+                id: "w1:p1".into(),
+                workspace: "w1".into(),
+                tab: "w1:t1".into(),
+                label: "A long session name that does not fit everywhere".into(),
+                agent: Some("claude".into()),
+                status: Some("working".into()),
+                account: Some("Main login".into()),
+                account_id: Some(MAIN_ID.into()),
+            }];
+            t.draw(|f| ui::draw(f, &mut a)).unwrap();
+            a.mode = Mode::Help;
+            t.draw(|f| ui::draw(f, &mut a)).unwrap();
+            if h < 40 {
+                assert!(a.help_max > 0, "the keys scroll on a low screen ({w}x{h})");
+                a.key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+                t.draw(|f| ui::draw(f, &mut a)).unwrap();
+                let buffer = format!("{:?}", t.backend().buffer());
+                assert!(buffer.contains("scroll · end"), "{w}x{h}");
+                a.key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+                assert_eq!(a.help_scroll, a.help_max - 1);
+            }
+            a.section = Section::Accounts;
+            a.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+            a.key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+            t.draw(|f| ui::draw(f, &mut a)).unwrap();
+            a.mode = Mode::Message {
+                title: "A title".into(),
+                lines: vec![
+                    "First line that is long enough to wrap around in a narrow pane.".into(),
+                    "Second".into(),
+                ],
+                good: false,
+            };
+            t.draw(|f| ui::draw(f, &mut a)).unwrap();
+            a.mode = key_input(None, "Sandbox".into());
+            a.event(Event::Paste(
+                "sk-ant-api03-abcdefghijklmnopqrstuvwxyz".into(),
+            ));
+            t.draw(|f| ui::draw(f, &mut a)).unwrap();
+            let buffer = format!("{:?}", t.backend().buffer());
+            assert!(!buffer.contains("sk-ant"), "a key is never shown");
+        }
+    }
+}

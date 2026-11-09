@@ -1,0 +1,31 @@
+# Herdr Multiaccount settings. Copy to the directory
+# `herdr plugin config-dir multiaccount` prints, as config.toml.
+
+# Move new sessions to the next account in the list when the account they
+# would get is at its limit. Press F in the list to switch.
+fallback = true
+
+# Used share of a usage window (50 to 100 percent) from which an account
+# counts as at its limit.
+threshold = 95
+
+# A Herdr notification when fallback starts moving new sessions.
+notify = true
+
+# A Herdr popup when a session that fallback moved can go back to its
+# account, because that account has room again.
+remind = true
+
+# Seconds between limit checks (Claude Code's /usage) while the list is
+# open, at least 30. 0 turns them off.
+check_limits = 60
+
+# Where the list opens: "overlay" (over the current tab), "split" (next to
+# the focused pane) or "tab" (a tab of its own).
+placement = "overlay"
+
+# Where a split goes: "down" (below the focused pane) or "right".
+split_direction = "down"
+
+# "nerd" needs a Nerd Font in the terminal; "plain" uses ordinary symbols.
+icons = "nerd"

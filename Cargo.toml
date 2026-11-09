@@ -1,0 +1,18 @@
+[package]
+name = "herdr-multiaccount"
+version = "1.0.0"
+edition = "2021"
+description = "Herdr plugin that keeps several Claude Code accounts side by side, shows their usage limits and picks one per space"
+license = "MIT"
+repository = "https://github.com/nolvane/herdr-multiaccount"
+publish = false
+
+[dependencies]
+ratatui = "0.30.2"
+serde_json = { version = "1.0.154", features = ["preserve_order"] }
+unicode-width = "0.2.3"
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true
