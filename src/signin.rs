@@ -152,6 +152,32 @@ impl SignIn {
         })
     }
 
+    /// A sign-in that shows `url`, for tests: a harmless child process
+    /// stands in for Claude Code.
+    #[cfg(test)]
+    pub fn showing(url: &str) -> SignIn {
+        let mut child = Command::new("/bin/cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let (_tx, rx) = channel();
+        SignIn {
+            id: "personal".into(),
+            name: "Personal".into(),
+            new_account: false,
+            stdin: child.stdin.take(),
+            child,
+            rx,
+            output: String::new(),
+            url: Some(url.into()),
+            finished: None,
+            started: Instant::now(),
+            code_sent: false,
+        }
+    }
+
     /// Takes in new output and notices when Claude Code is done.
     pub fn poll(&mut self) {
         let mut raw = String::new();

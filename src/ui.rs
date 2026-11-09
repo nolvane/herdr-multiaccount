@@ -1345,6 +1345,42 @@ fn draw_help(frame: &mut Frame, app: &mut App) {
     };
     let inner = dialog(frame, area, "Keys");
     app.hits.push((area, Hit::Key('?')));
+    // The version in the bottom border, linked to the repository. It takes
+    // no row, so it stays when the box is cut to a short pane; a narrow box
+    // drops the address, then the name, and one too narrow for the version
+    // itself shows nothing. Pushed after the overlay's own click target, so
+    // a click on it finds the link first.
+    if area.height >= 3 {
+        let version = env!("CARGO_PKG_VERSION");
+        let address = env!("CARGO_PKG_REPOSITORY").trim_start_matches("https://");
+        // Both corners, a dash on each side and the spaces around it.
+        let room = area.width.saturating_sub(4) as usize;
+        let shown = [
+            format!("Herdr Multiaccount {version} · {address}"),
+            format!("Herdr Multiaccount {version}"),
+            version.to_string(),
+        ]
+        .into_iter()
+        .map(|t| {
+            Line::from(vec![
+                Span::raw(" "),
+                Span::styled(
+                    t,
+                    Style::new().fg(ACCENT).add_modifier(Modifier::UNDERLINED),
+                ),
+                Span::raw(" "),
+            ])
+        })
+        .find(|l| l.width() <= room);
+        if let Some(shown) = shown {
+            let width = shown.width() as u16;
+            let y = area.bottom() - 1;
+            frame.render_widget(shown, Rect::new(area.x + 2, y, width, 1));
+            // Only the words, not the spaces around them.
+            app.hits
+                .push((Rect::new(area.x + 3, y, width - 2, 1), Hit::Link));
+        }
+    }
     // Taller than the screen: scroll, with a line that says so.
     let longest = columns.iter().map(Vec::len).max().unwrap_or(0) as u16;
     let overflow = longest > inner.height;
