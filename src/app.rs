@@ -1611,7 +1611,6 @@ impl App {
     }
 }
 
-/// Opens a link in the browser.
 /// Starts `opener` (`open`, `xdg-open`) on `url`.
 pub fn open_in_browser(opener: &str, url: &str) -> bool {
     std::process::Command::new(opener)
@@ -1933,8 +1932,8 @@ mod tests {
         let cell = &t.backend().buffer()[(area.x + 3, bottom)];
         assert!(cell.modifier.contains(ratatui::style::Modifier::UNDERLINED));
         assert_eq!(cell.fg, crate::theme::ACCENT);
-        // It takes no row of the content: the box is not taller than before.
-        assert!(row_text(&rows, bottom).starts_with(&" ".repeat(area.x as usize)));
+        // In the border itself, so it takes no row of the content.
+        assert!(line.contains('╰') && line.contains('╯'), "{line}");
         assert_eq!(link_spot(&a).unwrap().width as usize, full.chars().count());
     }
 
