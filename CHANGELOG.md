@@ -5,6 +5,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-11-09
+
 ### Added
 
 - The list: accounts with their 5-hour and 7-day windows, spend limit,
@@ -33,4 +35,4 @@ All notable changes to this project are documented here. The format follows
   undo.
 - Account labels for spaces and Claude Code panes in Herdr's sidebar.
 - The keys overlay (`?`) shows the version and links to the repository
-  (#1).
+  (#4).
