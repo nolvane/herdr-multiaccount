@@ -20,6 +20,7 @@ mod mirror;
 mod pane;
 mod paths;
 mod probe;
+mod relocate;
 mod remind;
 mod secret;
 mod sessions;

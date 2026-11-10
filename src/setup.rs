@@ -57,7 +57,7 @@ pub fn rc_file() -> Option<PathBuf> {
 }
 
 /// The binary path as the shell should write it (`$HOME/...`).
-fn bin_for_shell() -> String {
+pub(crate) fn bin_for_shell() -> String {
     let bin = paths::installed_bin();
     match bin.strip_prefix(paths::home()) {
         Ok(rest) => format!("$HOME/{}", rest.to_string_lossy()),
@@ -67,7 +67,7 @@ fn bin_for_shell() -> String {
 
 /// Paths go into a shell file and a shell command inside double quotes:
 /// refuse the characters that would break out of them.
-fn quotable(path: &Path) -> Result<(), String> {
+pub(crate) fn quotable(path: &Path) -> Result<(), String> {
     let p = path.to_string_lossy();
     if p.contains(['"', '$', '`', '\\', '\n']) {
         Err(format!(

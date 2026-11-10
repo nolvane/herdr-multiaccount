@@ -644,7 +644,7 @@ fn draw_sessions(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
     let sessions = app.sessions();
     if sessions.is_empty() {
         let text = if !crate::herdr::inside() {
-            "Sessions are Herdr's: open this list inside Herdr."
+            "Agents are Herdr's: open this list inside Herdr."
         } else if app.panes.is_empty() {
             "Reading the sessions…"
         } else {
@@ -871,6 +871,8 @@ fn draw_footer(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
         ],
         Section::Sessions => vec![
             ("⏎", "go to session", '\n'),
+            ("m", "move", 'm'),
+            ("d", "end session", 'd'),
             ("?", "all keys", '?'),
             ("q", "close", 'q'),
         ],
@@ -1036,22 +1038,34 @@ fn draw_input(frame: &mut Frame, i: &crate::app::Input) {
 }
 
 fn draw_confirm(frame: &mut Frame, app: &mut App, c: &crate::app::Confirm) {
-    let width = 76u16;
+    // The width `centered` gives the box, so the text wraps inside it.
+    let width = centered(frame.area(), 76, 1).width;
     let wrapped: Vec<Line> = c
         .lines
         .iter()
         .flat_map(|l| wrap(l, width.saturating_sub(6) as usize))
         .map(|l| Line::from(Span::styled(l, Style::new().fg(MUTED))))
         .collect();
-    let area = centered(frame.area(), width, wrapped.len() as u16 + 5);
+    let mut area = centered(frame.area(), width, wrapped.len() as u16 + 5);
+    if area.height < wrapped.len() as u16 + 5 {
+        // A short pane: the whole height, over the tabs and the footer.
+        area.y = frame.area().y;
+        area.height = frame.area().height;
+    }
     let inner = dialog(frame, area, &c.question);
+    // On a short pane the blank lines around the text go first.
+    let (top, rest) = if inner.height < wrapped.len() as u16 + 3 {
+        (0, 1)
+    } else {
+        (1, 3)
+    };
     frame.render_widget(
         Paragraph::new(Text::from(wrapped)),
         Rect::new(
             inner.x,
-            inner.y + 1,
+            inner.y + top,
             inner.width,
-            inner.height.saturating_sub(3),
+            inner.height.saturating_sub(rest),
         ),
     );
     let y = inner.y + inner.height.saturating_sub(1);
@@ -1274,12 +1288,22 @@ fn draw_help(frame: &mut Frame, app: &mut App) {
                 ("x", "back to the active account"),
             ],
         ),
-        ("Sessions", &[("⏎", "go to the session's tab")]),
+        (
+            "Agents",
+            &[
+                ("⏎", "go to the session's tab"),
+                (
+                    "m",
+                    "move it to another account, with its conversation (asks first)",
+                ),
+                ("d", "end the session: its pane closes (asks first)"),
+            ],
+        ),
         (
             "List",
             &[
                 ("↑ ↓  j k", "move"),
-                ("← →  Tab  1 2 3", "accounts / spaces / sessions"),
+                ("← →  Tab  1 2 3", "accounts / spaces / agents"),
                 ("F", "fallback on / off"),
                 ("S", "set up the claude command and the limits"),
                 ("r", "refresh now"),

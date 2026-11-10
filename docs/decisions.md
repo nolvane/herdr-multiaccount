@@ -201,6 +201,9 @@ looks. API keys and logins without limits are skipped.
 
 ## 2026-11-09: Sessions tab
 
+Renamed to the Agents tab on 2026-11-10 (see "Ending a session from the
+Agents tab").
+
 It should be visible which account each running session uses. The list
 already reads Herdr's panes for the Spaces tab, and each session started
 through the plugin carries its account as a pane label, so a third tab lists
@@ -307,4 +310,81 @@ setting). Account names starting with `-` were checked against Herdr's
 notification command and pass, so nothing changes there. Passing the API key
 through an `apiKeyHelper` instead of the environment is a larger change for
 later.
+
+## 2026-11-10: Ending a session from the Agents tab
+
+The third tab is called "Agents", the word Herdr's sidebar uses for what it
+lists. Only the tab and the texts that name it changed: each row is still a
+"session" ("go to session", "end session"), as in the README, the reminder
+and fallback.
+
+`d` in the tab ends a session after asking, also one that is working or
+waiting for an answer (the question warns that its current work stops).
+Herdr has no command to end an agent (`herdr agent` only lists and reads),
+and typing `/exit` into another pane is neither offered to plugins nor read
+by a busy session, so ending closes the session's pane with `herdr pane
+close`. Claude Code has saved the conversation by then, so `claude --resume`
+finds it again. Before closing, the list asks Herdr for its panes once more
+and closes only when that pane still runs a Claude Code session: a row read
+seconds ago may belong to a pane that ended, or now runs something else. This
+does not contradict "Restarting is left to the user" in the reminder entry:
+the user asks for it, and the list asks back.
+
+`herdr pane close` is in Herdr 0.9.0 (its CLI reference and
+`src/cli/pane.rs` at tag `v0.9.0`), so `min_herdr_version` stays 0.9.0.
+
+## 2026-11-10: Moving a running session to another account
+
+`m` in the Agents tab moves an idle Claude Code session to another account:
+the list ends Claude Code in its pane and starts the same conversation there
+again with `HERDR_MULTIACCOUNT_USE=<account> "<binary>" run -- --resume <id>`.
+This changes the stance of "A popup when a moved session can go back"
+("restarting is left to the user"): the user asks for the move, the list
+asks back, and only an idle session (Herdr's `idle` or `done`) is moved, so
+no work in progress is cut off.
+
+- **Which conversation.** The status line notes Claude Code's `session_id`
+  per pane in `conversations/<pane>.json`, with the processes above it
+  (shells left out, so Claude Code is among them). The note counts only
+  while one of those processes is in the front of the pane now (`herdr pane
+  process-info`, in Herdr 0.9.0's `src/cli/pane.rs`), so an old note or a
+  new Claude Code whose status line has not run yet never resumes the wrong
+  conversation. `claude --continue` is never used: it could pick another
+  conversation in the same folder. Herdr's own `agent_session` field is
+  filled only with Herdr's Claude Code integration installed, so it is not
+  relied on. Only ids with the exact UUID shape are written or read, because
+  the id goes into a command typed into a shell; account ids are checked to
+  be letters, digits, `-` and `_` for the same reason.
+- **Ending it.** The list presses Ctrl+C (Herdr `pane send-keys`), at most
+  four times: the first clears text typed but not sent, then two in a row
+  end Claude Code (the first of them only shows "Press Ctrl-C again to
+  exit"), and one is spare. Nothing is typed into Claude Code; typing
+  `/exit` would send unsent text along with it as a message. Before each
+  press it asks Herdr again, and stops when the session started working in
+  the meantime, so no turn is cut off. The command is typed only once the
+  process has left the pane and the pane's own shell is in front again (up
+  to 8 s, by the clock as well, so slow Herdr calls cannot stretch it). If
+  it does not end, or a nested shell or another program is in front
+  instead, nothing starts and the list says which and names the way by
+  hand.
+- **Starting it again.** The command calls the plugin's binary by the path
+  the `claude` function uses, so it also works in a shell opened before
+  setup. It goes through the launcher, which labels the pane and writes its
+  note without a `wanted` account, so the reminder of an earlier fallback no
+  longer fires. The list waits up to 20 s until Herdr sees Claude Code again;
+  the launcher itself in front does not count, as it may still stop before
+  Claude Code starts (a missing key). Only `--resume <id>` is passed: options
+  the session was started with (such as `--model`) are not carried over.
+- **Which accounts.** Every account signed in with a login or key of its
+  own, except the session's own and those with the same login. Sessions
+  started without the plugin count as the main login. An account at its
+  limit can be picked; then fallback applies as at any start (the owner's
+  decision on #6), never back to the session's own login, and the question
+  says where the session goes. The list resolves this itself and names the
+  final account in the command, as a named account never falls back.
+- **The cost.** Claude Code's prompt cache belongs to the login, so the
+  first answer on the new account reads the whole conversation again: slower
+  and more against its limit. The question says so.
+- While a move runs (up to about half a minute), quitting the list, `d` and
+  another `m` wait, since quitting halfway would leave the session ended.
 

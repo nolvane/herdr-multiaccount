@@ -55,6 +55,7 @@ pub fn run() -> i32 {
             announce(&store, &config, &id, now);
             crate::remind::check(&store, &config, &id, now);
         }
+        note_conversation(&parsed);
     }
 
     // Keeps mirror folders in step when settings.json was saved over a link.
@@ -80,6 +81,33 @@ pub fn run() -> i32 {
             0
         }
     }
+}
+
+/// Notes which conversation this pane holds, so the list can move it to
+/// another account (`relocate.rs`). Only ids shaped like Claude Code's
+/// session ids are kept: the id goes into a command typed into a shell.
+fn note_conversation(input: &Value) {
+    if !herdr::inside() {
+        return;
+    }
+    let (Ok(pane), Some(id)) = (std::env::var("HERDR_PANE_ID"), input["session_id"].as_str())
+    else {
+        return;
+    };
+    if !crate::sessions::valid_session_id(id) {
+        return;
+    }
+    let pids = crate::sessions::my_ancestors();
+    if pids.is_empty() {
+        return;
+    }
+    crate::sessions::record_conversation(
+        &pane,
+        &crate::sessions::Conversation {
+            session_id: id.to_string(),
+            pids,
+        },
+    );
 }
 
 /// Tells once per full window when new sessions move to another account.

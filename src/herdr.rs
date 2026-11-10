@@ -189,6 +189,11 @@ pub fn focus_tab(tab: &str) -> bool {
     run_quiet(&["tab", "focus", tab])
 }
 
+/// Closes a pane, and with it what runs in it.
+pub fn close_pane(pane: &str) -> bool {
+    run_quiet(&["pane", "close", pane])
+}
+
 /// Labels a pane with the account its Claude Code runs on.
 pub fn tag_pane(pane: &str, account: &str, id: &str, pid: u32) {
     let a = format!("{TOKEN}={account}");
@@ -262,4 +267,102 @@ pub fn notify(title: &str, body: &str) {
         "--sound",
         "request",
     ]);
+}
+
+/// What runs in the front of a pane: the shell's pid and the processes of
+/// the foreground process group, with their names.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Processes {
+    pub shell: Option<u32>,
+    /// The foreground process group: the shell's own pid when it is in
+    /// front.
+    pub group: Option<u32>,
+    pub front: Vec<(u32, String)>,
+}
+
+impl Processes {
+    pub fn from_json(v: &Value) -> Option<Processes> {
+        let info = &v["result"]["process_info"];
+        if !info.is_object() {
+            return None;
+        }
+        let pid = |v: &Value| v.as_u64().and_then(|p| u32::try_from(p).ok());
+        Some(Processes {
+            shell: pid(&info["shell_pid"]),
+            group: pid(&info["foreground_process_group_id"]),
+            front: info["foreground_processes"]
+                .as_array()
+                .map(|list| {
+                    list.iter()
+                        .filter_map(|p| {
+                            Some((
+                                pid(&p["pid"])?,
+                                p["name"].as_str().unwrap_or("").to_string(),
+                            ))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+        })
+    }
+
+    /// Whether the pane's own shell is in front (waiting at its prompt).
+    pub fn shell_in_front(&self) -> bool {
+        self.shell
+            .is_some_and(|s| self.group == Some(s) || self.front.iter().any(|(p, _)| *p == s))
+    }
+}
+
+pub fn process_info(pane: &str) -> Option<Processes> {
+    Processes::from_json(&call(&["pane", "process-info", "--pane", pane])?)
+}
+
+/// Presses keys in a pane (`ctrl+c`, `esc`, ...).
+pub fn send_keys(pane: &str, keys: &[&str]) -> bool {
+    let mut args = vec!["pane", "send-keys", pane];
+    args.extend_from_slice(keys);
+    run_quiet(&args)
+}
+
+/// Types a command and Enter into a pane's shell.
+pub fn run_in_pane(pane: &str, command: &str) -> bool {
+    run_quiet(&["pane", "run", pane, command])
+}
+
+/// The agent Herdr sees in a pane now (`claude`), if any.
+pub fn pane_agent(pane: &str) -> Option<String> {
+    pane_field(pane, "agent")
+}
+
+/// What the agent in a pane does now (`idle`, `working`, ...), if known.
+pub fn pane_status(pane: &str) -> Option<String> {
+    pane_field(pane, "agent_status").filter(|s| s != "unknown")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn process_info_reads_shell_group_and_front() {
+        // The shape of `herdr pane process-info` (Herdr's API schema).
+        let v = json!({"id": "cli:pane:process_info", "result": {"type": "pane_process_info",
+            "process_info": {"pane_id": "w1:p6", "shell_pid": 300,
+                "foreground_process_group_id": 400,
+                "foreground_processes": [{"pid": 400, "name": "2.1.30", "argv0": "claude"},
+                    {"pid": 401, "name": "node"}]}}});
+        let p = Processes::from_json(&v).unwrap();
+        assert_eq!(p.shell, Some(300));
+        assert_eq!(p.group, Some(400));
+        assert_eq!(p.front, vec![(400, "2.1.30".into()), (401, "node".into())]);
+        assert!(!p.shell_in_front());
+        let back = Processes {
+            shell: Some(300),
+            group: Some(300),
+            front: vec![],
+        };
+        assert!(back.shell_in_front());
+        assert_eq!(Processes::from_json(&json!({"result": {}})), None);
+    }
 }
