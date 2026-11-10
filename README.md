@@ -8,7 +8,7 @@ gives each Herdr space its own account if you like, and moves new sessions
 to the next account when one is at its limit.
 
 ```
-  Claude accounts    Accounts (3)   Spaces (4)   Sessions (5)               fallback at 95%
+  Claude accounts    Accounts (3)   Spaces (4)   Agents (5)                 fallback at 95%
 
     Account                            5-hour              7-day               Used by
   ● Work                               –                   –                   2 spaces
@@ -49,9 +49,12 @@ to the next account when one is at its limit.
   session". Once per session.
 - **Start with an account.** `c` opens a new tab with Claude Code on the
   selected account, whatever the space or the active account say.
-- **Sessions.** The Sessions tab lists every Claude Code session in Herdr:
+- **Agents.** The Agents tab lists every Claude Code session in Herdr:
   what it does (working, waiting for you, idle), its space, the account it
-  runs on and that account's limits. `⏎` goes to the session.
+  runs on and that account's limits. `⏎` goes to the session. `d` ends it
+  after asking: its pane closes, and `claude --resume` finds the conversation
+  again. A session that is working or waiting for you can be ended too; the
+  question warns that its current work stops.
 - **Pane labels.** Each Claude Code pane carries the account it runs on, for
   the sidebar (see "Install").
 - **A note on first open.** The list explains the main login, the active
@@ -75,7 +78,7 @@ to the next account when one is at its limit.
   apart.
 - **Shells opened before setup.** They do not have the `claude` function;
   sessions started there run on the main login and show as "without
-  account" in the Spaces tab and "Main login (likely)" in the Sessions tab.
+  account" in the Spaces tab and "Main login (likely)" in the Agents tab.
   Open a new tab after setup.
 - **Removing an account with running sessions.** They stop working; the
   list warns before it removes one.
@@ -187,18 +190,18 @@ terminal.
 
 | Key | Does |
 |---|---|
-| `⏎` `Space` | Accounts: make active. Spaces: choose the space's account. Sessions: go to the session |
+| `⏎` `Space` | Accounts: make active. Spaces: choose the space's account. Agents: go to the session |
 | `a` | Add an account: subscription, subscription with SSO, or API key |
 | `l` | Sign in again, or store the key again |
 | `n` | Rename (the login stays) |
-| `d` | Remove: signs it out or deletes its key and deletes its folder of links; anything made only in that folder goes to `backups/` (asks first) |
+| `d` | Remove: signs it out or deletes its key and deletes its folder of links; anything made only in that folder goes to `backups/` (asks first). Agents: end the session; its pane closes (asks first) |
 | `c` | Start Claude Code with this account in a new tab |
 | `f` | Take part in fallback, or not |
 | `K` `J`, `Shift+↑` `Shift+↓` | Move the account up or down; fallback goes down the list |
 | `x` | Spaces: back to the active account |
 | `F` | Fallback on or off |
 | `S` | Set up the `claude` function and the status line |
-| `←` `→` `Tab` `1` `2` `3` | Accounts, spaces or sessions |
+| `←` `→` `Tab` `1` `2` `3` | Accounts, spaces or agents |
 | `r` | Refresh now (sign-in state is checked every 10 minutes) |
 | `i` | Nerd Font icons or plain symbols |
 | `?` | All keys and how the list works (scrolls with `↑` `↓` when the window is low) |

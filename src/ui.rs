@@ -644,7 +644,7 @@ fn draw_sessions(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
     let sessions = app.sessions();
     if sessions.is_empty() {
         let text = if !crate::herdr::inside() {
-            "Sessions are Herdr's: open this list inside Herdr."
+            "Agents are Herdr's: open this list inside Herdr."
         } else if app.panes.is_empty() {
             "Reading the sessions…"
         } else {
@@ -871,6 +871,7 @@ fn draw_footer(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
         ],
         Section::Sessions => vec![
             ("⏎", "go to session", '\n'),
+            ("d", "end session", 'd'),
             ("?", "all keys", '?'),
             ("q", "close", 'q'),
         ],
@@ -1036,7 +1037,7 @@ fn draw_input(frame: &mut Frame, i: &crate::app::Input) {
 }
 
 fn draw_confirm(frame: &mut Frame, app: &mut App, c: &crate::app::Confirm) {
-    let width = 76u16;
+    let width = 76u16.min(frame.area().width.saturating_sub(2)).max(24);
     let wrapped: Vec<Line> = c
         .lines
         .iter()
@@ -1274,12 +1275,18 @@ fn draw_help(frame: &mut Frame, app: &mut App) {
                 ("x", "back to the active account"),
             ],
         ),
-        ("Sessions", &[("⏎", "go to the session's tab")]),
+        (
+            "Agents",
+            &[
+                ("⏎", "go to the session's tab"),
+                ("d", "end the session: its pane closes (asks first)"),
+            ],
+        ),
         (
             "List",
             &[
                 ("↑ ↓  j k", "move"),
-                ("← →  Tab  1 2 3", "accounts / spaces / sessions"),
+                ("← →  Tab  1 2 3", "accounts / spaces / agents"),
                 ("F", "fallback on / off"),
                 ("S", "set up the claude command and the limits"),
                 ("r", "refresh now"),

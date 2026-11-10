@@ -201,6 +201,9 @@ looks. API keys and logins without limits are skipped.
 
 ## 2026-11-09: Sessions tab
 
+Renamed to the Agents tab on 2026-11-10 (see "Ending a session from the
+Agents tab").
+
 It should be visible which account each running session uses. The list
 already reads Herdr's panes for the Spaces tab, and each session started
 through the plugin carries its account as a pane label, so a third tab lists
@@ -308,3 +311,24 @@ notification command and pass, so nothing changes there. Passing the API key
 through an `apiKeyHelper` instead of the environment is a larger change for
 later.
 
+## 2026-11-10: Ending a session from the Agents tab
+
+The third tab is called "Agents", the word Herdr's sidebar uses for what it
+lists. Only the tab and the texts that name it changed: each row is still a
+"session" ("go to session", "end session"), as in the README, the reminder
+and fallback.
+
+`d` in the tab ends a session after asking, also one that is working or
+waiting for an answer (the question warns that its current work stops).
+Herdr has no command to end an agent (`herdr agent` only lists and reads),
+and typing `/exit` into another pane is neither offered to plugins nor read
+by a busy session, so ending closes the session's pane with `herdr pane
+close`. Claude Code has saved the conversation by then, so `claude --resume`
+finds it again. Before closing, the list asks Herdr for its panes once more
+and closes only when that pane still runs a Claude Code session: a row read
+seconds ago may belong to a pane that ended, or now runs something else. This
+does not contradict "Restarting is left to the user" in the reminder entry:
+the user asks for it, and the list asks back.
+
+`herdr pane close` is in Herdr 0.9.0 (its CLI reference and
+`src/cli/pane.rs` at tag `v0.9.0`), so `min_herdr_version` stays 0.9.0.

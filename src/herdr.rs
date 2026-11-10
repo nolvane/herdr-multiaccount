@@ -189,6 +189,11 @@ pub fn focus_tab(tab: &str) -> bool {
     run_quiet(&["tab", "focus", tab])
 }
 
+/// Closes a pane, and with it what runs in it.
+pub fn close_pane(pane: &str) -> bool {
+    run_quiet(&["pane", "close", pane])
+}
+
 /// Labels a pane with the account its Claude Code runs on.
 pub fn tag_pane(pane: &str, account: &str, id: &str, pid: u32) {
     let a = format!("{TOKEN}={account}");

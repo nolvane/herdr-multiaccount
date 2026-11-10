@@ -38,7 +38,7 @@ impl Section {
         match self {
             Section::Accounts => "Accounts",
             Section::Spaces => "Spaces",
-            Section::Sessions => "Sessions",
+            Section::Sessions => "Agents",
         }
     }
 
@@ -63,6 +63,11 @@ pub enum Hit {
 /// Runs the system's opener (first argument) on a web link, true when it
 /// could be started. Replaceable, so tests open nothing.
 pub type Opener = fn(&str, &str) -> bool;
+
+/// Reads Herdr's panes (`herdr::panes`), and closes one (`herdr::close_pane`);
+/// fields of the app so tests never reach Herdr.
+pub type PaneList = fn() -> Option<Vec<Pane>>;
+pub type PaneCloser = fn(&str) -> bool;
 
 /// The program that opens links: `open` on macOS, `xdg-open` elsewhere.
 const OPENER: &str = if cfg!(target_os = "macos") {
@@ -135,6 +140,11 @@ impl Input {
 pub enum ConfirmFor {
     Remove(String),
     Setup,
+    /// Ends the Claude Code session in this pane by closing the pane.
+    EndSession {
+        pane: String,
+        label: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -174,7 +184,7 @@ pub const INTRO: [&str; 6] = [
     "New sessions start on the active account; choose it with ⏎. Running sessions keep theirs, and a space can have an account of its own (Spaces).",
     "When an account is at its limit, new sessions go to the next account in the list that has room (fallback, F).",
     "Limits come from Claude Code: its /usage, read every minute while this list is open, and the status line of running sessions.",
-    "Sessions shows which account each Claude Code session runs on. ? shows all keys and this note again.",
+    "Agents shows which account each Claude Code session runs on. ? shows all keys and this note again.",
 ];
 
 /// The field an API key is pasted into.
@@ -217,6 +227,8 @@ pub struct App {
     pub quit: bool,
     pub hits: Vec<(Rect, Hit)>,
     pub opener: Opener,
+    pub pane_list: PaneList,
+    pub pane_closer: PaneCloser,
     pub cwd: Option<String>,
     pub read_at: Instant,
     next_files: Instant,
@@ -260,6 +272,8 @@ impl App {
             quit: false,
             hits: vec![],
             opener: open_in_browser,
+            pane_list: herdr::panes,
+            pane_closer: herdr::close_pane,
             cwd: std::env::current_dir()
                 .ok()
                 .map(|p| p.to_string_lossy().to_string()),
@@ -465,6 +479,79 @@ impl App {
         } else {
             self.flash("Herdr could not show that tab", crate::theme::RED);
         }
+    }
+
+    /// The account a session runs on, as the Agents tab names it.
+    fn session_account(&self, p: &Pane) -> String {
+        match (&p.account_id, &p.account) {
+            (Some(id), _) if self.store.account(id).is_some() => self.store.name_of(id),
+            (_, Some(name)) => name.clone(),
+            _ => format!("{} (likely)", self.store.name_of(MAIN_ID)),
+        }
+    }
+
+    /// Asks before ending the selected session (`d` in the Agents tab).
+    fn ask_end_session(&mut self) {
+        let Some(p) = self.sessions().get(self.session_sel).cloned() else {
+            return;
+        };
+        let label = if p.label.is_empty() {
+            p.id.clone()
+        } else {
+            p.label.clone()
+        };
+        let space = self.space_label(&p.workspace);
+        let account = self.session_account(&p);
+        let mut lines = vec![if space.is_empty() {
+            format!("It runs on {account}.")
+        } else {
+            format!("It runs in {space} on {account}.")
+        }];
+        match p.status.as_deref() {
+            Some("working") => {
+                lines.push("It is working right now: its current work stops.".into())
+            }
+            Some("blocked") => {
+                lines.push("It is waiting for your answer: its current work stops.".into())
+            }
+            _ => {}
+        }
+        lines.push("Its pane closes; claude --resume finds the conversation again.".into());
+        self.mode = Mode::Confirm(Confirm {
+            question: format!("End {label}?"),
+            lines,
+            purpose: ConfirmFor::EndSession { pane: p.id, label },
+        });
+    }
+
+    /// Closes the session's pane, after checking with Herdr that the pane
+    /// still runs that session: a row read seconds ago may be stale.
+    fn end_session(&mut self, pane: &str, label: &str) {
+        let Some(mut now) = (self.pane_list)() else {
+            self.flash(
+                "Herdr could not be asked; nothing was ended",
+                crate::theme::RED,
+            );
+            return;
+        };
+        let still = now.iter().any(|p| p.id == pane && self.is_session(p));
+        if still {
+            if !(self.pane_closer)(pane) {
+                self.flash(format!("Herdr could not close {label}"), crate::theme::RED);
+                return;
+            }
+            now.retain(|p| p.id != pane);
+            self.flash(format!("Ended {label}"), crate::theme::ACCENT);
+        } else {
+            self.flash(format!("{label} had already ended"), crate::theme::MUTED);
+        }
+        self.panes = now;
+        self.session_sel = self
+            .session_sel
+            .min(self.sessions().len().saturating_sub(1));
+        // A read started before the close would bring the row back.
+        self.herdr_rx = None;
+        self.start_herdr();
     }
 
     pub fn refresh_all(&mut self) {
@@ -1196,6 +1283,7 @@ impl App {
         self.mode = Mode::Normal;
         match c.purpose {
             ConfirmFor::Remove(id) => self.remove(&id),
+            ConfirmFor::EndSession { pane, label } => self.end_session(&pane, &label),
             ConfirmFor::Setup => {
                 match setup::apply() {
                     Ok(msg) => self.flash(msg, crate::theme::GREEN),
@@ -1433,6 +1521,11 @@ impl App {
                 KeyCode::Char('c') => self.start_claude(),
                 _ => {}
             },
+            _ if self.section == Section::Sessions => {
+                if matches!(k.code, KeyCode::Char('d') | KeyCode::Delete) {
+                    self.ask_end_session();
+                }
+            }
             _ if self.section == Section::Spaces => match k.code {
                 KeyCode::Char('x') | KeyCode::Backspace | KeyCode::Delete => {
                     if let Some(ws) = self.workspaces.get(self.space_sel).cloned() {
@@ -2175,5 +2268,317 @@ mod tests {
             "/nonexistent/opener",
             "https://example.com"
         ));
+    }
+
+    // ---- the Agents tab: ending a session ------------------------------
+
+    thread_local! {
+        /// The panes the test closer was asked to close, and what the test
+        /// pane list hands back, per test thread.
+        static CLOSED: std::cell::RefCell<Vec<String>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+        static FRESH: std::cell::RefCell<Option<Vec<Pane>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    fn closes(pane: &str) -> bool {
+        CLOSED.with(|c| c.borrow_mut().push(pane.into()));
+        true
+    }
+
+    fn cannot_close(pane: &str) -> bool {
+        closes(pane);
+        false
+    }
+
+    fn closed() -> Vec<String> {
+        CLOSED.with(|c| c.borrow_mut().drain(..).collect())
+    }
+
+    fn fresh() -> Option<Vec<Pane>> {
+        FRESH.with(|f| f.borrow().clone())
+    }
+
+    fn set_fresh(panes: Option<Vec<Pane>>) {
+        FRESH.with(|f| *f.borrow_mut() = panes);
+    }
+
+    fn pane(id: &str, tab: &str, label: &str, status: Option<&str>, account: Option<&str>) -> Pane {
+        Pane {
+            id: id.into(),
+            workspace: "w1".into(),
+            tab: tab.into(),
+            label: label.into(),
+            agent: Some("claude".into()),
+            status: status.map(str::to_string),
+            account: account.map(str::to_string),
+            account_id: account.map(str::to_string),
+        }
+    }
+
+    fn shell(id: &str, tab: &str) -> Pane {
+        Pane {
+            agent: None,
+            account: None,
+            account_id: None,
+            ..pane(id, tab, "zsh", None, None)
+        }
+    }
+
+    /// The Agents tab with two sessions on Personal (one in another tab) and
+    /// a plain shell next to the first; Herdr reports the same panes.
+    fn agents() -> App {
+        let mut a = app();
+        a.pane_list = fresh;
+        a.pane_closer = closes;
+        a.panes = vec![
+            pane(
+                "w1:p1",
+                "w1:t1",
+                "Fix the login bug",
+                Some("idle"),
+                Some("personal"),
+            ),
+            shell("w1:p2", "w1:t1"),
+            pane(
+                "w1:p3",
+                "w1:t2",
+                "Write the docs",
+                Some("idle"),
+                Some("personal"),
+            ),
+        ];
+        set_fresh(Some(a.panes.clone()));
+        closed();
+        a.section = Section::Sessions;
+        a
+    }
+
+    fn press(a: &mut App, code: KeyCode) {
+        a.key(KeyEvent::new(code, KeyModifiers::NONE));
+    }
+
+    fn screen_of(a: &mut App, w: u16, h: u16) -> Vec<String> {
+        let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+        t.draw(|f| ui::draw(f, a)).unwrap();
+        let buf = t.backend().buffer();
+        let rows: Vec<String> = (0..h)
+            .map(|y| (0..w).map(|x| buf[(x, y)].symbol().to_string()).collect())
+            .collect();
+        if std::env::var("SHOW_SCREEN").is_ok() {
+            println!("{}", rows.join("\n"));
+        }
+        rows
+    }
+
+    fn confirm(a: &App) -> Confirm {
+        match &a.mode {
+            Mode::Confirm(c) => c.clone(),
+            m => panic!("no question open: {m:?}"),
+        }
+    }
+
+    #[test]
+    fn the_third_tab_is_called_agents() {
+        let mut a = agents();
+        a.section = Section::Accounts;
+        press(&mut a, KeyCode::Char('3'));
+        assert_eq!(a.section, Section::Sessions, "3 reaches the tab");
+        let rows = screen_of(&mut a, 100, 30);
+        assert!(rows[0].contains("Agents (2)"), "{}", rows[0]);
+        assert!(!rows[0].contains("Sessions"), "{}", rows[0]);
+    }
+
+    #[test]
+    fn the_texts_that_name_the_tab_say_agents() {
+        assert!(INTRO[5].starts_with("Agents shows"), "{}", INTRO[5]);
+        let mut a = agents();
+        a.mode = Mode::Help;
+        let screen = screen_of(&mut a, 120, 60).join("\n");
+        assert!(screen.contains("accounts / spaces / agents"), "{screen}");
+        assert!(!screen.contains("Sessions"), "{screen}");
+        if !herdr::inside() {
+            let mut a = app();
+            a.section = Section::Sessions;
+            let screen = screen_of(&mut a, 100, 30).join("\n");
+            assert!(screen.contains("Agents are Herdr's"), "{screen}");
+        }
+    }
+
+    #[test]
+    fn d_asks_before_ending_a_session_and_names_it() {
+        for key in [KeyCode::Char('d'), KeyCode::Delete] {
+            let mut a = agents();
+            press(&mut a, key);
+            let c = confirm(&a);
+            assert_eq!(c.question, "End Fix the login bug?");
+            let text = c.lines.join(" ");
+            assert!(text.contains("acme-app"), "names the space: {text}");
+            assert!(text.contains("Personal"), "names the account: {text}");
+            assert!(text.contains("pane closes"), "{text}");
+            assert!(!text.contains("current work stops"), "an idle one: {text}");
+            assert!(closed().is_empty(), "nothing ended yet");
+            assert_eq!(a.sessions().len(), 2);
+        }
+    }
+
+    #[test]
+    fn yes_closes_only_that_pane_and_the_row_goes() {
+        let mut a = agents();
+        assert_eq!(a.running("personal"), 2);
+        press(&mut a, KeyCode::Char('j'));
+        press(&mut a, KeyCode::Char('d'));
+        assert_eq!(confirm(&a).question, "End Write the docs?");
+        press(&mut a, KeyCode::Char('y'));
+        assert_eq!(closed(), vec!["w1:p3".to_string()]);
+        assert_eq!(a.mode, Mode::Normal);
+        let left: Vec<String> = a.sessions().into_iter().map(|p| p.id).collect();
+        assert_eq!(left, vec!["w1:p1".to_string()], "the row is gone");
+        assert_eq!(a.session_sel, 0, "the selection moves to the neighbour");
+        assert!(
+            a.panes.iter().any(|p| p.id == "w1:p2"),
+            "the shell in the same space stays"
+        );
+        assert_eq!(a.running("personal"), 1, "the account counts one fewer");
+        assert_eq!(
+            a.flash.as_ref().map(|f| f.0.as_str()),
+            Some("Ended Write the docs")
+        );
+        let rows = screen_of(&mut a, 100, 30);
+        assert!(rows[0].contains("Agents (1)"), "{}", rows[0]);
+    }
+
+    #[test]
+    fn any_other_answer_keeps_the_session() {
+        for key in [
+            KeyCode::Char('n'),
+            KeyCode::Esc,
+            KeyCode::Char('x'),
+            KeyCode::Enter,
+        ] {
+            let mut a = agents();
+            let before = a.panes.clone();
+            press(&mut a, KeyCode::Char('d'));
+            press(&mut a, key);
+            assert_eq!(a.mode, Mode::Normal, "{key:?}");
+            assert!(closed().is_empty(), "{key:?}");
+            assert_eq!(a.panes, before, "{key:?}");
+        }
+    }
+
+    #[test]
+    fn a_busy_session_is_warned_about_and_still_ends() {
+        for status in ["working", "blocked"] {
+            let mut a = agents();
+            a.panes[0].status = Some(status.into());
+            set_fresh(Some(a.panes.clone()));
+            press(&mut a, KeyCode::Char('d'));
+            let text = confirm(&a).lines.join(" ");
+            assert!(text.contains("current work stops"), "{status}: {text}");
+            press(&mut a, KeyCode::Char('y'));
+            assert_eq!(closed(), vec!["w1:p1".to_string()], "{status}");
+        }
+    }
+
+    #[test]
+    fn a_session_that_ended_meanwhile_closes_nothing_else() {
+        // Gone from Herdr, or its pane now runs something else.
+        for now in [vec![shell("w1:p2", "w1:t1")], vec![shell("w1:p1", "w1:t1")]] {
+            let mut a = agents();
+            press(&mut a, KeyCode::Char('d'));
+            set_fresh(Some(now));
+            press(&mut a, KeyCode::Char('y'));
+            assert!(closed().is_empty());
+            assert_eq!(
+                a.flash.as_ref().map(|f| f.0.as_str()),
+                Some("Fix the login bug had already ended")
+            );
+            assert!(a.sessions().iter().all(|p| p.id != "w1:p1"));
+        }
+    }
+
+    #[test]
+    fn a_pane_herdr_cannot_close_stays_with_an_error() {
+        let mut a = agents();
+        a.pane_closer = cannot_close;
+        press(&mut a, KeyCode::Char('d'));
+        press(&mut a, KeyCode::Char('y'));
+        assert_eq!(closed(), vec!["w1:p1".to_string()]);
+        let flash = a.flash.clone().map(|f| (f.0, f.1));
+        assert_eq!(
+            flash,
+            Some((
+                "Herdr could not close Fix the login bug".to_string(),
+                crate::theme::RED
+            ))
+        );
+        assert_eq!(a.sessions().len(), 2, "the row stays");
+
+        // Herdr cannot be asked at all: nothing is closed either.
+        let mut a = agents();
+        press(&mut a, KeyCode::Char('d'));
+        set_fresh(None);
+        press(&mut a, KeyCode::Char('y'));
+        assert!(closed().is_empty());
+        assert_eq!(a.flash.as_ref().map(|f| f.1), Some(crate::theme::RED));
+        assert_eq!(a.sessions().len(), 2);
+    }
+
+    #[test]
+    fn d_does_nothing_in_an_empty_tab_and_still_removes_in_accounts() {
+        let mut a = agents();
+        a.panes = vec![shell("w1:p2", "w1:t1")];
+        press(&mut a, KeyCode::Char('d'));
+        assert_eq!(a.mode, Mode::Normal);
+        a.section = Section::Accounts;
+        a.sel = 1;
+        press(&mut a, KeyCode::Char('d'));
+        assert_eq!(confirm(&a).purpose, ConfirmFor::Remove("personal".into()));
+    }
+
+    #[test]
+    fn the_list_never_ends_itself() {
+        let mut a = agents();
+        a.panes = vec![pane("w1:p9", "w1:t1", "Multiaccount", Some("idle"), None)];
+        assert!(a.sessions().is_empty());
+        press(&mut a, KeyCode::Char('d'));
+        assert_eq!(a.mode, Mode::Normal);
+        assert!(closed().is_empty());
+    }
+
+    #[test]
+    fn the_footer_and_the_keys_overlay_show_the_new_key() {
+        let mut a = agents();
+        let rows = screen_of(&mut a, 100, 30);
+        assert!(rows[29].contains("d end session"), "{}", rows[29]);
+        a.mode = Mode::Help;
+        let screen = screen_of(&mut a, 120, 60).join("\n");
+        assert!(screen.contains("end the session"), "{screen}");
+        assert!(screen.contains("remove (asks first)"), "{screen}");
+        // A click on the footer key asks too.
+        let mut a = agents();
+        screen_of(&mut a, 100, 30);
+        let spot = a
+            .hits
+            .iter()
+            .find_map(|(r, h)| (*h == Hit::Key('d')).then_some(*r))
+            .expect("d in the footer");
+        a.click(spot.x, spot.y);
+        assert_eq!(confirm(&a).question, "End Fix the login bug?");
+    }
+
+    #[test]
+    fn the_question_draws_at_many_sizes() {
+        for (w, h) in [(160, 40), (100, 30), (60, 20), (40, 12)] {
+            let mut a = agents();
+            a.panes[0].status = Some("working".into());
+            press(&mut a, KeyCode::Char('d'));
+            let screen = screen_of(&mut a, w, h).join("\n");
+            assert!(screen.contains("End Fix"), "{w}x{h}: {screen}");
+            assert!(screen.contains("y yes"), "{w}x{h}: {screen}");
+            // Wrapped to the pane, not cut off at its edge.
+            let flat: String = screen.split_whitespace().collect::<Vec<_>>().join(" ");
+            assert!(flat.contains("work stops."), "{w}x{h}: {screen}");
+        }
     }
 }

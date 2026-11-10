@@ -5,8 +5,20 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- `d` in the Agents tab ends a Claude Code session after asking: its pane
+  closes and the row goes. The question warns when the session is working
+  or waiting for an answer, and nothing is closed when the pane ended or
+  runs something else by then.
+
+### Changed
+
+- The Sessions tab is called Agents, the word Herdr's sidebar uses.
+
 ### Fixed
 
+- Questions wrap to narrow panes instead of being cut off at the edge.
 - `o` in the sign-in dialog says when the browser opener could not be
   started, and opened links no longer leave an ended opener process behind
   while the list is open.
