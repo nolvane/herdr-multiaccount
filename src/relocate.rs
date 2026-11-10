@@ -648,6 +648,11 @@ pub fn run_noted(io: &dyn Io, dir: &Path, pane: &str, bin: &str, me: u32) {
     let result = run_move(io, &note.plan, bin);
     note.result = Some(result.clone());
     let file = note_file(dir, pane);
+    // A list already told this move as stopped (it ran past
+    // `MOVE_AT_MOST`): it is not told a second time.
+    if !file.exists() {
+        return;
+    }
     let written = write_note(dir, &note);
     if written && wait(io, LIST_WAIT, &|| !file.exists()) {
         return;
@@ -756,6 +761,8 @@ mod tests {
         /// move process waits (`list_takes`) and for the popup.
         dir: Option<PathBuf>,
         list_takes: bool,
+        /// A list tells the move as stopped while it still runs.
+        list_stops: bool,
         popup_opens: bool,
         /// The popup takes the report (it started).
         popup_takes: bool,
@@ -782,6 +789,7 @@ mod tests {
                 slept: RefCell::new(Duration::ZERO),
                 dir: None,
                 list_takes: false,
+                list_stops: false,
                 popup_opens: true,
                 popup_takes: true,
                 popups: RefCell::new(vec![]),
@@ -836,8 +844,11 @@ mod tests {
         }
         fn sleep(&self, d: Duration) {
             *self.slept.borrow_mut() += d;
-            if let (true, Some(dir)) = (self.list_takes, &self.dir) {
-                if read_note(dir, "w91:p1").is_some_and(|n| n.result.is_some()) {
+            if let Some(dir) = &self.dir {
+                let done = read_note(dir, "w91:p1").map(|n| n.result.is_some());
+                if (self.list_takes && done == Some(true))
+                    || (self.list_stops && done == Some(false))
+                {
                     assert!(take(dir, "w91:p1"));
                 }
             }
@@ -960,6 +971,20 @@ mod tests {
         // Runs once: a second start finds no note.
         run_noted(&io, &dir, "w91:p1", BIN, 4712);
         assert_eq!(io.ran.borrow().len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_move_a_list_told_as_stopped_is_not_told_again() {
+        let dir = scratch("stopped");
+        listed(&dir, plan());
+        let mut io = Fake::new(None, true);
+        io.dir = Some(dir.clone());
+        io.list_stops = true;
+        run_noted(&io, &dir, "w91:p1", BIN, 4711);
+        assert!(io.popups.borrow().is_empty());
+        assert!(io.notified.borrow().is_empty());
+        assert!(notes(&dir).is_empty(), "no second note");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

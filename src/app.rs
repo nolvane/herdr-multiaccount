@@ -4024,7 +4024,7 @@ mod tests {
     fn a_move_whose_process_is_gone_is_reported_once() {
         let a = movable();
         let dir = a.moves_dir.clone();
-        let mut plan = relocate::Plan {
+        let plan = relocate::Plan {
             pane: "w91:p1".into(),
             label: "Fix the login bug".into(),
             session_id: CONV.into(),
@@ -4071,7 +4071,6 @@ mod tests {
             poll(&mut b);
             assert_eq!(b.mode, Mode::Normal, "said once");
             assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
-            plan.pane = "w91:p1".into();
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
