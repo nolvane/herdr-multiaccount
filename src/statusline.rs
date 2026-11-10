@@ -27,8 +27,7 @@ pub fn account_of_session(store: &Store) -> Option<String> {
     match std::env::var_os("CLAUDE_CONFIG_DIR") {
         Some(dir) => {
             let dir = Path::new(&dir);
-            if dir.parent() == Some(paths::homes_dir().as_path()) {
-                let id = dir.file_name()?.to_string_lossy().to_string();
+            if let Some(id) = account_of_folder(dir, &paths::homes_dir()) {
                 return store.account(&id).map(|a| a.id.clone());
             }
             let same = |a: &Path, b: &Path| a.canonicalize().ok() == b.canonicalize().ok();
@@ -39,6 +38,29 @@ pub fn account_of_session(store: &Store) -> Option<String> {
         None if std::env::var_os("ANTHROPIC_API_KEY").is_some() => None,
         None => Some(MAIN_ID.to_string()),
     }
+}
+
+/// The account id whose folder `dir` is: its folder `homes/<id>/.claude`,
+/// or the old folder `homes/<id>` of an account from an older version.
+pub fn account_of_folder(dir: &Path, homes: &Path) -> Option<String> {
+    let home = match dir.file_name()? {
+        n if n == mirror::NEW => dir.parent()?,
+        _ => dir,
+    };
+    if home.parent() != Some(homes) {
+        return None;
+    }
+    let id = home.file_name()?.to_string_lossy().to_string();
+    crate::store::valid_id(&id).then_some(id)
+}
+
+/// The folder whose links the status line heals: the one the session runs
+/// on, when it is one of the account's folders.
+fn session_folder(id: &str) -> std::path::PathBuf {
+    std::env::var_os("CLAUDE_CONFIG_DIR")
+        .map(std::path::PathBuf::from)
+        .filter(|d| account_of_folder(d, &paths::homes_dir()).as_deref() == Some(id))
+        .unwrap_or_else(|| mirror::folder(id))
 }
 
 pub fn run() -> i32 {
@@ -63,7 +85,7 @@ pub fn run() -> i32 {
         if store.account(&id).is_some_and(|a| a.kind.has_home()) {
             let _ = mirror::sync_dirs(
                 &paths::claude_dir(),
-                &mirror::home_of(&id),
+                &session_folder(&id),
                 &id,
                 &paths::backups_dir(),
             );
@@ -229,5 +251,16 @@ mod tests {
         );
         assert_eq!(model_of(&json!({"model": {"display_name": "Opus"}})), None);
         assert_eq!(model_of(&json!({"model": {"id": "x; rm -rf ~"}})), None);
+    }
+
+    #[test]
+    fn both_folders_of_an_account_are_recognised() {
+        let homes = std::path::Path::new("/x/homes");
+        let of = |p: &str| super::account_of_folder(std::path::Path::new(p), homes);
+        assert_eq!(of("/x/homes/work/.claude").as_deref(), Some("work"));
+        assert_eq!(of("/x/homes/work").as_deref(), Some("work"), "old folder");
+        assert_eq!(of("/x/homes/.claude"), None);
+        assert_eq!(of("/x/other/work/.claude"), None);
+        assert_eq!(of("/x/homes/work/.claude/skills"), None);
     }
 }

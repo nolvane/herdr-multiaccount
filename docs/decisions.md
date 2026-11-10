@@ -579,3 +579,41 @@ space and its branch stay: closing a space only closes Herdr's state.
 `herdr workspace close [--group]` and the `worktree` field are in Herdr
 0.9.0 (`src/cli/workspace.rs` and `src/api/schema/workspaces.rs` at tag
 `v0.9.0`), so `min_herdr_version` stays 0.9.0.
+
+## 2026-11-10: Account folders named `.claude`; accounts from 1.0.0 sign in again
+
+Claude Code always asks before a write that reaches a protected path such as
+`.claude` through a link when the requested path does not name it, also in
+auto mode (https://code.claude.com/docs/en/permissions, "Symlinks";
+https://code.claude.com/docs/en/permission-modes, "Protected paths"). An
+account folder at `homes/<id>/` linked into `~/.claude`, so every edit of a
+skill or `CLAUDE.md` from an account asked. Each account's
+`CLAUDE_CONFIG_DIR` is now `homes/<id>/.claude/` with the same links, so the
+requested path names `.claude` as on the main login. Nothing in `~/.claude`
+changes, and which entries are shared stays the same; only an entry named
+`.claude` inside `~/.claude` is never linked, since the new folder has that
+name inside the old one.
+
+Claude Code keys a folder's keychain entry by the `CLAUDE_CONFIG_DIR` string
+as given (checked in Claude Code 2.1.311; the docs only say the entry is keyed
+to the directory), so a new path has no login, and a link cannot keep it.
+An undocumented variable would keep the old entry, but it may change with any
+Claude Code update and sign accounts out at an unpredictable time; it is not
+used. Accounts from 1.0.0 sign in again once instead. On Linux the login file
+in the old folder is not moved either: moving credential files around is
+what "Logins stay with Claude Code" rules out.
+
+Until it signs in again, an account keeps running on its old folder: the
+launcher picks the new folder once its config holds a login, else the old one
+when that holds one, else the new one (every sign-in goes there). The list
+row and each session started on the old folder say to press `l`. The new
+folder's `.claude.json` starts with the shared parts of the old one (MCP
+servers, per-project settings), never its account fields. Both folders share
+the lock `homes/<id>.lock`.
+
+The old folder is not signed out or cleared automatically after the new
+sign-in: a session an older version started outside Herdr cannot be seen,
+and clearing would take its skills and login while it runs. Once the new
+folder has a login the old one is never picked again, so it stays until the
+account is removed, which signs out every folder that holds a login and
+deletes both, links removed and never followed.

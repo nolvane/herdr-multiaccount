@@ -24,6 +24,9 @@ pub struct Info {
     pub email: Option<String>,
     /// Pro, Max 5x, Team, Enterprise, Console, API key …
     pub plan: Option<String>,
+    /// A subscription that still runs on the folder an older version made
+    /// and should sign in again (`mirror::on_old_folder`).
+    pub old_folder: bool,
 }
 
 /// Parses `claude auth status --text`. A row ending in "not in use" names a
@@ -173,7 +176,7 @@ pub fn read(account: &Account) -> Info {
             ..Info::default()
         },
         Kind::Main | Kind::Subscription => {
-            let home = (account.kind == Kind::Subscription).then(|| mirror::home_of(&account.id));
+            let home = (account.kind == Kind::Subscription).then(|| mirror::folder(&account.id));
             let json = match &home {
                 Some(h) => h.join(".claude.json"),
                 None => paths::main_claude_json(),
@@ -186,6 +189,8 @@ pub fn read(account: &Account) -> Info {
             } else if info.borrows_main {
                 info.signed_in = false;
             }
+            info.old_folder =
+                account.kind == Kind::Subscription && mirror::on_old_folder(&account.id);
             // The account fields in .claude.json describe the last claude.ai
             // login, which is not always the credential in use.
             if info.claude_ai {

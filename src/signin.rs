@@ -87,7 +87,10 @@ pub fn find_url(text: &str) -> Option<String> {
 
 impl SignIn {
     pub fn start(account: &Account, new_account: bool) -> Result<SignIn, String> {
-        mirror::sync(&account.id).map_err(|e| format!("could not prepare its folder: {e}"))?;
+        // Every sign-in goes to the account's (new) folder.
+        let dir = mirror::new_dir_of(&account.id);
+        mirror::sync_at(&account.id, &dir)
+            .map_err(|e| format!("could not prepare its folder: {e}"))?;
         let claude = launch::find_claude().ok_or("claude was not found on PATH")?;
         let mut cmd = Command::new(claude);
         // Clean first, so CLAUDE_CONFIG_DIR set below stays.
@@ -103,7 +106,7 @@ impl SignIn {
         if account.sso {
             cmd.arg("--sso");
         }
-        cmd.env("CLAUDE_CONFIG_DIR", mirror::home_of(&account.id))
+        cmd.env("CLAUDE_CONFIG_DIR", &dir)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());

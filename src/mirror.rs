@@ -3,14 +3,63 @@
 //! organisation's policy files); everything else is a link to the same entry
 //! in `~/.claude`, so settings, skills, plugins, memory and history stay one
 //! setup. Claude Code keeps each folder's login apart by itself (a keychain
-//! entry per folder on macOS).
+//! entry per folder on macOS, keyed by the folder's path as given).
+//!
+//! The folder is `homes/<id>/.claude`, so paths through its links name
+//! `.claude` as on the main login and Claude Code's permission checks treat
+//! them the same way. Version 1.0.0 used `homes/<id>` itself (the "old
+//! folder"); an account signed in there keeps using it until it signs in
+//! again in the new folder.
 
 use crate::paths;
 use serde_json::{Map, Value};
 use std::path::{Path, PathBuf};
 
+/// The name of an account's Claude Code folder inside `homes/<id>`.
+pub const NEW: &str = ".claude";
+
+/// The account's folder, `homes/<id>`: the old folder, and the place of the
+/// new one.
 pub fn home_of(id: &str) -> PathBuf {
     paths::homes_dir().join(id)
+}
+
+/// The account's Claude Code folder, `homes/<id>/.claude`.
+pub fn new_dir_of(id: &str) -> PathBuf {
+    home_of(id).join(NEW)
+}
+
+/// Whether Claude Code signed in in this folder at least once: it wrote the
+/// account into the folder's config. (Whether the login still works takes a
+/// second: `claude auth status`.)
+pub fn has_login(dir: &Path) -> bool {
+    std::fs::read_to_string(dir.join(".claude.json"))
+        .ok()
+        .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+        .is_some_and(|v| v["oauthAccount"].is_object())
+}
+
+/// The folder sessions of the account in `home` run on: the new folder once
+/// it has a login; the old folder while only that one has a login (an
+/// account from version 1.0.0 that has not signed in again); otherwise the new
+/// folder, where every sign-in happens.
+pub fn folder_in(home: &Path) -> PathBuf {
+    let new = home.join(NEW);
+    if !has_login(&new) && has_login(home) {
+        home.to_path_buf()
+    } else {
+        new
+    }
+}
+
+pub fn folder(id: &str) -> PathBuf {
+    folder_in(&home_of(id))
+}
+
+/// Whether the account still runs on its old folder and should sign in
+/// again.
+pub fn on_old_folder(id: &str) -> bool {
+    folder(id) == home_of(id)
 }
 
 /// Entries that belong to one login and are never shared.
@@ -94,8 +143,16 @@ fn relink(target: &Path, link: &Path) -> std::io::Result<()> {
 /// change the folder (or heal the same file) at once.
 pub struct Lock(#[allow(dead_code)] std::fs::File);
 
+/// One lock per account, `homes/<id>.lock`, for its old and its new folder.
+fn lock_file(dir: &Path) -> PathBuf {
+    match dir.parent() {
+        Some(home) if dir.file_name().is_some_and(|n| n == NEW) => home.with_extension("lock"),
+        _ => dir.with_extension("lock"),
+    }
+}
+
 pub fn lock(home: &Path) -> std::io::Result<Lock> {
-    let path = home.with_extension("lock");
+    let path = lock_file(home);
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
@@ -119,7 +176,9 @@ pub fn sync_dirs(main: &Path, home: &Path, id: &str, backups: &Path) -> std::io:
     let mut names: Vec<String> = Vec::new();
     for entry in std::fs::read_dir(main)? {
         let name = entry?.file_name().to_string_lossy().to_string();
-        if !is_own(&name) {
+        // The new folder lives under this name inside the old one, so it is
+        // never made a link.
+        if !is_own(&name) && name != NEW {
             names.push(name);
         }
     }
@@ -180,13 +239,41 @@ pub fn sync_dirs(main: &Path, home: &Path, id: &str, backups: &Path) -> std::io:
     Ok(report)
 }
 
-pub fn sync(id: &str) -> std::io::Result<Report> {
+/// Brings the folder sessions of the account run on in step; returns it.
+pub fn sync(id: &str) -> std::io::Result<(PathBuf, Report)> {
+    let dir = folder(id);
+    let report = sync_at(id, &dir)?;
+    Ok((dir, report))
+}
+
+/// Brings one of the account's folders in step: links, and the shared parts
+/// of `~/.claude.json` in its own copy.
+pub fn sync_at(id: &str, dir: &Path) -> std::io::Result<Report> {
     let main = paths::claude_dir();
     std::fs::create_dir_all(&main)?;
-    let home = home_of(id);
-    let report = sync_dirs(&main, &home, id, &paths::backups_dir())?;
-    let _lock = lock(&home)?;
-    sync_claude_json(&paths::main_claude_json(), &home.join(".claude.json"))?;
+    sync_folder(
+        &main,
+        &paths::main_claude_json(),
+        &home_of(id),
+        dir,
+        id,
+        &paths::backups_dir(),
+    )
+}
+
+fn sync_folder(
+    main: &Path,
+    main_json: &Path,
+    home: &Path,
+    dir: &Path,
+    id: &str,
+    backups: &Path,
+) -> std::io::Result<Report> {
+    let report = sync_dirs(main, dir, id, backups)?;
+    let _lock = lock(dir)?;
+    // A new folder starts with what the old one had of the shared parts.
+    let seed = (dir != home).then(|| home.join(".claude.json"));
+    sync_claude_json(main_json, &dir.join(".claude.json"), seed.as_deref())?;
     Ok(report)
 }
 
@@ -258,7 +345,16 @@ pub fn merge_claude_json(main: &Value, own: Option<&Value>) -> Value {
     Value::Object(out)
 }
 
-fn sync_claude_json(main: &Path, own: &Path) -> std::io::Result<()> {
+fn read_json(path: &Path) -> Option<Value> {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+}
+
+/// `seed`: where a missing own copy takes its first shared parts from (the
+/// old folder's copy; `merge_claude_json` takes only its MCP servers and
+/// per-project settings, never the account fields).
+fn sync_claude_json(main: &Path, own: &Path, seed: Option<&Path>) -> std::io::Result<()> {
     let Some(main_v) = std::fs::read_to_string(main)
         .ok()
         .and_then(|t| serde_json::from_str::<Value>(&t).ok())
@@ -273,7 +369,16 @@ fn sync_claude_json(main: &Path, own: &Path) -> std::io::Result<()> {
     if own_text.is_some() && own_v.is_none() {
         return Ok(());
     }
-    let merged = merge_claude_json(&main_v, own_v.as_ref());
+    let seeded = match (&own_v, seed.and_then(read_json)) {
+        // The first-run keys come from `~/.claude.json`; the old copy adds
+        // only its MCP servers and per-project settings.
+        (None, Some(old)) => Some(merge_claude_json(
+            &old,
+            Some(&merge_claude_json(&main_v, None)),
+        )),
+        _ => None,
+    };
+    let merged = merge_claude_json(&main_v, own_v.as_ref().or(seeded.as_ref()));
     if Some(&merged) == own_v.as_ref() {
         return Ok(());
     }
@@ -283,39 +388,51 @@ fn sync_claude_json(main: &Path, own: &Path) -> std::io::Result<()> {
     paths::write_private(own, text.as_bytes())
 }
 
-/// Real entries in an account's folder that are neither links nor its own
-/// login files: things made only there, which removing it keeps in backups.
-pub fn own_data(id: &str) -> Vec<String> {
-    let Ok(entries) = std::fs::read_dir(home_of(id)) else {
+/// The new folder inside `home`, when it is a real folder (never a link,
+/// which would lead somewhere else).
+fn real_new_dir(home: &Path) -> Option<PathBuf> {
+    let new = home.join(NEW);
+    std::fs::symlink_metadata(&new)
+        .is_ok_and(|m| m.is_dir())
+        .then_some(new)
+}
+
+/// Real entries of one folder that are neither links nor login files.
+fn data_in(dir: &Path, prefix: &str) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
         return vec![];
     };
-    let mut out: Vec<String> = entries
+    entries
         .flatten()
         .filter(|e| e.file_type().is_ok_and(|t| !t.is_symlink()))
         .map(|e| e.file_name().to_string_lossy().to_string())
-        .filter(|n| !is_own(n))
-        .collect();
+        .filter(|n| !is_own(n) && n != NEW)
+        .map(|n| format!("{prefix}{n}"))
+        .collect()
+}
+
+/// Real entries in an account's folders that are neither links nor its own
+/// login files: things made only there, which removing it keeps in backups.
+/// Entries of the new folder are named `.claude/<name>`.
+pub fn own_data(id: &str) -> Vec<String> {
+    own_data_in(&home_of(id))
+}
+
+fn own_data_in(home: &Path) -> Vec<String> {
+    let mut out = data_in(home, "");
+    if let Some(new) = real_new_dir(home) {
+        out.extend(data_in(&new, &format!("{NEW}/")));
+    }
     out.sort();
     out
 }
 
-/// Removes an account's folder: its links (never what they point to) and
-/// its own login files. Anything else that is real (a folder Claude Code
-/// made there before `~/.claude` had it) goes to `backups/` instead of being
-/// deleted; their names are returned.
-pub fn remove(id: &str) -> std::io::Result<Vec<String>> {
-    if !crate::store::valid_id(id) || id == crate::store::MAIN_ID {
-        return Ok(vec![]);
-    }
-    let home = home_of(id);
-    match std::fs::symlink_metadata(&home) {
-        Ok(m) if m.is_dir() => {}
-        _ => return Ok(vec![]),
-    }
-    let _lock = lock(&home)?;
-    let keep = paths::backups_dir().join(backup_name(&format!("{id}-removed")));
+/// Empties one folder: links are removed (never followed), login files
+/// deleted, anything else real moved to `keep`. Returns the names kept,
+/// with `prefix`. The new folder inside the old one is left to the caller.
+fn clear(dir: &Path, keep: &Path, prefix: &str) -> std::io::Result<Vec<String>> {
     let mut kept = Vec::new();
-    for entry in std::fs::read_dir(&home)? {
+    for entry in std::fs::read_dir(dir)? {
         let path = entry?.path();
         let name = path
             .file_name()
@@ -324,6 +441,8 @@ pub fn remove(id: &str) -> std::io::Result<Vec<String>> {
         let m = std::fs::symlink_metadata(&path)?;
         if m.file_type().is_symlink() {
             std::fs::remove_file(&path)?;
+        } else if name == NEW && m.is_dir() && prefix.is_empty() {
+            continue;
         } else if is_own(&name) {
             if m.is_dir() {
                 // Does not follow links inside it either.
@@ -332,13 +451,41 @@ pub fn remove(id: &str) -> std::io::Result<Vec<String>> {
                 std::fs::remove_file(&path)?;
             }
         } else {
-            std::fs::create_dir_all(&keep)?;
+            std::fs::create_dir_all(keep)?;
             std::fs::rename(&path, keep.join(&name))?;
-            kept.push(name);
+            kept.push(format!("{prefix}{name}"));
         }
     }
-    std::fs::remove_dir(&home)?;
-    let _ = std::fs::remove_file(home.with_extension("lock"));
+    Ok(kept)
+}
+
+/// Removes an account's folders, the new one and the old one around it:
+/// their links (never what they point to) and their own login files.
+/// Anything else that is real (a folder Claude Code made there before
+/// `~/.claude` had it) goes to `backups/` instead of being deleted; their
+/// names are returned.
+pub fn remove(id: &str) -> std::io::Result<Vec<String>> {
+    if !crate::store::valid_id(id) || id == crate::store::MAIN_ID {
+        return Ok(vec![]);
+    }
+    remove_in(&home_of(id), &paths::backups_dir(), id)
+}
+
+fn remove_in(home: &Path, backups: &Path, id: &str) -> std::io::Result<Vec<String>> {
+    match std::fs::symlink_metadata(home) {
+        Ok(m) if m.is_dir() => {}
+        _ => return Ok(vec![]),
+    }
+    let _lock = lock(home)?;
+    let keep = backups.join(backup_name(&format!("{id}-removed")));
+    let mut kept = Vec::new();
+    if let Some(new) = real_new_dir(home) {
+        kept.extend(clear(&new, &keep.join(NEW), &format!("{NEW}/"))?);
+        std::fs::remove_dir(&new)?;
+    }
+    kept.extend(clear(home, &keep, "")?);
+    std::fs::remove_dir(home)?;
+    let _ = std::fs::remove_file(lock_file(home));
     Ok(kept)
 }
 
@@ -532,5 +679,270 @@ mod tests {
         let merged = merge_claude_json(&main, Some(&own));
         assert_eq!(merged["mcpServers"]["mine"]["command"], "y");
         assert_eq!(merged["mcpServers"]["docs"]["command"], "x");
+    }
+
+    /// Every entry under `dir`, links not followed: path, and the link
+    /// target or the file's content.
+    fn snapshot(dir: &Path) -> Vec<(String, String)> {
+        let mut out = vec![];
+        let mut todo = vec![dir.to_path_buf()];
+        while let Some(d) = todo.pop() {
+            for e in std::fs::read_dir(&d).unwrap().flatten() {
+                let p = e.path();
+                let m = std::fs::symlink_metadata(&p).unwrap();
+                let what = if m.file_type().is_symlink() {
+                    format!("-> {}", std::fs::read_link(&p).unwrap().display())
+                } else if m.is_dir() {
+                    todo.push(p.clone());
+                    "dir".into()
+                } else {
+                    std::fs::read_to_string(&p).unwrap_or_default()
+                };
+                out.push((p.strip_prefix(dir).unwrap().display().to_string(), what));
+            }
+        }
+        out.sort();
+        out
+    }
+
+    fn is_link(p: &Path) -> bool {
+        std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_symlink())
+    }
+
+    const SIGNED_IN: &str = r#"{"oauthAccount":{"emailAddress":"alex@example.com"},"userID":"u1"}"#;
+
+    #[test]
+    fn which_folder_an_account_uses() {
+        let home = scratch("which").join("homes").join("work");
+        let new = home.join(NEW);
+        // Never signed in, or new: the new folder (no notice).
+        assert_eq!(folder_in(&home), new);
+        std::fs::create_dir_all(&home).unwrap();
+        // An old folder that never signed in does not count either.
+        std::fs::write(home.join(".claude.json"), r#"{"theme":"dark"}"#).unwrap();
+        assert_eq!(folder_in(&home), new);
+        // Signed in on the old folder by an older version: stays there.
+        std::fs::write(home.join(".claude.json"), SIGNED_IN).unwrap();
+        assert_eq!(folder_in(&home), home);
+        // The new folder exists but its sign-in was cancelled: still old.
+        std::fs::create_dir_all(&new).unwrap();
+        std::fs::write(new.join(".claude.json"), r#"{"theme":"dark"}"#).unwrap();
+        assert_eq!(folder_in(&home), home);
+        // Signed in again: the new folder from now on.
+        std::fs::write(new.join(".claude.json"), SIGNED_IN).unwrap();
+        assert_eq!(folder_in(&home), new);
+        assert!(new.ends_with(".claude"), "the path names .claude");
+        let _ = std::fs::remove_dir_all(home.parent().unwrap().parent().unwrap());
+    }
+
+    #[test]
+    fn both_folders_share_one_lock() {
+        let home = Path::new("/x/homes/work");
+        assert_eq!(lock_file(home), Path::new("/x/homes/work.lock"));
+        assert_eq!(lock_file(&home.join(NEW)), Path::new("/x/homes/work.lock"));
+    }
+
+    /// A fake `~/.claude`, `~/.claude.json` and an account signed in on its
+    /// old folder by an older version.
+    fn old_layout(root: &Path) -> (PathBuf, PathBuf, PathBuf) {
+        let main = root.join("dot-claude");
+        let main_json = root.join("dot-claude.json");
+        let home = root.join("homes").join("work");
+        std::fs::create_dir_all(main.join("skills").join("notes")).unwrap();
+        std::fs::write(main.join("skills").join("notes").join("SKILL.md"), "skill").unwrap();
+        std::fs::write(main.join("settings.json"), "{\"a\":1}").unwrap();
+        std::fs::write(main.join("CLAUDE.md"), "rules").unwrap();
+        std::fs::write(main.join(".credentials.json"), "main secret").unwrap();
+        std::fs::write(
+            &main_json,
+            r#"{"theme":"dark","oauthAccount":{"emailAddress":"main@example.com"},"mcpServers":{"docs":{"command":"x"}},"projects":{"/p":{"hasTrustDialogAccepted":true}}}"#,
+        )
+        .unwrap();
+        sync_dirs(&main, &home, "work", &root.join("backups")).unwrap();
+        std::fs::write(
+            home.join(".claude.json"),
+            r#"{"oauthAccount":{"emailAddress":"alex@example.com"},"userID":"u1","mcpServers":{"mine":{"command":"y"}},"projects":{"/q":{"hasTrustDialogAccepted":true}}}"#,
+        )
+        .unwrap();
+        std::fs::write(home.join(".credentials.json"), "old login").unwrap();
+        (main, main_json, home)
+    }
+
+    #[test]
+    fn the_new_folder_links_the_same_entries_and_starts_signed_out() {
+        let root = scratch("newfolder");
+        let (main, main_json, home) = old_layout(&root);
+        let before = snapshot(&main);
+        let new = home.join(NEW);
+        sync_folder(
+            &main,
+            &main_json,
+            &home,
+            &new,
+            "work",
+            &root.join("backups"),
+        )
+        .unwrap();
+        for name in ["skills", "settings.json", "CLAUDE.md"] {
+            assert!(is_link(&new.join(name)), "{name} is shared");
+            assert_eq!(std::fs::read_link(new.join(name)).unwrap(), main.join(name));
+        }
+        // A write through the new folder lands in ~/.claude.
+        assert_eq!(
+            std::fs::read_to_string(new.join("skills/notes/SKILL.md")).unwrap(),
+            "skill"
+        );
+        assert!(
+            !new.join(".credentials.json").exists(),
+            "no login is copied"
+        );
+        let json: Value =
+            serde_json::from_str(&std::fs::read_to_string(new.join(".claude.json")).unwrap())
+                .unwrap();
+        assert!(json.get("oauthAccount").is_none(), "{json}");
+        assert!(json.get("userID").is_none(), "{json}");
+        assert_eq!(json["theme"], "dark");
+        assert_eq!(json["mcpServers"]["docs"]["command"], "x");
+        assert_eq!(
+            json["mcpServers"]["mine"]["command"], "y",
+            "the old folder's server"
+        );
+        assert_eq!(json["projects"]["/p"]["hasTrustDialogAccepted"], true);
+        assert_eq!(json["projects"]["/q"]["hasTrustDialogAccepted"], true);
+        // The new folder has no login yet, so the account stays on the old
+        // folder, which still has everything.
+        assert!(!has_login(&new));
+        assert_eq!(folder_in(&home), home);
+        assert!(is_link(&home.join("skills")));
+        assert_eq!(
+            std::fs::read_to_string(home.join(".credentials.json")).unwrap(),
+            "old login"
+        );
+        // Syncing the old folder again leaves the new one alone.
+        sync_folder(
+            &main,
+            &main_json,
+            &home,
+            &home,
+            "work",
+            &root.join("backups"),
+        )
+        .unwrap();
+        assert!(std::fs::symlink_metadata(&new).unwrap().is_dir());
+        assert!(!is_link(&new));
+        assert_eq!(snapshot(&main), before, "nothing in ~/.claude changed");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_claude_entry_in_dot_claude_never_replaces_the_new_folder() {
+        let root = scratch("nested");
+        let main = root.join("main");
+        let home = root.join("home");
+        std::fs::create_dir_all(main.join(NEW)).unwrap();
+        std::fs::create_dir_all(home.join(NEW)).unwrap();
+        // Empty, as right after a cancelled sign-in.
+        let r = sync_dirs(&main, &home, "x", &root.join("backups")).unwrap();
+        assert_eq!(r.linked, 0);
+        assert!(!is_link(&home.join(NEW)));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn removing_takes_both_folders_and_never_follows_a_link() {
+        let root = scratch("remove-both");
+        let (main, main_json, home) = old_layout(&root);
+        let new = home.join(NEW);
+        sync_folder(
+            &main,
+            &main_json,
+            &home,
+            &new,
+            "work",
+            &root.join("backups"),
+        )
+        .unwrap();
+        std::fs::write(new.join(".claude.json"), SIGNED_IN).unwrap();
+        std::fs::write(new.join(".credentials.json"), "new login").unwrap();
+        std::fs::create_dir_all(new.join("plans")).unwrap();
+        std::fs::write(new.join("plans").join("a.md"), "mine").unwrap();
+        std::fs::create_dir_all(home.join("notes")).unwrap();
+        std::fs::write(lock_file(&home), "").unwrap();
+        let before = snapshot(&main);
+        let mut data = own_data_in(&home);
+        data.sort();
+        assert_eq!(data, vec![".claude/plans".to_string(), "notes".to_string()]);
+
+        let backups = root.join("backups");
+        let mut kept = remove_in(&home, &backups, "work").unwrap();
+        kept.sort();
+        assert_eq!(kept, vec![".claude/plans".to_string(), "notes".to_string()]);
+        assert!(
+            std::fs::symlink_metadata(&home).is_err(),
+            "both folders are gone"
+        );
+        assert!(!lock_file(&home).exists());
+        assert_eq!(snapshot(&main), before, "nothing in ~/.claude changed");
+        let saved = snapshot(&backups);
+        assert!(
+            saved
+                .iter()
+                .any(|(p, c)| p.ends_with(".claude/plans/a.md") && c == "mine"),
+            "{saved:?}"
+        );
+        assert!(
+            !saved.iter().any(|(_, c)| c.contains("login")),
+            "login files are deleted, not kept"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn removing_an_account_whose_claude_entry_is_a_link_only_unlinks_it() {
+        let root = scratch("remove-link");
+        let elsewhere = root.join("elsewhere");
+        let home = root.join("homes").join("work");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::write(elsewhere.join("keep.txt"), "keep").unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, home.join(NEW)).unwrap();
+        assert!(own_data_in(&home).is_empty());
+        remove_in(&home, &root.join("backups"), "work").unwrap();
+        assert!(std::fs::symlink_metadata(&home).is_err());
+        assert_eq!(
+            std::fs::read_to_string(elsewhere.join("keep.txt")).unwrap(),
+            "keep"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn removing_a_new_account_takes_its_folder() {
+        let root = scratch("remove-new");
+        let main = root.join("main");
+        let main_json = root.join("main.json");
+        let home = root.join("homes").join("fresh");
+        std::fs::create_dir_all(main.join("skills")).unwrap();
+        std::fs::write(&main_json, "{}").unwrap();
+        let before = snapshot(&main);
+        sync_folder(
+            &main,
+            &main_json,
+            &home,
+            &home.join(NEW),
+            "fresh",
+            &root.join("backups"),
+        )
+        .unwrap();
+        assert!(
+            !home.join(".claude.json").exists(),
+            "the old place stays empty"
+        );
+        assert!(remove_in(&home, &root.join("backups"), "fresh")
+            .unwrap()
+            .is_empty());
+        assert!(std::fs::symlink_metadata(&home).is_err());
+        assert_eq!(snapshot(&main), before);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

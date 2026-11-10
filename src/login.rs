@@ -48,7 +48,7 @@ pub fn of(account: &Account) -> Option<Login> {
     match account.kind {
         Kind::ApiKey => None,
         Kind::Main => read(&paths::main_claude_json()),
-        Kind::Subscription => read(&mirror::home_of(&account.id).join(".claude.json")),
+        Kind::Subscription => read(&mirror::folder(&account.id).join(".claude.json")),
     }
 }
 
