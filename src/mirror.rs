@@ -172,6 +172,11 @@ pub fn lock(home: &Path) -> std::io::Result<Lock> {
 /// over the link) is folded back: the newer of the two wins, the other goes
 /// to `backups/`, and the link is made again. Takes the folder's lock.
 pub fn sync_dirs(main: &Path, home: &Path, id: &str, backups: &Path) -> std::io::Result<Report> {
+    // An account folder is never a link: one (such as an old link named
+    // `.claude`) would lead the links into `~/.claude` itself.
+    if std::fs::symlink_metadata(home).is_ok_and(|m| m.file_type().is_symlink()) {
+        return Err(std::io::Error::other("the account folder is a link"));
+    }
     std::fs::create_dir_all(home)?;
     let _lock = lock(home)?;
     let mut report = Report::default();
@@ -989,6 +994,21 @@ mod tests {
             before,
             "nothing was written into ~/.claude"
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn links_are_never_made_through_a_folder_that_is_a_link() {
+        let root = scratch("linkhome");
+        let main = root.join("main");
+        let home = root.join("home");
+        std::fs::create_dir_all(main.join(NEW)).unwrap();
+        std::fs::write(main.join("settings.json"), "{}").unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        std::os::unix::fs::symlink(main.join(NEW), home.join(NEW)).unwrap();
+        let before = snapshot(&main);
+        assert!(sync_dirs(&main, &home.join(NEW), "x", &root.join("backups")).is_err());
+        assert_eq!(snapshot(&main), before);
         let _ = std::fs::remove_dir_all(&root);
     }
 }
