@@ -57,7 +57,7 @@ pub fn rc_file() -> Option<PathBuf> {
 }
 
 /// The binary path as the shell should write it (`$HOME/...`).
-fn bin_for_shell() -> String {
+pub(crate) fn bin_for_shell() -> String {
     let bin = paths::installed_bin();
     match bin.strip_prefix(paths::home()) {
         Ok(rest) => format!("$HOME/{}", rest.to_string_lossy()),

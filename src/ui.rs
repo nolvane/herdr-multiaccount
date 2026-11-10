@@ -871,6 +871,7 @@ fn draw_footer(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
         ],
         Section::Sessions => vec![
             ("⏎", "go to session", '\n'),
+            ("m", "move", 'm'),
             ("d", "end session", 'd'),
             ("?", "all keys", '?'),
             ("q", "close", 'q'),
@@ -1045,15 +1046,26 @@ fn draw_confirm(frame: &mut Frame, app: &mut App, c: &crate::app::Confirm) {
         .flat_map(|l| wrap(l, width.saturating_sub(6) as usize))
         .map(|l| Line::from(Span::styled(l, Style::new().fg(MUTED))))
         .collect();
-    let area = centered(frame.area(), width, wrapped.len() as u16 + 5);
+    let mut area = centered(frame.area(), width, wrapped.len() as u16 + 5);
+    if area.height < wrapped.len() as u16 + 5 {
+        // A short pane: the whole height, over the tabs and the footer.
+        area.y = frame.area().y;
+        area.height = frame.area().height;
+    }
     let inner = dialog(frame, area, &c.question);
+    // On a short pane the blank lines around the text go first.
+    let (top, rest) = if inner.height < wrapped.len() as u16 + 3 {
+        (0, 1)
+    } else {
+        (1, 3)
+    };
     frame.render_widget(
         Paragraph::new(Text::from(wrapped)),
         Rect::new(
             inner.x,
-            inner.y + 1,
+            inner.y + top,
             inner.width,
-            inner.height.saturating_sub(3),
+            inner.height.saturating_sub(rest),
         ),
     );
     let y = inner.y + inner.height.saturating_sub(1);
@@ -1280,6 +1292,10 @@ fn draw_help(frame: &mut Frame, app: &mut App) {
             "Agents",
             &[
                 ("⏎", "go to the session's tab"),
+                (
+                    "m",
+                    "move it to another account, with its conversation (asks first)",
+                ),
                 ("d", "end the session: its pane closes (asks first)"),
             ],
         ),

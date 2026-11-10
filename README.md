@@ -55,6 +55,17 @@ to the next account when one is at its limit.
   after asking: its pane closes, and `claude --resume` finds the conversation
   again. A session that is working or waiting for you can be ended too; the
   question warns that its current work stops.
+- **Move a running session.** `m` in the Agents tab moves an idle session to
+  another signed-in account: Claude Code in its pane ends and starts again
+  there on that account, with the same conversation, and the pane's label
+  follows. You pick from every other account (not one with the same login);
+  one at its limit hands over to the next account with room, as at any
+  start, and the question says where the session goes. The first answer
+  afterwards is slower and counts more against the new account's limit,
+  because Claude Code's cache of the conversation stays with the old login;
+  text typed but not sent is lost. A session that is working or waiting for
+  an answer is not moved. Sessions started without the plugin count as the
+  main login.
 - **Pane labels.** Each Claude Code pane carries the account it runs on, for
   the sidebar (see "Install").
 - **A note on first open.** The list explains the main login, the active
@@ -87,9 +98,6 @@ to the next account when one is at its limit.
 
 ### What it cannot do
 
-- **Switch a running session.** Claude Code picks its login when it starts.
-  To move a session that hit a limit: `/exit`, then `claude --continue`. The
-  history is shared, so it continues on the new account.
 - **Fresh limits while the list is closed.** Then only the status line of
   running sessions updates them; the last reading stays, and a window whose
   reset time has passed counts as fresh.
@@ -135,7 +143,8 @@ backs up each file first, and `herdr-multiaccount setup --undo` takes them back:
    records the usage windows and cost Claude Code hands the status line, for
    the account of that session, and then runs the status line command you had
    with the same input, so it looks as before. Without one, it shows the
-   account and its usage.
+   account and its usage. Inside Herdr it also notes which conversation
+   (Claude Code's session id) each pane holds, so `m` can move it.
 
 While the list is open, it also runs Claude Code's own `/usage` command for
 each signed-in subscription once a minute (`claude -p /usage` in the
@@ -195,6 +204,7 @@ terminal.
 | `l` | Sign in again, or store the key again |
 | `n` | Rename (the login stays) |
 | `d` | Remove: signs it out or deletes its key and deletes its folder of links; anything made only in that folder goes to `backups/` (asks first). Agents: end the session; its pane closes (asks first) |
+| `m` | Agents: move the session to another account, with its conversation (asks first) |
 | `c` | Start Claude Code with this account in a new tab |
 | `f` | Take part in fallback, or not |
 | `K` `J`, `Shift+↑` `Shift+↓` | Move the account up or down; fallback goes down the list |
@@ -250,6 +260,7 @@ Everything lives in the plugin's config directory
 | `backups/` | Files replaced by setup or when a link was restored; only you can open it, and each copy keeps the original's permissions |
 | `probe/` | Where the limit checks run (empty) |
 | `sessions/<pane>.json` | The account of each session started through the plugin, removed when it ends |
+| `conversations/<pane>.json` | Which conversation each Claude Code pane holds, from its status line; dropped after a week |
 
 ## Development
 

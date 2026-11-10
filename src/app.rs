@@ -6,6 +6,7 @@ use crate::info::{self, Info};
 use crate::launch;
 use crate::mirror;
 use crate::paths;
+use crate::relocate;
 use crate::secret;
 use crate::setup;
 use crate::signin::SignIn;
@@ -68,6 +69,11 @@ pub type Opener = fn(&str, &str) -> bool;
 /// fields of the app so tests never reach Herdr.
 pub type PaneList = fn() -> Option<Vec<Pane>>;
 pub type PaneCloser = fn(&str) -> bool;
+/// The conversation a pane holds now and its Claude Code process
+/// (`real_conversation`), and the move itself (`relocate::perform`); fields
+/// so tests never reach Herdr.
+pub type ConversationOf = fn(&str) -> Option<(String, u32)>;
+pub type Mover = fn(relocate::Plan) -> Result<String, String>;
 
 /// The program that opens links: `open` on macOS, `xdg-open` elsewhere.
 const OPENER: &str = if cfg!(target_os = "macos") {
@@ -86,7 +92,23 @@ pub enum AddKind {
 #[derive(Debug, Clone, PartialEq)]
 pub enum PickFor {
     AddKind,
-    Space { workspace: String, label: String },
+    Space {
+        workspace: String,
+        label: String,
+    },
+    /// The account to move a running session to.
+    MoveSession(Moving),
+}
+
+/// A session to move, as the list saw it when `m` was pressed.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Moving {
+    pub pane: String,
+    pub label: String,
+    pub session_id: String,
+    pub pid: u32,
+    /// The account it runs on now (the main login when unknown).
+    pub from: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -144,6 +166,11 @@ pub enum ConfirmFor {
     EndSession {
         pane: String,
         label: String,
+    },
+    /// Moves the session to the account `to`.
+    MoveSession {
+        session: Moving,
+        to: String,
     },
 }
 
@@ -229,6 +256,13 @@ pub struct App {
     pub opener: Opener,
     pub pane_list: PaneList,
     pub pane_closer: PaneCloser,
+    pub conversation_of: ConversationOf,
+    pub mover: Mover,
+    /// Whether the list runs inside Herdr (`herdr::inside`).
+    pub in_herdr: bool,
+    /// A move that runs: its session's name, and where its result arrives.
+    pub moving: Option<String>,
+    move_rx: Option<Receiver<Result<String, String>>>,
     pub cwd: Option<String>,
     pub read_at: Instant,
     next_files: Instant,
@@ -274,6 +308,11 @@ impl App {
             opener: open_in_browser,
             pane_list: herdr::panes,
             pane_closer: herdr::close_pane,
+            conversation_of: real_conversation,
+            mover: relocate::perform,
+            in_herdr: herdr::inside(),
+            moving: None,
+            move_rx: None,
             cwd: std::env::current_dir()
                 .ok()
                 .map(|p| p.to_string_lossy().to_string()),
@@ -558,6 +597,287 @@ impl App {
         self.next_herdr = Instant::now() + Duration::from_secs(1);
     }
 
+    /// The account id a session runs on; the main login when the list
+    /// does not know it (started without the plugin).
+    fn session_account_id(&self, p: &Pane) -> String {
+        p.account_id
+            .as_deref()
+            .filter(|id| self.store.account(id).is_some())
+            .unwrap_or(MAIN_ID)
+            .to_string()
+    }
+
+    /// Whether `id` is `of` or has the same login.
+    fn same_login(&self, of: &str, id: &str) -> bool {
+        id == of
+            || self
+                .twins
+                .get(of)
+                .is_some_and(|t| t.iter().any(|x| x == id))
+    }
+
+    /// Whether a session can be moved to an account: it is checked and
+    /// signed in with a login (or key) of its own, as the launcher demands.
+    fn can_take(&self, id: &str) -> bool {
+        self.store.account(id).is_some()
+            && self
+                .info
+                .get(id)
+                .is_some_and(|i| i.signed_in && !i.borrows_main)
+    }
+
+    /// Why a session cannot be moved now, from Herdr's status.
+    fn not_idle(label: &str, status: Option<&str>) -> Option<String> {
+        match status {
+            Some("idle") | Some("done") => None,
+            Some("working") => Some(format!(
+                "{label} can only be moved while it waits for you; it is working"
+            )),
+            Some("blocked") => Some(format!(
+                "{label} can only be moved while it waits for you; it waits for your answer"
+            )),
+            _ => Some(format!(
+                "Herdr cannot tell whether {label} is idle; try again in a moment"
+            )),
+        }
+    }
+
+    fn pane_name(p: &Pane) -> String {
+        if p.label.is_empty() {
+            p.id.clone()
+        } else {
+            p.label.clone()
+        }
+    }
+
+    /// `m` in the Agents tab: the accounts to move the selected session to.
+    fn ask_move_session(&mut self) {
+        if !self.in_herdr {
+            self.flash("Only inside Herdr", crate::theme::MUTED);
+            return;
+        }
+        if let Some(label) = &self.moving {
+            self.flash(
+                format!("{label} is being moved; wait a moment"),
+                crate::theme::MUTED,
+            );
+            return;
+        }
+        let Some(p) = self.sessions().get(self.session_sel).cloned() else {
+            return;
+        };
+        let label = Self::pane_name(&p);
+        if let Some(why) = Self::not_idle(&label, p.status.as_deref()) {
+            self.flash(why, crate::theme::YELLOW);
+            return;
+        }
+        let from = self.session_account_id(&p);
+        let Some((session_id, pid)) = (self.conversation_of)(&p.id) else {
+            self.mode = Mode::Message {
+                title: format!("Which conversation {label} holds is not known"),
+                lines: vec![
+                    "Its status line notes it (every 30 seconds while it runs), and only once setup (S) is done. Try again in a moment.".into(),
+                    format!(
+                        "To move it by hand: type /exit in it, then {}=<account> claude --resume and pick the conversation.",
+                        launch::ENV_USE
+                    ),
+                ],
+                good: false,
+            };
+            return;
+        };
+        let now = self.now();
+        let items: Vec<PickItem> = self
+            .store
+            .accounts
+            .iter()
+            .filter(|a| !self.same_login(&from, &a.id) && self.can_take(&a.id))
+            .map(|a| {
+                let limit = self
+                    .usage
+                    .get(&a.id)
+                    .and_then(|u| u.at_limit(self.config.threshold, now));
+                let detail = match limit {
+                    Some(l) => format!(
+                        "at its {} limit, resets in {}",
+                        l.window,
+                        time::span(l.resets_at - now)
+                    ),
+                    None => self
+                        .info
+                        .get(&a.id)
+                        .and_then(|i| i.plan.clone())
+                        .unwrap_or_default(),
+                };
+                PickItem {
+                    label: a.name.clone(),
+                    detail,
+                    value: Some(a.id.clone()),
+                }
+            })
+            .collect();
+        if items.is_empty() {
+            self.flash(
+                if self.info_loading {
+                    "The accounts are still being checked; try again in a moment".to_string()
+                } else {
+                    format!("No other signed-in account to move {label} to")
+                },
+                crate::theme::MUTED,
+            );
+            return;
+        }
+        self.mode = Mode::Pick(Picker {
+            title: format!("Move {label} to"),
+            items,
+            sel: 0,
+            purpose: PickFor::MoveSession(Moving {
+                pane: p.id,
+                label,
+                session_id,
+                pid,
+                from,
+            }),
+        });
+    }
+
+    /// Where a session picked for `wanted` goes: fallback as at any start,
+    /// never back to its own login.
+    pub fn move_target(&self, from: &str, wanted: &str) -> launch::Choice {
+        let check = |id: &str| !self.same_login(from, id) && self.can_take(id);
+        launch::choose(
+            &self.store,
+            &self.config,
+            &self.usage,
+            &check,
+            wanted.to_string(),
+            launch::Source::Active,
+            self.now(),
+        )
+    }
+
+    /// Asks before the move, saying where it goes and what it costs.
+    fn ask_move_to(&mut self, session: Moving, wanted: &str) {
+        let choice = self.move_target(&session.from, wanted);
+        let to = self.store.name_of(&choice.id);
+        let picked = self.store.name_of(wanted);
+        let mut lines = vec![];
+        let now = self.now();
+        let full = self
+            .usage
+            .get(wanted)
+            .and_then(|u| u.at_limit(self.config.threshold, now));
+        match (&choice.moved, full) {
+            (Some(l), _) => lines.push(format!(
+                "{picked} is at its {} limit, so it goes to {to}.",
+                l.window
+            )),
+            (None, Some(l)) if !self.config.fallback => lines.push(format!(
+                "{picked} is at its {} limit; fallback is off.",
+                l.window
+            )),
+            (None, Some(l)) => lines.push(format!(
+                "{picked} is at its {} limit; no other account has room.",
+                l.window
+            )),
+            _ => {}
+        }
+        lines.push(
+            "It restarts there and its conversation carries on; unsent text in it is lost.".into(),
+        );
+        // The conversation's cache stays with the old login.
+        lines.push(format!(
+            "The first answer is slower and counts more against {to}'s limit (an API key: costs more)."
+        ));
+        self.mode = Mode::Confirm(Confirm {
+            question: format!("Move {} to {to}?", session.label),
+            lines,
+            purpose: ConfirmFor::MoveSession {
+                session,
+                to: choice.id,
+            },
+        });
+    }
+
+    /// Starts the move after checking with Herdr once more that the session
+    /// is still there, idle, and holds the same conversation.
+    fn move_session(&mut self, s: Moving, to: &str) {
+        let Some(now) = (self.pane_list)() else {
+            self.flash(
+                "Herdr could not be asked; nothing was moved",
+                crate::theme::RED,
+            );
+            return;
+        };
+        let label = s.label.clone();
+        let Some(p) = now.iter().find(|p| p.id == s.pane && self.is_session(p)) else {
+            self.flash(
+                format!("{label} has ended; nothing was moved"),
+                crate::theme::MUTED,
+            );
+            return;
+        };
+        if let Some(why) = Self::not_idle(&label, p.status.as_deref()) {
+            self.flash(format!("{why}; nothing was moved"), crate::theme::YELLOW);
+            return;
+        }
+        if (self.conversation_of)(&s.pane) != Some((s.session_id.clone(), s.pid)) {
+            self.flash(
+                format!("{label} holds another conversation now; nothing was moved"),
+                crate::theme::YELLOW,
+            );
+            return;
+        }
+        let plan = relocate::Plan {
+            pane: s.pane,
+            label: label.clone(),
+            session_id: s.session_id,
+            pid: s.pid,
+            account_id: to.to_string(),
+            account_name: self.store.name_of(to),
+        };
+        let (tx, rx) = channel();
+        let mover = self.mover;
+        std::thread::spawn(move || {
+            let _ = tx.send(mover(plan));
+        });
+        self.move_rx = Some(rx);
+        self.flash(
+            format!("Moving {label} to {}…", self.store.name_of(to)),
+            crate::theme::ACCENT,
+        );
+        self.moving = Some(label);
+    }
+
+    /// Takes the result of a move once it is done.
+    pub fn receive_move(&mut self) {
+        let Some(rx) = &self.move_rx else {
+            return;
+        };
+        let result = match rx.try_recv() {
+            Ok(r) => r,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                Err("The move stopped unexpectedly; look at the pane.".into())
+            }
+        };
+        self.move_rx = None;
+        let label = self.moving.take().unwrap_or_default();
+        match result {
+            Ok(msg) => self.flash(msg, crate::theme::GREEN),
+            Err(e) => {
+                self.mode = Mode::Message {
+                    title: format!("{label} was not moved"),
+                    lines: vec![e],
+                    good: false,
+                };
+            }
+        }
+        // The pane's new label and note show on the next read.
+        self.herdr_rx = None;
+        self.next_herdr = Instant::now() + Duration::from_secs(1);
+    }
+
     pub fn refresh_all(&mut self) {
         self.reload_files();
         self.setup = setup::state();
@@ -763,6 +1083,11 @@ impl App {
                     purpose: InputFor::NewAccount(kind),
                     secret: false,
                 });
+            }
+            PickFor::MoveSession(session) => {
+                if let Some(id) = item.value.as_deref() {
+                    self.ask_move_to(session, id);
+                }
             }
             PickFor::Space { workspace, label } => {
                 self.mode = Mode::Normal;
@@ -1207,7 +1532,7 @@ impl App {
         let Some(a) = self.selected().cloned() else {
             return;
         };
-        if !herdr::inside() {
+        if !self.in_herdr {
             self.flash("Only inside Herdr", crate::theme::MUTED);
             return;
         }
@@ -1288,6 +1613,7 @@ impl App {
         match c.purpose {
             ConfirmFor::Remove(id) => self.remove(&id),
             ConfirmFor::EndSession { pane, label } => self.end_session(&pane, &label),
+            ConfirmFor::MoveSession { session, to } => self.move_session(session, &to),
             ConfirmFor::Setup => {
                 match setup::apply() {
                     Ok(msg) => self.flash(msg, crate::theme::GREEN),
@@ -1367,7 +1693,15 @@ impl App {
             Mode::AskQuit => {
                 self.mode = Mode::Normal;
                 if k.code == KeyCode::Char('y') {
-                    self.quit = true;
+                    // Quitting halfway would leave the session ended.
+                    if let Some(label) = self.moving.clone() {
+                        self.flash(
+                            format!("{label} is being moved; quit once it is done"),
+                            crate::theme::YELLOW,
+                        );
+                    } else {
+                        self.quit = true;
+                    }
                 }
             }
             Mode::Help => match k.code {
@@ -1525,11 +1859,20 @@ impl App {
                 KeyCode::Char('c') => self.start_claude(),
                 _ => {}
             },
-            _ if self.section == Section::Sessions => {
-                if matches!(k.code, KeyCode::Char('d') | KeyCode::Delete) {
-                    self.ask_end_session();
+            _ if self.section == Section::Sessions => match k.code {
+                KeyCode::Char('d') | KeyCode::Delete => {
+                    if let Some(label) = self.moving.clone() {
+                        self.flash(
+                            format!("{label} is being moved; wait a moment"),
+                            crate::theme::MUTED,
+                        );
+                    } else {
+                        self.ask_end_session();
+                    }
                 }
-            }
+                KeyCode::Char('m') => self.ask_move_session(),
+                _ => {}
+            },
             _ if self.section == Section::Spaces => match k.code {
                 KeyCode::Char('x') | KeyCode::Backspace | KeyCode::Delete => {
                     if let Some(ws) = self.workspaces.get(self.space_sel).cloned() {
@@ -1681,6 +2024,7 @@ impl App {
             self.receive_herdr();
             self.receive_info();
             self.receive_probe();
+            self.receive_move();
             if Instant::now() >= self.next_probe {
                 self.start_probe();
             }
@@ -1708,6 +2052,14 @@ impl App {
         }
         Ok(())
     }
+}
+
+/// The conversation the status line noted for a pane, while its Claude
+/// Code still runs in front there: its session id and process.
+pub fn real_conversation(pane: &str) -> Option<(String, u32)> {
+    let note = crate::sessions::conversation(pane)?;
+    let pid = crate::sessions::front_process(&note, &herdr::process_info(pane)?)?;
+    Some((note.session_id, pid))
 }
 
 /// Starts `opener` (`open`, `xdg-open`) on `url`. It is waited on in the
@@ -2587,6 +2939,470 @@ mod tests {
             // the question shows whole.
             let shown: Vec<&str> = screen.split_whitespace().collect();
             for word in confirm(&a).lines.iter().flat_map(|l| l.split_whitespace()) {
+                assert!(shown.contains(&word), "{w}x{h}: {word} cut off\n{screen}");
+            }
+        }
+    }
+
+    // ---- moving a session (m) ----------------------------------------
+
+    const CONV: &str = "0b7f3c2e-1d4a-4c6b-9e8f-a1b2c3d4e5f6";
+
+    fn knows(_: &str) -> Option<(String, u32)> {
+        Some((CONV.into(), 4242))
+    }
+
+    fn knows_nothing(_: &str) -> Option<(String, u32)> {
+        None
+    }
+
+    fn knows_another(_: &str) -> Option<(String, u32)> {
+        Some(("11111111-2222-4333-8444-555555555555".into(), 4243))
+    }
+
+    /// Hands back what it was asked to do, without Herdr.
+    fn moves(p: relocate::Plan) -> Result<String, String> {
+        Ok(format!(
+            "moved {} {} {} {} to {}",
+            p.pane, p.label, p.session_id, p.pid, p.account_id
+        ))
+    }
+
+    fn fails(_: relocate::Plan) -> Result<String, String> {
+        Err("Claude Code did not end in it, so nothing was started. By hand: type /exit in it, then HERDR_MULTIACCOUNT_USE=work claude --resume x.".into())
+    }
+
+    fn signed_in(plan: &str) -> Info {
+        Info {
+            signed_in: true,
+            plan: Some(plan.into()),
+            ..Info::default()
+        }
+    }
+
+    /// The Agents tab inside Herdr, with Personal (where both sessions
+    /// run), Work and the main login, all signed in.
+    fn movable() -> App {
+        let mut a = agents();
+        a.in_herdr = true;
+        a.conversation_of = knows;
+        a.mover = moves;
+        a.store.accounts.push(Account {
+            id: "work".into(),
+            name: "Work".into(),
+            kind: Kind::Subscription,
+            sso: false,
+            fallback: true,
+        });
+        a.info_loading = false;
+        a.info = HashMap::new();
+        for (id, plan) in [("main", "Max 5x"), ("personal", "Pro"), ("work", "Team")] {
+            a.info.insert(id.into(), signed_in(plan));
+        }
+        a
+    }
+
+    fn picker(a: &App) -> Picker {
+        match &a.mode {
+            Mode::Pick(p) => p.clone(),
+            m => panic!("no picker open: {m:?}"),
+        }
+    }
+
+    fn names(p: &Picker) -> Vec<String> {
+        p.items.iter().map(|i| i.label.clone()).collect()
+    }
+
+    fn flash_text(a: &App) -> String {
+        a.flash.as_ref().map(|f| f.0.clone()).unwrap_or_default()
+    }
+
+    /// Waits for the move started in the background.
+    fn finish(a: &mut App) {
+        for _ in 0..200 {
+            a.receive_move();
+            if a.moving.is_none() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        panic!("the move never finished");
+    }
+
+    fn full_at(pct: f64, now: i64) -> Usage {
+        let mut u = Usage::default();
+        u.record(
+            &serde_json::json!({"rate_limits": {"five_hour": {"used_percentage": pct, "resets_at": now + 3600}}}),
+            now,
+        );
+        u
+    }
+
+    #[test]
+    fn m_offers_the_other_signed_in_accounts_but_not_its_own_login() {
+        let mut a = movable();
+        // "Old" has the same login as Personal; "Unchecked" is not checked
+        // yet; "Borrowed" has no login of its own.
+        for (id, name) in [
+            ("old", "Old"),
+            ("unchecked", "Unchecked"),
+            ("borrowed", "Borrowed"),
+        ] {
+            a.store.accounts.push(Account {
+                id: id.into(),
+                name: name.into(),
+                kind: Kind::Subscription,
+                sso: false,
+                fallback: true,
+            });
+        }
+        a.info.insert("old".into(), signed_in("Pro"));
+        a.info.insert(
+            "borrowed".into(),
+            Info {
+                signed_in: true,
+                borrows_main: true,
+                ..Info::default()
+            },
+        );
+        a.twins.insert("personal".into(), vec!["old".into()]);
+        press(&mut a, KeyCode::Char('m'));
+        let p = picker(&a);
+        assert_eq!(
+            names(&p),
+            vec!["Main login".to_string(), "Work".to_string()]
+        );
+        assert_eq!(p.title, "Move Fix the login bug to");
+        assert_eq!(p.items[1].detail, "Team");
+    }
+
+    #[test]
+    fn a_session_without_known_account_counts_as_the_main_login() {
+        let mut a = movable();
+        a.panes[0].account = None;
+        a.panes[0].account_id = None;
+        press(&mut a, KeyCode::Char('m'));
+        assert_eq!(
+            names(&picker(&a)),
+            vec!["Personal".to_string(), "Work".to_string()]
+        );
+    }
+
+    #[test]
+    fn picking_and_yes_moves_that_conversation_to_that_account() {
+        let mut a = movable();
+        press(&mut a, KeyCode::Char('m'));
+        press(&mut a, KeyCode::Char('2'));
+        let c = confirm(&a);
+        assert_eq!(c.question, "Move Fix the login bug to Work?");
+        let text = c.lines.join(" ");
+        assert!(text.contains("slower"), "{text}");
+        assert!(text.contains("counts more against Work"), "{text}");
+        assert!(text.contains("API key"), "{text}");
+        assert!(text.contains("unsent text in it is lost"), "{text}");
+        assert!(!text.contains("limit,"), "no fallback note: {text}");
+        press(&mut a, KeyCode::Char('y'));
+        assert_eq!(a.moving.as_deref(), Some("Fix the login bug"));
+        finish(&mut a);
+        assert_eq!(
+            flash_text(&a),
+            format!("moved w91:p1 Fix the login bug {CONV} 4242 to work")
+        );
+        assert_eq!(a.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn a_busy_session_is_not_moved() {
+        for (status, says) in [
+            (Some("working"), "it is working"),
+            (Some("blocked"), "waits for your answer"),
+            (None, "cannot tell"),
+        ] {
+            let mut a = movable();
+            a.panes[0].status = status.map(str::to_string);
+            press(&mut a, KeyCode::Char('m'));
+            assert_eq!(a.mode, Mode::Normal, "{status:?}");
+            assert!(
+                flash_text(&a).contains(says),
+                "{status:?}: {}",
+                flash_text(&a)
+            );
+            assert!(a.moving.is_none());
+        }
+        // Done counts as waiting for you.
+        let mut a = movable();
+        a.panes[0].status = Some("done".into());
+        press(&mut a, KeyCode::Char('m'));
+        picker(&a);
+    }
+
+    #[test]
+    fn a_session_that_got_busy_or_changed_before_yes_stays() {
+        type Change = fn(&mut App);
+        let cases: [(Change, &str); 4] = [
+            (
+                |a| {
+                    let mut now = a.panes.clone();
+                    now[0].status = Some("working".into());
+                    set_fresh(Some(now));
+                },
+                "it is working; nothing was moved",
+            ),
+            (
+                |_| set_fresh(Some(vec![shell("w91:p1", "w91:t1")])),
+                "has ended; nothing was moved",
+            ),
+            (
+                |a| a.conversation_of = knows_another,
+                "holds another conversation now",
+            ),
+            (|_| set_fresh(None), "Herdr could not be asked"),
+        ];
+        for (change, says) in cases {
+            let mut a = movable();
+            press(&mut a, KeyCode::Char('m'));
+            press(&mut a, KeyCode::Enter);
+            change(&mut a);
+            press(&mut a, KeyCode::Char('y'));
+            assert!(a.moving.is_none(), "{says}");
+            assert!(flash_text(&a).contains(says), "{says}: {}", flash_text(&a));
+        }
+    }
+
+    #[test]
+    fn any_answer_but_yes_leaves_the_session() {
+        for key in [KeyCode::Char('n'), KeyCode::Esc, KeyCode::Enter] {
+            let mut a = movable();
+            press(&mut a, KeyCode::Char('m'));
+            press(&mut a, KeyCode::Enter);
+            press(&mut a, key);
+            assert_eq!(a.mode, Mode::Normal);
+            assert!(a.moving.is_none(), "{key:?}");
+        }
+        // Esc in the picker too.
+        let mut a = movable();
+        press(&mut a, KeyCode::Char('m'));
+        press(&mut a, KeyCode::Esc);
+        assert_eq!(a.mode, Mode::Normal);
+        assert!(a.moving.is_none());
+    }
+
+    #[test]
+    fn with_no_other_account_m_says_so() {
+        let mut a = movable();
+        a.info.remove("main");
+        a.info.remove("work");
+        press(&mut a, KeyCode::Char('m'));
+        assert_eq!(a.mode, Mode::Normal);
+        assert_eq!(
+            flash_text(&a),
+            "No other signed-in account to move Fix the login bug to"
+        );
+    }
+
+    #[test]
+    fn an_unknown_conversation_names_the_way_by_hand() {
+        let mut a = movable();
+        a.conversation_of = knows_nothing;
+        press(&mut a, KeyCode::Char('m'));
+        match &a.mode {
+            Mode::Message { title, lines, .. } => {
+                assert!(title.contains("not known"), "{title}");
+                let text = lines.join(" ");
+                assert!(text.contains("/exit"), "{text}");
+                assert!(text.contains("claude --resume"), "{text}");
+                assert!(text.contains("setup (S)"), "{text}");
+            }
+            m => panic!("{m:?}"),
+        }
+    }
+
+    #[test]
+    fn a_failed_move_is_shown_with_the_way_by_hand() {
+        let mut a = movable();
+        a.mover = fails;
+        press(&mut a, KeyCode::Char('m'));
+        press(&mut a, KeyCode::Enter);
+        press(&mut a, KeyCode::Char('y'));
+        finish(&mut a);
+        match &a.mode {
+            Mode::Message { title, lines, good } => {
+                assert_eq!(title, "Fix the login bug was not moved");
+                assert!(lines.join(" ").contains("/exit"));
+                assert!(!good);
+            }
+            m => panic!("{m:?}"),
+        }
+    }
+
+    #[test]
+    fn outside_herdr_m_says_so() {
+        let mut a = movable();
+        a.in_herdr = false;
+        press(&mut a, KeyCode::Char('m'));
+        assert_eq!(a.mode, Mode::Normal);
+        assert_eq!(flash_text(&a), "Only inside Herdr");
+    }
+
+    #[test]
+    fn an_account_at_its_limit_is_offered_and_hands_over_to_the_next() {
+        let mut a = movable();
+        let now = a.now();
+        a.store.accounts.push(Account {
+            id: "spare".into(),
+            name: "Spare".into(),
+            kind: Kind::Subscription,
+            sso: false,
+            fallback: true,
+        });
+        a.info.insert("spare".into(), signed_in("Pro"));
+        a.usage.insert("work".into(), full_at(99.0, now));
+        press(&mut a, KeyCode::Char('m'));
+        let p = picker(&a);
+        let work = p.items.iter().position(|i| i.label == "Work").unwrap();
+        assert!(
+            p.items[work].detail.starts_with("at its 5-hour limit"),
+            "{}",
+            p.items[work].detail
+        );
+        press(&mut a, KeyCode::Char(char::from(b'1' + work as u8)));
+        let c = confirm(&a);
+        assert_eq!(c.question, "Move Fix the login bug to Spare?");
+        assert!(
+            c.lines[0].contains("Work is at its 5-hour limit, so it goes to Spare"),
+            "{}",
+            c.lines[0]
+        );
+        press(&mut a, KeyCode::Char('y'));
+        finish(&mut a);
+        assert!(flash_text(&a).ends_with("to spare"), "{}", flash_text(&a));
+    }
+
+    #[test]
+    fn fallback_never_goes_back_to_its_own_login_and_otherwise_stays() {
+        let mut a = movable();
+        let now = a.now();
+        // Work is full; next in line is Personal (its own) and then main,
+        // which is full too: nothing has room.
+        a.usage.insert("work".into(), full_at(99.0, now));
+        a.usage.insert("main".into(), full_at(99.0, now));
+        let c = a.move_target("personal", "work");
+        assert_eq!(c.id, "work");
+        press(&mut a, KeyCode::Char('m'));
+        let p = picker(&a);
+        let work = p.items.iter().position(|i| i.label == "Work").unwrap();
+        press(&mut a, KeyCode::Char(char::from(b'1' + work as u8)));
+        let c = confirm(&a);
+        assert_eq!(c.question, "Move Fix the login bug to Work?");
+        assert!(
+            c.lines[0].contains("no other account has room"),
+            "{}",
+            c.lines[0]
+        );
+        // With fallback off it stays on the pick and says why.
+        let mut a = movable();
+        a.config.fallback = false;
+        a.usage.insert("work".into(), full_at(99.0, now));
+        assert_eq!(a.move_target("personal", "work").id, "work");
+        press(&mut a, KeyCode::Char('m'));
+        let p = picker(&a);
+        let work = p.items.iter().position(|i| i.label == "Work").unwrap();
+        press(&mut a, KeyCode::Char(char::from(b'1' + work as u8)));
+        assert!(confirm(&a).lines[0].contains("fallback is off"));
+    }
+
+    #[test]
+    fn a_move_names_its_account_so_no_reminder_follows() {
+        // The command names the account (HERDR_MULTIACCOUNT_USE): such a
+        // start never falls back, so the launcher notes no account to go
+        // back to and the reminder of an earlier fallback ends.
+        let a = movable();
+        let c = launch::choose(
+            &a.store,
+            &a.config,
+            &a.usage,
+            &|_| true,
+            "work".into(),
+            launch::Source::Explicit,
+            a.now(),
+        );
+        assert_eq!(c.id, c.wanted);
+        let note = crate::sessions::Entry {
+            account: c.id.clone(),
+            pid: 1,
+            wanted: (c.id != c.wanted).then(|| c.wanted.clone()),
+            told: false,
+        };
+        assert_eq!(
+            crate::remind::due(&note, "work", &a.store, &Usage::default(), 95.0, a.now()),
+            None
+        );
+    }
+
+    #[test]
+    fn while_a_move_runs_the_list_stays_and_the_session_is_kept() {
+        let mut a = movable();
+        a.moving = Some("Fix the login bug".into());
+        press(&mut a, KeyCode::Char('q'));
+        press(&mut a, KeyCode::Char('y'));
+        assert!(!a.quit);
+        assert!(flash_text(&a).contains("quit once it is done"));
+        press(&mut a, KeyCode::Char('d'));
+        assert_eq!(a.mode, Mode::Normal);
+        press(&mut a, KeyCode::Char('m'));
+        assert_eq!(a.mode, Mode::Normal);
+        assert!(flash_text(&a).contains("being moved"));
+    }
+
+    #[test]
+    fn the_footer_and_the_keys_overlay_show_m() {
+        let mut a = movable();
+        let rows = screen_of(&mut a, 100, 30);
+        assert!(rows[29].contains("m move"), "{}", rows[29]);
+        a.mode = Mode::Help;
+        let screen = screen_of(&mut a, 120, 60).join("\n");
+        assert!(screen.contains("move it to another account"), "{screen}");
+        let mut a = movable();
+        screen_of(&mut a, 100, 30);
+        let spot = a
+            .hits
+            .iter()
+            .find_map(|(r, h)| (*h == Hit::Key('m')).then_some(*r))
+            .expect("m in the footer");
+        a.click(spot.x, spot.y);
+        picker(&a);
+    }
+
+    #[test]
+    fn the_picker_and_the_question_draw_at_many_sizes() {
+        for (w, h, full) in [
+            (160, 40, false),
+            (100, 30, true),
+            (60, 20, false),
+            (40, 12, false),
+            (40, 12, true),
+            (24, 20, true),
+            (20, 30, true),
+        ] {
+            let mut a = movable();
+            if full {
+                // Work is full and hands over to Main login: one line more.
+                let now = a.now();
+                a.usage.insert("work".into(), full_at(99.0, now));
+            }
+            press(&mut a, KeyCode::Char('m'));
+            let screen = screen_of(&mut a, w, h).join("\n");
+            assert!(screen.contains("Work"), "{w}x{h}: {screen}");
+            press(&mut a, KeyCode::Char('2'));
+            let screen = screen_of(&mut a, w, h).join("\n");
+            assert!(screen.contains("y yes"), "{w}x{h}: {screen}");
+            let shown: Vec<&str> = screen.split_whitespace().collect();
+            let c = confirm(&a);
+            // The title may be cut on a narrow pane; the text names where
+            // the session goes.
+            let to = if full { "Main login's" } else { "Work's" };
+            assert!(c.lines.join(" ").contains(to), "{w}x{h}");
+            for word in c.lines.iter().flat_map(|l| l.split_whitespace()) {
                 assert!(shown.contains(&word), "{w}x{h}: {word} cut off\n{screen}");
             }
         }

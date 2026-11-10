@@ -30,7 +30,8 @@ it is built this way: [docs/decisions.md](docs/decisions.md).
 | `remind.rs` | The popup when a moved session can go back to its account |
 | `setup.rs` | Shell function and status line setup, and undo |
 | `secret.rs` | API keys in the system keychain |
-| `sessions.rs` | The account of each running session, per Herdr pane |
+| `sessions.rs` | The account and the conversation of each running session, per Herdr pane |
+| `relocate.rs` | Moving a running session to another account (`m` in the Agents tab) |
 | `info.rs` | Who an account is signed in as (`claude auth status`) |
 | `herdr.rs`, `pane.rs` | Herdr's command line: spaces, panes, labels, the open action |
 
