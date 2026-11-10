@@ -70,6 +70,13 @@ pub type Opener = fn(&str, &str) -> bool;
 /// fields of the app so tests never reach Herdr.
 pub type PaneList = fn() -> Option<Vec<Pane>>;
 pub type PaneCloser = fn(&str) -> bool;
+/// Reads Herdr's spaces (`herdr::workspaces`), and closes one, with its
+/// worktree group when asked (`herdr::close_workspace`).
+pub type SpaceList = fn() -> Option<Vec<Workspace>>;
+pub type SpaceCloser = fn(&str, bool) -> bool;
+/// Changes `accounts.json` under its lock (`Store::update`); a field so
+/// tests never write the real config directory.
+pub type StoreUpdate = for<'a> fn(Box<dyn FnOnce(&mut Store) + 'a>) -> std::io::Result<Store>;
 /// The conversation a pane holds now and its Claude Code process
 /// (`real_conversation`), and the start of the move (`relocate::perform`,
 /// which notes it in the folder given and starts its process); fields so
@@ -205,6 +212,12 @@ pub enum ConfirmFor {
         session: Moving,
         to: String,
     },
+    /// Closes a space (`spaces[0]`), with the worktree spaces the question
+    /// named when it is their main checkout.
+    CloseSpace {
+        spaces: Vec<Workspace>,
+        label: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -304,6 +317,11 @@ pub struct App {
     pub opener: Opener,
     pub pane_list: PaneList,
     pub pane_closer: PaneCloser,
+    pub space_list: SpaceList,
+    pub space_closer: SpaceCloser,
+    pub store_update: StoreUpdate,
+    /// The list's own pane in Herdr (`HERDR_PANE_ID`).
+    pub own_pane: Option<String>,
     pub conversation_of: ConversationOf,
     pub mover: Mover,
     /// Whether the list runs inside Herdr (`herdr::inside`).
@@ -366,6 +384,10 @@ impl App {
             opener: open_in_browser,
             pane_list: herdr::panes,
             pane_closer: herdr::close_pane,
+            space_list: herdr::workspaces,
+            space_closer: herdr::close_workspace,
+            store_update: |change| Store::update(change),
+            own_pane: std::env::var("HERDR_PANE_ID").ok(),
             conversation_of: real_conversation,
             mover: relocate::perform,
             in_herdr: herdr::inside(),
@@ -649,6 +671,203 @@ impl App {
             .min(self.sessions().len().saturating_sub(1));
         // A read started before the close would bring the row back; the
         // next one (spaces too) runs a moment after Herdr is done closing.
+        self.herdr_rx = None;
+        self.next_herdr = Instant::now() + Duration::from_secs(1);
+    }
+
+    /// A space's name in the list: its label, else its number.
+    fn space_name(ws: &Workspace) -> String {
+        if ws.label.is_empty() {
+            format!("space {}", ws.number)
+        } else {
+            ws.label.clone()
+        }
+    }
+
+    /// The spaces closing `id` takes, by Herdr's own rule: the main checkout
+    /// of a repository takes every open space of that repository with it
+    /// (when there are any); every other space closes alone.
+    fn space_group(spaces: &[Workspace], id: &str) -> Vec<Workspace> {
+        let Some(ws) = spaces.iter().find(|w| w.id == id) else {
+            return vec![];
+        };
+        let group: Vec<Workspace> = match ws.worktree.as_ref().filter(|t| !t.linked) {
+            Some(main) => spaces
+                .iter()
+                .filter(|w| {
+                    w.worktree
+                        .as_ref()
+                        .is_some_and(|t| t.repo_key == main.repo_key)
+                })
+                .cloned()
+                .collect(),
+            None => vec![],
+        };
+        if group.len() >= 2 {
+            // The chosen space first, the others in Herdr's order.
+            let mut list = vec![ws.clone()];
+            list.extend(group.into_iter().filter(|w| w.id != id));
+            list
+        } else {
+            vec![ws.clone()]
+        }
+    }
+
+    /// Asks before closing the selected space (`d` in the Spaces tab).
+    fn ask_close_space(&mut self) {
+        let Some(ws) = self.workspaces.get(self.space_sel).cloned() else {
+            return;
+        };
+        let label = Self::space_name(&ws);
+        let spaces = Self::space_group(&self.workspaces, &ws.id);
+        let group = spaces.len() > 1;
+        let mut lines = vec![];
+        if group {
+            let others: Vec<String> = spaces[1..].iter().map(Self::space_name).collect();
+            lines.push(format!(
+                "It is the main checkout of its repository: its worktree spaces {} close with it.",
+                others.join(", ")
+            ));
+        }
+        let sessions: Vec<&Pane> = spaces
+            .iter()
+            .flat_map(|w| self.sessions_in(&w.id))
+            .collect();
+        let place = if group { "in them" } else { "in it" };
+        lines.push(match sessions.len() {
+            0 => format!("No Claude Code session runs {place}."),
+            1 => format!("1 Claude Code session runs {place}."),
+            n => format!("{n} Claude Code sessions run {place}."),
+        });
+        let busy = sessions
+            .iter()
+            .filter(|p| matches!(p.status.as_deref(), Some("working") | Some("blocked")))
+            .count();
+        if busy > 0 {
+            lines.push(if sessions.len() == 1 {
+                "It is working or waiting for your answer: its current work stops.".into()
+            } else {
+                format!(
+                    "{busy} of them {} working or waiting for your answer: their current work stops.",
+                    if busy == 1 { "is" } else { "are" }
+                )
+            });
+        }
+        lines.push(
+            "Its tabs and everything running in them close; claude --resume finds the conversations again."
+                .into(),
+        );
+        if spaces
+            .iter()
+            .any(|w| w.worktree.as_ref().is_some_and(|t| t.linked))
+        {
+            lines.push("Worktree checkouts and their branches stay on disk.".into());
+        }
+        let own = self
+            .own_pane
+            .as_deref()
+            .and_then(|me| self.panes.iter().find(|p| p.id == me))
+            .is_some_and(|me| spaces.iter().any(|w| w.id == me.workspace));
+        if own {
+            lines.push(format!(
+                "This list runs in {}: it closes too.",
+                if group { "one of them" } else { "it" }
+            ));
+        }
+        self.mode = Mode::Confirm(Confirm {
+            question: format!("Close {label}?"),
+            lines,
+            purpose: ConfirmFor::CloseSpace { spaces, label },
+        });
+    }
+
+    /// Closes the spaces the question named, after checking with Herdr that
+    /// the space is still there and that the close takes no space the
+    /// question did not name.
+    fn close_space(&mut self, named: &[Workspace], label: &str) {
+        let Some(first) = named.first() else {
+            return;
+        };
+        if let Some(m) = self.running_move() {
+            self.flash(
+                format!("{} is being moved; nothing was closed", m.label),
+                crate::theme::MUTED,
+            );
+            return;
+        }
+        let Some(now) = (self.space_list)() else {
+            self.flash(
+                "Herdr could not be asked; nothing was closed",
+                crate::theme::RED,
+            );
+            return;
+        };
+        if !now.iter().any(|w| w.id == first.id) {
+            self.flash(format!("{label} had already closed"), crate::theme::MUTED);
+            self.workspaces = now;
+            self.after_close();
+            return;
+        }
+        let group = Self::space_group(&now, &first.id);
+        if let Some(new) = group.iter().find(|w| !named.iter().any(|n| n.id == w.id)) {
+            self.flash(
+                format!(
+                    "{} opened since; nothing was closed. Press d again",
+                    Self::space_name(new)
+                ),
+                crate::theme::YELLOW,
+            );
+            self.workspaces = now;
+            self.after_close();
+            return;
+        }
+        // The account choices go first: when the list runs in one of these
+        // spaces, Herdr ends it with the close.
+        let kept: Vec<(Workspace, String)> = group
+            .iter()
+            .filter_map(|w| {
+                self.store
+                    .space_account(&w.id)
+                    .map(|a| (w.clone(), a.to_string()))
+            })
+            .collect();
+        if !kept.is_empty() {
+            let forget = kept.clone();
+            if !self.update(move |s| {
+                for (w, _) in &forget {
+                    s.assign(&w.id, &w.label, None);
+                }
+            }) {
+                return;
+            }
+        }
+        if !(self.space_closer)(&first.id, group.len() > 1) {
+            if !kept.is_empty() {
+                self.update(move |s| {
+                    for (w, account) in &kept {
+                        s.assign(&w.id, &w.label, Some(account));
+                    }
+                });
+            }
+            self.flash(format!("Herdr could not close {label}"), crate::theme::RED);
+            return;
+        }
+        let gone: Vec<&str> = group.iter().map(|w| w.id.as_str()).collect();
+        self.workspaces = now;
+        self.workspaces.retain(|w| !gone.contains(&w.id.as_str()));
+        self.panes.retain(|p| !gone.contains(&p.workspace.as_str()));
+        self.flash(format!("Closed {label}"), crate::theme::ACCENT);
+        self.after_close();
+    }
+
+    /// Keeps the selections on rows that exist, and reads Herdr again a
+    /// moment after it is done closing (a read started before would bring
+    /// the rows back).
+    fn after_close(&mut self) {
+        self.space_sel = self.space_sel.min(self.workspaces.len().saturating_sub(1));
+        self.session_sel = self
+            .session_sel
+            .min(self.sessions().len().saturating_sub(1));
         self.herdr_rx = None;
         self.next_herdr = Instant::now() + Duration::from_secs(1);
     }
@@ -1019,7 +1238,7 @@ impl App {
     /// result. False when it could not be saved.
     fn update(&mut self, change: impl FnOnce(&mut Store)) -> bool {
         let keep = self.selected().map(|a| a.id.clone());
-        match Store::update(change) {
+        match (self.store_update)(Box::new(change)) {
             Ok(store) => {
                 self.store = store;
                 if let Some(id) = keep {
@@ -1066,9 +1285,16 @@ impl App {
     /// for a moment (to check logins and limits), which Herdr may take for
     /// a session: its own panes never count.
     pub fn is_session(&self, p: &Pane) -> bool {
-        let ours =
-            p.label == "Multiaccount" || std::env::var("HERDR_PANE_ID").is_ok_and(|me| me == p.id);
+        let ours = p.label == "Multiaccount" || self.own_pane.as_deref() == Some(p.id.as_str());
         !ours && (p.agent.as_deref() == Some("claude") || p.account_id.is_some())
+    }
+
+    /// The Claude Code sessions in a space, as the Spaces tab counts them.
+    pub fn sessions_in(&self, ws: &str) -> Vec<&Pane> {
+        self.panes
+            .iter()
+            .filter(|p| p.workspace == ws && self.is_session(p))
+            .collect()
     }
 
     /// Live Claude Code sessions per account, from the pane labels.
@@ -1743,6 +1969,7 @@ impl App {
             ConfirmFor::Remove(id) => self.remove(&id),
             ConfirmFor::EndSession { pane, label } => self.end_session(&pane, &label),
             ConfirmFor::MoveSession { session, to } => self.move_session(session, &to),
+            ConfirmFor::CloseSpace { spaces, label } => self.close_space(&spaces, &label),
             ConfirmFor::Setup => {
                 match setup::apply() {
                     Ok(msg) => self.flash(msg, crate::theme::GREEN),
@@ -2034,6 +2261,18 @@ impl App {
                 _ => {}
             },
             _ if self.section == Section::Spaces => match k.code {
+                // `d` only: Delete keeps "back to the active account" (the
+                // owner's decision on #11).
+                KeyCode::Char('d') => {
+                    if let Some(m) = self.moving.clone() {
+                        self.flash(
+                            format!("{} is being moved; wait a moment", m.label),
+                            crate::theme::MUTED,
+                        );
+                    } else {
+                        self.ask_close_space();
+                    }
+                }
                 KeyCode::Char('x') | KeyCode::Backspace | KeyCode::Delete => {
                     if let Some(ws) = self.workspaces.get(self.space_sel).cloned() {
                         if !self.update(|s| s.assign(&ws.id, &ws.label, None)) {
@@ -2364,9 +2603,34 @@ mod tests {
         d
     }
 
+    thread_local! {
+        /// What the test `accounts.json` holds, per test thread.
+        static STORED: std::cell::RefCell<Store> = std::cell::RefCell::new(Store::default());
+    }
+
+    /// `Store::update` on the test's own store, never the real file.
+    fn stores(change: Box<dyn FnOnce(&mut Store) + '_>) -> std::io::Result<Store> {
+        STORED.with(|s| {
+            let mut s = s.borrow_mut();
+            change(&mut s);
+            Ok(s.clone())
+        })
+    }
+
+    fn cannot_store(_: Box<dyn FnOnce(&mut Store) + '_>) -> std::io::Result<Store> {
+        Err(std::io::Error::other("disk full"))
+    }
+
+    fn stored() -> Store {
+        STORED.with(|s| s.borrow().clone())
+    }
+
     fn app() -> App {
         let mut a = App::new(Config::default(), std::env::temp_dir());
         a.moves_dir = moves_dir();
+        a.own_pane = None;
+        a.store_update = stores;
+        a.space_closer = |_, _| panic!("a test closed a space without a fake closer");
         a.store = Store::default();
         a.store.accounts.push(Account {
             id: "personal".into(),
@@ -2382,7 +2646,9 @@ mod tests {
             label: "acme-app".into(),
             number: 1,
             focused: true,
+            worktree: None,
         }];
+        STORED.with(|s| *s.borrow_mut() = a.store.clone());
         a
     }
 
@@ -3050,7 +3316,12 @@ mod tests {
             });
             a
         };
-        let asks: [fn() -> App; 3] = [end, remove, setup];
+        let close = || {
+            let mut a = spaces();
+            press(&mut a, KeyCode::Char('d'));
+            a
+        };
+        let asks: [fn() -> App; 4] = [end, remove, setup, close];
         for ask in asks {
             for key in [KeyCode::Enter, KeyCode::Char('x'), KeyCode::Char(' ')] {
                 let mut a = ask();
@@ -3058,6 +3329,7 @@ mod tests {
                 press(&mut a, key);
                 assert_eq!(confirm(&a), before, "{}: {key:?}", before.question);
                 assert!(closed().is_empty());
+                assert!(spaces_closed().is_empty());
             }
             let mut a = ask();
             press(&mut a, KeyCode::Esc);
@@ -3190,6 +3462,515 @@ mod tests {
             let shown: Vec<&str> = screen.split_whitespace().collect();
             for word in confirm(&a).lines.iter().flat_map(|l| l.split_whitespace()) {
                 assert!(shown.contains(&word), "{w}x{h}: {word} cut off\n{screen}");
+            }
+        }
+    }
+
+    // ---- closing a space (d in Spaces) --------------------------------
+
+    thread_local! {
+        /// The spaces the test closer was asked to close (with `--group` or
+        /// not), and what the test space list hands back.
+        static SPACES_CLOSED: std::cell::RefCell<Vec<(String, bool)>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+        static FRESH_SPACES: std::cell::RefCell<Option<Vec<Workspace>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    fn closes_space(ws: &str, group: bool) -> bool {
+        SPACES_CLOSED.with(|c| c.borrow_mut().push((ws.into(), group)));
+        true
+    }
+
+    fn cannot_close_space(ws: &str, group: bool) -> bool {
+        closes_space(ws, group);
+        false
+    }
+
+    fn spaces_closed() -> Vec<(String, bool)> {
+        SPACES_CLOSED.with(|c| c.borrow_mut().drain(..).collect())
+    }
+
+    fn fresh_spaces() -> Option<Vec<Workspace>> {
+        FRESH_SPACES.with(|f| f.borrow().clone())
+    }
+
+    fn set_fresh_spaces(list: Option<Vec<Workspace>>) {
+        FRESH_SPACES.with(|f| *f.borrow_mut() = list);
+    }
+
+    fn space(id: &str, number: u64, label: &str, tree: Option<(&str, bool)>) -> Workspace {
+        Workspace {
+            id: id.into(),
+            label: label.into(),
+            number,
+            focused: false,
+            worktree: tree.map(|(key, linked)| herdr::Worktree {
+                repo_key: key.into(),
+                linked,
+            }),
+        }
+    }
+
+    fn in_space(ws: &str, p: Pane) -> Pane {
+        Pane {
+            workspace: ws.into(),
+            ..p
+        }
+    }
+
+    /// The Spaces tab: acme-app (main checkout, one idle session and a
+    /// shell), its worktree space fix-login (one session), and notes (no
+    /// session, on Work). Herdr reports the same.
+    fn spaces() -> App {
+        let mut a = app();
+        a.store.accounts.push(Account {
+            id: "work".into(),
+            name: "Work".into(),
+            kind: Kind::Subscription,
+            sso: false,
+            fallback: true,
+        });
+        a.store.assign("w3", "notes", Some("work"));
+        a.store.assign("w2", "fix-login", Some("personal"));
+        STORED.with(|s| *s.borrow_mut() = a.store.clone());
+        a.workspaces = vec![
+            space("w1", 1, "acme-app", Some(("/src/acme/.git", false))),
+            space("w2", 2, "fix-login", Some(("/src/acme/.git", true))),
+            space("w3", 3, "notes", None),
+        ];
+        a.panes = vec![
+            in_space(
+                "w1",
+                pane(
+                    "w1:p1",
+                    "w1:t1",
+                    "Fix the login bug",
+                    Some("idle"),
+                    Some("personal"),
+                ),
+            ),
+            in_space("w1", shell("w1:p2", "w1:t1")),
+            in_space(
+                "w2",
+                pane(
+                    "w2:p1",
+                    "w2:t1",
+                    "Write the docs",
+                    Some("idle"),
+                    Some("personal"),
+                ),
+            ),
+            in_space("w3", shell("w3:p1", "w3:t1")),
+        ];
+        a.space_list = fresh_spaces;
+        a.space_closer = closes_space;
+        set_fresh_spaces(Some(a.workspaces.clone()));
+        spaces_closed();
+        a.section = Section::Spaces;
+        a
+    }
+
+    fn ids(list: &[Workspace]) -> Vec<String> {
+        list.iter().map(|w| w.id.clone()).collect()
+    }
+
+    #[test]
+    fn d_asks_before_closing_a_space_and_names_its_sessions() {
+        let mut a = spaces();
+        a.space_sel = 1;
+        press(&mut a, KeyCode::Char('d'));
+        let c = confirm(&a);
+        assert_eq!(c.question, "Close fix-login?");
+        let text = c.lines.join(" ");
+        assert!(text.contains("1 Claude Code session runs in it."), "{text}");
+        assert!(
+            text.contains("tabs and everything running in them close"),
+            "{text}"
+        );
+        assert!(text.contains("claude --resume"), "{text}");
+        assert!(!text.contains("current work stops"), "idle: {text}");
+        assert!(!text.contains("closes too"), "{text}");
+        assert!(spaces_closed().is_empty(), "nothing closed yet");
+        assert_eq!(a.workspaces.len(), 3);
+    }
+
+    #[test]
+    fn a_space_without_sessions_says_so_and_a_nameless_one_has_its_number() {
+        let mut a = spaces();
+        a.space_sel = 2;
+        press(&mut a, KeyCode::Char('d'));
+        let text = confirm(&a).lines.join(" ");
+        assert!(
+            text.contains("No Claude Code session runs in it."),
+            "{text}"
+        );
+        assert!(!text.contains("stay on disk"), "no worktree: {text}");
+        let mut a = spaces();
+        a.workspaces[2].label.clear();
+        a.space_sel = 2;
+        press(&mut a, KeyCode::Char('d'));
+        assert_eq!(confirm(&a).question, "Close space 3?");
+    }
+
+    #[test]
+    fn busy_sessions_are_warned_about() {
+        for status in ["working", "blocked"] {
+            let mut a = spaces();
+            a.space_sel = 1;
+            a.panes[2].status = Some(status.into());
+            press(&mut a, KeyCode::Char('d'));
+            let text = confirm(&a).lines.join(" ");
+            assert!(text.contains("its current work stops"), "{status}: {text}");
+        }
+        // Several sessions, one of them busy.
+        let mut a = spaces();
+        a.panes[0].status = Some("working".into());
+        press(&mut a, KeyCode::Char('d'));
+        let text = confirm(&a).lines.join(" ");
+        assert!(
+            text.contains("2 Claude Code sessions run in them."),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "1 of them is working or waiting for your answer: their current work stops."
+            ),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn yes_closes_the_space_and_its_rows_go() {
+        let mut a = spaces();
+        a.space_sel = 2;
+        a.section = Section::Sessions;
+        a.session_sel = 1;
+        a.section = Section::Spaces;
+        press(&mut a, KeyCode::Char('d'));
+        press(&mut a, KeyCode::Char('y'));
+        assert_eq!(spaces_closed(), vec![("w3".to_string(), false)]);
+        assert_eq!(a.mode, Mode::Normal);
+        assert_eq!(ids(&a.workspaces), vec!["w1", "w2"], "the row is gone");
+        assert_eq!(a.space_sel, 1, "the selection moves to the row above");
+        assert!(a.panes.iter().all(|p| p.workspace != "w3"));
+        assert_eq!(flash_text(&a), "Closed notes");
+        let rows = screen_of(&mut a, 100, 30);
+        assert!(rows[0].contains("Spaces (2)"), "{}", rows[0]);
+
+        // Its sessions leave the Agents tab too.
+        let mut a = spaces();
+        a.space_sel = 1;
+        press(&mut a, KeyCode::Char('d'));
+        press(&mut a, KeyCode::Char('y'));
+        assert_eq!(spaces_closed(), vec![("w2".to_string(), false)]);
+        let left: Vec<String> = a.sessions().into_iter().map(|p| p.id).collect();
+        assert_eq!(left, vec!["w1:p1".to_string()]);
+        assert_eq!(a.space_sel, 1, "the next space moves up");
+        assert_eq!(a.running("personal"), 1);
+    }
+
+    #[test]
+    fn closing_the_only_space_leaves_the_empty_tab() {
+        let mut a = spaces();
+        a.workspaces.truncate(1);
+        a.workspaces[0].worktree = None;
+        set_fresh_spaces(Some(a.workspaces.clone()));
+        press(&mut a, KeyCode::Char('d'));
+        press(&mut a, KeyCode::Char('y'));
+        assert_eq!(spaces_closed(), vec![("w1".to_string(), false)]);
+        assert!(a.workspaces.is_empty());
+        assert_eq!(a.space_sel, 0);
+        let rows = screen_of(&mut a, 100, 30).join("\n");
+        assert!(rows.contains("Spaces (0)"), "{rows}");
+        press(&mut a, KeyCode::Char('d'));
+        assert_eq!(a.mode, Mode::Normal, "nothing to ask about");
+    }
+
+    #[test]
+    fn no_and_esc_keep_the_space() {
+        for key in [KeyCode::Char('n'), KeyCode::Esc] {
+            let mut a = spaces();
+            let before = (a.workspaces.clone(), a.panes.clone());
+            press(&mut a, KeyCode::Char('d'));
+            press(&mut a, key);
+            assert_eq!(a.mode, Mode::Normal, "{key:?}");
+            assert!(spaces_closed().is_empty(), "{key:?}");
+            assert_eq!((a.workspaces.clone(), a.panes.clone()), before);
+            assert_eq!(stored(), a.store, "{key:?}: account choices kept");
+        }
+    }
+
+    #[test]
+    fn a_worktree_space_closes_alone_and_its_checkout_stays() {
+        let mut a = spaces();
+        a.space_sel = 1;
+        press(&mut a, KeyCode::Char('d'));
+        let text = confirm(&a).lines.join(" ");
+        assert!(
+            text.contains("Worktree checkouts and their branches stay on disk."),
+            "{text}"
+        );
+        assert!(!text.contains("main checkout"), "{text}");
+        press(&mut a, KeyCode::Char('y'));
+        assert_eq!(spaces_closed(), vec![("w2".to_string(), false)]);
+        assert_eq!(ids(&a.workspaces), vec!["w1", "w3"]);
+    }
+
+    #[test]
+    fn a_main_checkout_names_its_worktree_spaces_and_closes_them_together() {
+        let mut a = spaces();
+        a.workspaces
+            .push(space("w4", 4, "docs-site", Some(("/src/acme/.git", true))));
+        a.workspaces.push(space(
+            "w5",
+            5,
+            "other-repo",
+            Some(("/src/other/.git", false)),
+        ));
+        a.panes.push(in_space(
+            "w4",
+            pane("w4:p1", "w4:t1", "Docs", Some("working"), None),
+        ));
+        set_fresh_spaces(Some(a.workspaces.clone()));
+        press(&mut a, KeyCode::Char('d'));
+        let c = confirm(&a);
+        assert_eq!(c.question, "Close acme-app?");
+        let text = c.lines.join(" ");
+        assert!(
+            text.contains("main checkout of its repository: its worktree spaces fix-login, docs-site close with it."),
+            "{text}"
+        );
+        assert!(!text.contains("other-repo"), "{text}");
+        assert!(
+            text.contains("3 Claude Code sessions run in them."),
+            "{text}"
+        );
+        assert!(text.contains("1 of them is working"), "{text}");
+        assert!(text.contains("stay on disk"), "{text}");
+        press(&mut a, KeyCode::Char('y'));
+        assert_eq!(spaces_closed(), vec![("w1".to_string(), true)], "--group");
+        assert_eq!(ids(&a.workspaces), vec!["w3", "w5"]);
+        assert!(a.sessions().is_empty());
+        assert_eq!(
+            stored().space_account("w2"),
+            None,
+            "fix-login's choice goes"
+        );
+        assert_eq!(
+            stored().space_account("w3"),
+            Some("work"),
+            "notes keeps its"
+        );
+    }
+
+    #[test]
+    fn a_main_checkout_without_open_worktree_spaces_closes_alone() {
+        let mut a = spaces();
+        a.workspaces.remove(1);
+        set_fresh_spaces(Some(a.workspaces.clone()));
+        press(&mut a, KeyCode::Char('d'));
+        let text = confirm(&a).lines.join(" ");
+        assert!(!text.contains("worktree spaces"), "{text}");
+        assert!(text.contains("1 Claude Code session runs in it."), "{text}");
+        press(&mut a, KeyCode::Char('y'));
+        assert_eq!(spaces_closed(), vec![("w1".to_string(), false)]);
+    }
+
+    #[test]
+    fn a_group_that_grew_since_the_question_closes_nothing() {
+        let mut a = spaces();
+        press(&mut a, KeyCode::Char('d'));
+        let mut now = a.workspaces.clone();
+        now.push(space("w4", 4, "docs-site", Some(("/src/acme/.git", true))));
+        set_fresh_spaces(Some(now));
+        press(&mut a, KeyCode::Char('y'));
+        assert!(spaces_closed().is_empty());
+        assert!(
+            flash_text(&a).contains("docs-site opened since"),
+            "{}",
+            flash_text(&a)
+        );
+        assert_eq!(stored(), a.store, "account choices kept");
+        assert_eq!(a.workspaces.len(), 4, "the new space shows");
+
+        // A group that shrank closes what is left of it.
+        let mut a = spaces();
+        press(&mut a, KeyCode::Char('d'));
+        set_fresh_spaces(Some(vec![a.workspaces[0].clone(), a.workspaces[2].clone()]));
+        press(&mut a, KeyCode::Char('y'));
+        assert_eq!(spaces_closed(), vec![("w1".to_string(), false)]);
+    }
+
+    #[test]
+    fn a_space_closed_meanwhile_changes_nothing_else() {
+        let mut a = spaces();
+        a.space_sel = 2;
+        press(&mut a, KeyCode::Char('d'));
+        set_fresh_spaces(Some(a.workspaces[..2].to_vec()));
+        press(&mut a, KeyCode::Char('y'));
+        assert!(spaces_closed().is_empty());
+        assert_eq!(flash_text(&a), "notes had already closed");
+        assert_eq!(stored().space_account("w3"), Some("work"), "kept");
+        assert_eq!(a.space_sel, 1, "the selection stays on a row");
+    }
+
+    #[test]
+    fn a_space_herdr_cannot_close_stays_with_its_account() {
+        let mut a = spaces();
+        a.space_sel = 2;
+        a.space_closer = cannot_close_space;
+        press(&mut a, KeyCode::Char('d'));
+        press(&mut a, KeyCode::Char('y'));
+        assert_eq!(spaces_closed(), vec![("w3".to_string(), false)]);
+        assert_eq!(
+            a.flash.clone().map(|f| (f.0, f.1)),
+            Some(("Herdr could not close notes".to_string(), crate::theme::RED))
+        );
+        assert_eq!(a.workspaces.len(), 3, "the row stays");
+        assert_eq!(stored().space_account("w3"), Some("work"), "choice back");
+        assert_eq!(a.store.space_account("w3"), Some("work"));
+
+        // Herdr cannot be asked at all.
+        let mut a = spaces();
+        press(&mut a, KeyCode::Char('d'));
+        set_fresh_spaces(None);
+        press(&mut a, KeyCode::Char('y'));
+        assert!(spaces_closed().is_empty());
+        assert_eq!(a.flash.as_ref().map(|f| f.1), Some(crate::theme::RED));
+        assert_eq!(a.workspaces.len(), 3);
+
+        // The account choice cannot be forgotten: nothing closes either.
+        let mut a = spaces();
+        a.space_sel = 2;
+        a.store_update = cannot_store;
+        press(&mut a, KeyCode::Char('d'));
+        press(&mut a, KeyCode::Char('y'));
+        assert!(spaces_closed().is_empty());
+        assert!(
+            flash_text(&a).starts_with("Not saved"),
+            "{}",
+            flash_text(&a)
+        );
+    }
+
+    #[test]
+    fn closing_forgets_the_space_account_choice() {
+        let mut a = spaces();
+        a.space_sel = 2;
+        assert_eq!(stored().space_account("w3"), Some("work"));
+        press(&mut a, KeyCode::Char('d'));
+        press(&mut a, KeyCode::Char('y'));
+        assert_eq!(spaces_closed(), vec![("w3".to_string(), false)]);
+        assert_eq!(stored().space_account("w3"), None);
+        assert!(
+            stored().spaces.iter().all(|s| s.label != "notes"),
+            "a new space named notes starts on the active account"
+        );
+        assert_eq!(
+            stored().space_account("w2"),
+            Some("personal"),
+            "others stay"
+        );
+        assert_eq!(a.store, stored());
+    }
+
+    #[test]
+    fn d_in_spaces_waits_while_a_session_is_moved() {
+        let mut a = spaces();
+        a.moving = Some(MoveRun {
+            pane: "w1:p1".into(),
+            label: "Fix the login bug".into(),
+            to: "Work".into(),
+        });
+        press(&mut a, KeyCode::Char('d'));
+        assert_eq!(a.mode, Mode::Normal, "asks nothing");
+        assert_eq!(
+            flash_text(&a),
+            "Fix the login bug is being moved; wait a moment"
+        );
+        assert!(spaces_closed().is_empty());
+    }
+
+    #[test]
+    fn the_list_says_when_it_closes_with_its_space() {
+        let mut a = spaces();
+        a.own_pane = Some("w3:p9".into());
+        a.panes.push(in_space(
+            "w3",
+            pane("w3:p9", "w3:t1", "Multiaccount", None, None),
+        ));
+        a.space_sel = 2;
+        press(&mut a, KeyCode::Char('d'));
+        let text = confirm(&a).lines.join(" ");
+        assert!(
+            text.contains("This list runs in it: it closes too."),
+            "{text}"
+        );
+        assert!(
+            text.contains("No Claude Code session"),
+            "the list is none: {text}"
+        );
+        a.mode = Mode::Normal;
+        a.space_sel = 0;
+        press(&mut a, KeyCode::Char('d'));
+        let text = confirm(&a).lines.join(" ");
+        assert!(!text.contains("closes too"), "{text}");
+    }
+
+    #[test]
+    fn the_footer_and_the_keys_overlay_show_d_and_x_keeps_its_meaning() {
+        let mut a = spaces();
+        let rows = screen_of(&mut a, 100, 30);
+        assert!(rows[29].contains("d close space"), "{}", rows[29]);
+        assert!(rows[29].contains("x use active"), "{}", rows[29]);
+        let spot = a
+            .hits
+            .iter()
+            .find_map(|(r, h)| (*h == Hit::Key('d')).then_some(*r))
+            .expect("d in the footer");
+        a.click(spot.x, spot.y);
+        assert_eq!(confirm(&a).question, "Close acme-app?");
+        let mut a = spaces();
+        a.mode = Mode::Help;
+        let screen = screen_of(&mut a, 120, 60).join("\n");
+        assert!(
+            screen.contains("close the space with everything in it"),
+            "{screen}"
+        );
+        assert!(screen.contains("back to the active account"), "{screen}");
+        // x, Backspace and Delete still go back to the active account (the
+        // failing store stops them before they reach Herdr) and ask nothing.
+        for key in [KeyCode::Char('x'), KeyCode::Backspace, KeyCode::Delete] {
+            let mut a = spaces();
+            a.store_update = cannot_store;
+            press(&mut a, key);
+            assert_eq!(a.mode, Mode::Normal, "{key:?}");
+            assert!(flash_text(&a).starts_with("Not saved"), "{key:?}");
+        }
+        // Enter still picks the space's account.
+        let mut a = spaces();
+        press(&mut a, KeyCode::Enter);
+        assert!(matches!(a.mode, Mode::Pick(_)), "{:?}", a.mode);
+    }
+
+    #[test]
+    fn the_close_question_draws_at_many_sizes() {
+        for (w, h) in [(160, 40), (100, 30), (60, 20), (40, 12), (24, 20), (20, 30)] {
+            let mut a = spaces();
+            a.own_pane = Some("w1:p2".into());
+            a.panes[0].status = Some("working".into());
+            press(&mut a, KeyCode::Char('d'));
+            let screen = screen_of(&mut a, w, h).join("\n");
+            assert!(screen.contains("Close"), "{w}x{h}: {screen}");
+            assert!(screen.contains("y yes"), "{w}x{h}: {screen}");
+            assert!(!screen.contains("⏎ y yes"), "{w}x{h}: {screen}");
+            // Smaller panes scroll the question (tested with the move).
+            if w >= 60 {
+                let shown: Vec<&str> = screen.split_whitespace().collect();
+                for word in confirm(&a).lines.iter().flat_map(|l| l.split_whitespace()) {
+                    assert!(shown.contains(&word), "{w}x{h}: {word} cut off\n{screen}");
+                }
             }
         }
     }

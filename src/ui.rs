@@ -564,12 +564,7 @@ fn draw_spaces(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
             Cell::from(Text::from(vec![first_line, second])),
         ];
         if wide {
-            let claude: Vec<&crate::herdr::Pane> = app
-                .panes
-                .iter()
-                .filter(|p| p.workspace == ws.id)
-                .filter(|p| app.is_session(p))
-                .collect();
+            let claude = app.sessions_in(&ws.id);
             let mut names: Vec<String> = claude
                 .iter()
                 .filter_map(|p| p.account_id.as_deref())
@@ -897,6 +892,7 @@ fn draw_footer(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
         Section::Spaces => vec![
             ("⏎", "choose account", '\n'),
             ("x", "use active", 'x'),
+            ("d", "close space", 'd'),
             ("?", "all keys", '?'),
             ("q", "close", 'q'),
         ],
@@ -1350,6 +1346,7 @@ fn draw_help(frame: &mut Frame, app: &mut App) {
             &[
                 ("⏎", "choose the account for the space"),
                 ("x", "back to the active account"),
+                ("d", "close the space with everything in it (asks first)"),
             ],
         ),
         (

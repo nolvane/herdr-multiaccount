@@ -11,6 +11,11 @@ All notable changes to this project are documented here. The format follows
   closes and the row goes. The question warns when the session is working
   or waiting for an answer, and nothing is closed when the pane ended or
   runs something else by then.
+- `d` in the Spaces tab closes a space after asking, with its tabs and
+  everything running in them. The question counts its Claude Code sessions,
+  warns when one is working or waiting for an answer, names the worktree
+  spaces that close with a repository's main checkout, and says when the
+  list closes too. The space's account choice is forgotten.
 
 ### Changed
 

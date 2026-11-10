@@ -52,10 +52,25 @@ pub struct Workspace {
     pub label: String,
     pub number: u64,
     pub focused: bool,
+    /// The git checkout the space is for; `None` outside a repository.
+    pub worktree: Option<Worktree>,
+}
+
+/// A space's checkout, as Herdr groups them: spaces with the same
+/// `repo_key` belong to one repository.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Worktree {
+    pub repo_key: String,
+    /// A linked worktree, not the repository's main checkout.
+    pub linked: bool,
 }
 
 pub fn workspaces() -> Option<Vec<Workspace>> {
-    let v = call(&["workspace", "list"])?;
+    workspaces_from(&call(&["workspace", "list"])?)
+}
+
+/// Reads the answer of `herdr workspace list`.
+pub fn workspaces_from(v: &Value) -> Option<Vec<Workspace>> {
     Some(
         v["result"]["workspaces"]
             .as_array()?
@@ -66,6 +81,12 @@ pub fn workspaces() -> Option<Vec<Workspace>> {
                     label: w["label"].as_str().unwrap_or("").to_string(),
                     number: w["number"].as_u64().unwrap_or(0),
                     focused: w["focused"].as_bool().unwrap_or(false),
+                    worktree: w["worktree"]["repo_key"].as_str().map(|key| Worktree {
+                        repo_key: key.to_string(),
+                        linked: w["worktree"]["is_linked_worktree"]
+                            .as_bool()
+                            .unwrap_or(false),
+                    }),
                 })
             })
             .collect(),
@@ -192,6 +213,16 @@ pub fn focus_tab(tab: &str) -> bool {
 /// Closes a pane, and with it what runs in it.
 pub fn close_pane(pane: &str) -> bool {
     run_quiet(&["pane", "close", pane])
+}
+
+/// Closes a space with all its tabs and panes; `group` also closes the
+/// worktree spaces of a main checkout, which Herdr refuses to close alone.
+pub fn close_workspace(workspace: &str, group: bool) -> bool {
+    let mut args = vec!["workspace", "close", workspace];
+    if group {
+        args.push("--group");
+    }
+    run_quiet(&args)
 }
 
 /// Labels a pane with the account its Claude Code runs on.
@@ -364,5 +395,40 @@ mod tests {
         };
         assert!(back.shell_in_front());
         assert_eq!(Processes::from_json(&json!({"result": {}})), None);
+    }
+
+    #[test]
+    fn workspace_list_reads_the_checkout_of_each_space() {
+        // The shape of `herdr workspace list` (Herdr's API schema, 0.9.0).
+        let v = json!({"id": "cli:workspace:list", "result": {"type": "workspace_list",
+        "workspaces": [
+            {"workspace_id": "w1", "number": 1, "label": "acme-app", "focused": true,
+                "worktree": {"repo_key": "/src/acme-app/.git", "repo_name": "acme-app",
+                    "repo_root": "/src/acme-app", "checkout_path": "/src/acme-app",
+                    "is_linked_worktree": false}},
+            {"workspace_id": "w2", "number": 2, "label": "fix-login", "focused": false,
+                "worktree": {"repo_key": "/src/acme-app/.git", "repo_name": "acme-app",
+                    "repo_root": "/src/acme-app", "checkout_path": "/src/wt/fix-login",
+                    "is_linked_worktree": true}},
+            {"workspace_id": "w3", "number": 3, "label": "notes", "focused": false}
+        ]}});
+        let list = workspaces_from(&v).unwrap();
+        let key = "/src/acme-app/.git".to_string();
+        assert_eq!(
+            list.iter().map(|w| w.worktree.clone()).collect::<Vec<_>>(),
+            vec![
+                Some(Worktree {
+                    repo_key: key.clone(),
+                    linked: false
+                }),
+                Some(Worktree {
+                    repo_key: key,
+                    linked: true
+                }),
+                None,
+            ]
+        );
+        assert_eq!(list[0].label, "acme-app");
+        assert!(list[0].focused);
     }
 }

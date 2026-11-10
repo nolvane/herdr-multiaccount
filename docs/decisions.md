@@ -533,3 +533,42 @@ same steps (`relocate::run_move`) and writes the result into the note.
   on Linux the list's own file is gone after a rebuild.
 - **Quitting.** `q` / Ctrl+C then `y` close the list while a move runs (the
   owner's decision on #12), since the move goes on.
+
+## 2026-11-10: Closing a space from the Spaces tab
+
+`d` in the Spaces tab closes a space after asking, with
+`herdr workspace close`: its tabs and panes close, and everything running in
+them stops. Only `d`: `Delete` and `Backspace` keep "back to the active
+account" there, and `Enter` does nothing on this question (the owner's
+decisions on #11 and #10). The question counts the space's Claude Code
+sessions as the "Sessions" column does (`App::sessions_in`) and warns when
+one of them is working or waiting for an answer. The checkout of a worktree
+space and its branch stay: closing a space only closes Herdr's state.
+
+- **Worktree groups.** Herdr refuses to close the main checkout of a
+  repository alone while worktree spaces of that repository are open; with
+  `--group` it closes all of them. The list reads each space's checkout from
+  `herdr workspace list` (`worktree.repo_key`, `is_linked_worktree`) and
+  works out the group by Herdr's own rule (`workspace_close_indices` at tag
+  `v0.9.0`), so the question names those spaces and counts their sessions
+  (the owner's decision on #11). Before closing, the list reads the spaces
+  again: a space that is gone is "had already closed", and a group that grew
+  since the question closes nothing, so `y` never takes a space it did not
+  name. `--group` is passed only when the fresh group has two or more
+  spaces.
+- **The list's own space.** Closing it is allowed (the owner's decision on
+  #11); the question says that the list closes too. The list's pane is
+  `HERDR_PANE_ID`, kept in `App::own_pane`, which `is_session` uses as well.
+- **Forgetting the account choice first.** A closed space's account choice
+  is removed from `accounts.json`, as `x` does: after a Herdr restart the
+  startup hook would otherwise hand it to a new space with the same name
+  (see "Spaces by id"). It is removed before the close, because Herdr ends
+  the list itself when the list's space closes, and put back when Herdr
+  refuses.
+- **Tests.** The space reader, the closer and the write of `accounts.json`
+  (`App::store_update`) are fields, so tests reach neither Herdr nor the
+  real config directory.
+
+`herdr workspace close [--group]` and the `worktree` field are in Herdr
+0.9.0 (`src/cli/workspace.rs` and `src/api/schema/workspaces.rs` at tag
+`v0.9.0`), so `min_herdr_version` stays 0.9.0.

@@ -37,6 +37,11 @@ to the next account when one is at its limit.
   subscription's limits every minute, also for accounts no session uses.
 - **Spaces.** In the Spaces tab, `⏎` on a space picks its account. New
   sessions in that space use it; the sidebar shows it next to the space.
+  `d` closes a space after asking, with its tabs and everything running in
+  them; the question says how many Claude Code sessions run in it and warns
+  when one of them is working or waiting for you. The main checkout of a
+  repository closes together with its open worktree spaces, which the
+  question names; worktree checkouts and branches stay on disk.
 - **Fallback.** When the account a session would get is used at least 95 %
   (in any window), the session goes to the next account in the list that has
   room. You get one Herdr notification when that starts. Once the full
@@ -234,12 +239,12 @@ terminal.
 | `a` | Add an account: subscription, subscription with SSO, or API key |
 | `l` | Sign in again, or store the key again |
 | `n` | Rename (the login stays) |
-| `d` | Remove: signs it out or deletes its key and deletes its folder of links; anything made only in that folder goes to `backups/` (asks first). Agents: end the session; its pane closes (asks first) |
+| `d` | Remove: signs it out or deletes its key and deletes its folder of links; anything made only in that folder goes to `backups/` (asks first). Spaces: close the space with everything in it (asks first). Agents: end the session; its pane closes (asks first) |
 | `m` | Agents: move the session to another account, with its conversation (asks first) |
 | `c` | Start Claude Code with this account in a new tab |
 | `f` | Take part in fallback, or not |
 | `K` `J`, `Shift+↑` `Shift+↓` | Move the account up or down; fallback goes down the list |
-| `x` | Spaces: back to the active account |
+| `x` `Delete` `Backspace` | Spaces: back to the active account |
 | `F` | Fallback on or off |
 | `S` | Set up the `claude` function and the status line |
 | `←` `→` `Tab` `1` `2` `3` | Accounts, spaces or agents |
