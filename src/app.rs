@@ -534,6 +534,9 @@ impl App {
             );
             return;
         };
+        // Herdr's pane list carries no pane tokens: the account comes only
+        // from the launcher's note, which goes with its process
+        // (`sessions::live`), so a shell left in the pane does not count.
         let still = now.iter().any(|p| p.id == pane && self.is_session(p));
         if still {
             if !(self.pane_closer)(pane) {
@@ -549,9 +552,10 @@ impl App {
         self.session_sel = self
             .session_sel
             .min(self.sessions().len().saturating_sub(1));
-        // A read started before the close would bring the row back.
+        // A read started before the close would bring the row back; the
+        // next one (spaces too) runs a moment after Herdr is done closing.
         self.herdr_rx = None;
-        self.start_herdr();
+        self.next_herdr = Instant::now() + Duration::from_secs(1);
     }
 
     pub fn refresh_all(&mut self) {
@@ -2333,16 +2337,16 @@ mod tests {
         a.pane_closer = closes;
         a.panes = vec![
             pane(
-                "w1:p1",
-                "w1:t1",
+                "w91:p1",
+                "w91:t1",
                 "Fix the login bug",
                 Some("idle"),
                 Some("personal"),
             ),
-            shell("w1:p2", "w1:t1"),
+            shell("w91:p2", "w91:t1"),
             pane(
-                "w1:p3",
-                "w1:t2",
+                "w91:p3",
+                "w91:t2",
                 "Write the docs",
                 Some("idle"),
                 Some("personal"),
@@ -2430,13 +2434,13 @@ mod tests {
         press(&mut a, KeyCode::Char('d'));
         assert_eq!(confirm(&a).question, "End Write the docs?");
         press(&mut a, KeyCode::Char('y'));
-        assert_eq!(closed(), vec!["w1:p3".to_string()]);
+        assert_eq!(closed(), vec!["w91:p3".to_string()]);
         assert_eq!(a.mode, Mode::Normal);
         let left: Vec<String> = a.sessions().into_iter().map(|p| p.id).collect();
-        assert_eq!(left, vec!["w1:p1".to_string()], "the row is gone");
+        assert_eq!(left, vec!["w91:p1".to_string()], "the row is gone");
         assert_eq!(a.session_sel, 0, "the selection moves to the neighbour");
         assert!(
-            a.panes.iter().any(|p| p.id == "w1:p2"),
+            a.panes.iter().any(|p| p.id == "w91:p2"),
             "the shell in the same space stays"
         );
         assert_eq!(a.running("personal"), 1, "the account counts one fewer");
@@ -2476,14 +2480,17 @@ mod tests {
             let text = confirm(&a).lines.join(" ");
             assert!(text.contains("current work stops"), "{status}: {text}");
             press(&mut a, KeyCode::Char('y'));
-            assert_eq!(closed(), vec!["w1:p1".to_string()], "{status}");
+            assert_eq!(closed(), vec!["w91:p1".to_string()], "{status}");
         }
     }
 
     #[test]
     fn a_session_that_ended_meanwhile_closes_nothing_else() {
         // Gone from Herdr, or its pane now runs something else.
-        for now in [vec![shell("w1:p2", "w1:t1")], vec![shell("w1:p1", "w1:t1")]] {
+        for now in [
+            vec![shell("w91:p2", "w91:t1")],
+            vec![shell("w91:p1", "w91:t1")],
+        ] {
             let mut a = agents();
             press(&mut a, KeyCode::Char('d'));
             set_fresh(Some(now));
@@ -2493,7 +2500,7 @@ mod tests {
                 a.flash.as_ref().map(|f| f.0.as_str()),
                 Some("Fix the login bug had already ended")
             );
-            assert!(a.sessions().iter().all(|p| p.id != "w1:p1"));
+            assert!(a.sessions().iter().all(|p| p.id != "w91:p1"));
         }
     }
 
@@ -2503,7 +2510,7 @@ mod tests {
         a.pane_closer = cannot_close;
         press(&mut a, KeyCode::Char('d'));
         press(&mut a, KeyCode::Char('y'));
-        assert_eq!(closed(), vec!["w1:p1".to_string()]);
+        assert_eq!(closed(), vec!["w91:p1".to_string()]);
         let flash = a.flash.clone().map(|f| (f.0, f.1));
         assert_eq!(
             flash,
@@ -2527,7 +2534,7 @@ mod tests {
     #[test]
     fn d_does_nothing_in_an_empty_tab_and_still_removes_in_accounts() {
         let mut a = agents();
-        a.panes = vec![shell("w1:p2", "w1:t1")];
+        a.panes = vec![shell("w91:p2", "w91:t1")];
         press(&mut a, KeyCode::Char('d'));
         assert_eq!(a.mode, Mode::Normal);
         a.section = Section::Accounts;
@@ -2539,7 +2546,7 @@ mod tests {
     #[test]
     fn the_list_never_ends_itself() {
         let mut a = agents();
-        a.panes = vec![pane("w1:p9", "w1:t1", "Multiaccount", Some("idle"), None)];
+        a.panes = vec![pane("w91:p9", "w91:t1", "Multiaccount", Some("idle"), None)];
         assert!(a.sessions().is_empty());
         press(&mut a, KeyCode::Char('d'));
         assert_eq!(a.mode, Mode::Normal);
@@ -2569,16 +2576,19 @@ mod tests {
 
     #[test]
     fn the_question_draws_at_many_sizes() {
-        for (w, h) in [(160, 40), (100, 30), (60, 20), (40, 12)] {
+        for (w, h) in [(160, 40), (100, 30), (60, 20), (40, 12), (24, 20), (20, 30)] {
             let mut a = agents();
             a.panes[0].status = Some("working".into());
             press(&mut a, KeyCode::Char('d'));
             let screen = screen_of(&mut a, w, h).join("\n");
             assert!(screen.contains("End Fix"), "{w}x{h}: {screen}");
             assert!(screen.contains("y yes"), "{w}x{h}: {screen}");
-            // Wrapped to the pane, not cut off at its edge.
-            let flat: String = screen.split_whitespace().collect::<Vec<_>>().join(" ");
-            assert!(flat.contains("work stops."), "{w}x{h}: {screen}");
+            // Wrapped to the pane, not cut off at its edge: every word of
+            // the question shows whole.
+            let shown: Vec<&str> = screen.split_whitespace().collect();
+            for word in confirm(&a).lines.iter().flat_map(|l| l.split_whitespace()) {
+                assert!(shown.contains(&word), "{w}x{h}: {word} cut off\n{screen}");
+            }
         }
     }
 }

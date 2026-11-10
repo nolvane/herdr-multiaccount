@@ -1037,7 +1037,8 @@ fn draw_input(frame: &mut Frame, i: &crate::app::Input) {
 }
 
 fn draw_confirm(frame: &mut Frame, app: &mut App, c: &crate::app::Confirm) {
-    let width = 76u16.min(frame.area().width.saturating_sub(2)).max(24);
+    // The width `centered` gives the box, so the text wraps inside it.
+    let width = centered(frame.area(), 76, 1).width;
     let wrapped: Vec<Line> = c
         .lines
         .iter()
