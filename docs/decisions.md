@@ -568,7 +568,8 @@ space and its branch stay: closing a space only closes Herdr's state.
   startup hook would otherwise hand it to a new space with the same name
   (see "Spaces by id"). It is removed before the close, because Herdr ends
   the list itself when the list's space closes, and put back when Herdr
-  refuses, only for the spaces still open. The choices are taken from the
+  refuses, only for the spaces still open and still without a choice (one
+  another list made meanwhile wins). The choices are taken from the
   file under its lock, not from what the list read earlier, so a choice
   another list made meanwhile goes too.
 - **Tests.** The space reader, the closer and the write of `accounts.json`

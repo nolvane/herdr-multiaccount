@@ -217,10 +217,10 @@ pub enum ConfirmFor {
     CloseSpace {
         spaces: Vec<Workspace>,
         label: String,
-        /// The sessions the question counted, and whether it warned that
-        /// their work stops.
+        /// The sessions the question counted, and those it warned about
+        /// (working or waiting for an answer).
         sessions: Vec<String>,
-        warned: bool,
+        warned: Vec<String>,
     },
 }
 
@@ -673,6 +673,12 @@ impl App {
         self.after_close();
     }
 
+    /// Whether a session is working or waiting for an answer: closing it
+    /// stops that.
+    fn busy(p: &Pane) -> bool {
+        matches!(p.status.as_deref(), Some("working") | Some("blocked"))
+    }
+
     /// A space's name in the list: its label, else its number.
     fn space_name(ws: &Workspace) -> String {
         if ws.label.is_empty() {
@@ -737,10 +743,7 @@ impl App {
             1 => format!("1 Claude Code session runs {place}."),
             n => format!("{n} Claude Code sessions run {place}."),
         });
-        let busy = sessions
-            .iter()
-            .filter(|p| matches!(p.status.as_deref(), Some("working") | Some("blocked")))
-            .count();
+        let busy = sessions.iter().filter(|p| Self::busy(p)).count();
         if busy > 0 {
             lines.push(if sessions.len() == 1 {
                 "It is working or waiting for your answer: its current work stops.".into()
@@ -780,7 +783,11 @@ impl App {
                 spaces,
                 label,
                 sessions: ids,
-                warned: busy > 0,
+                warned: sessions
+                    .iter()
+                    .filter(|p| Self::busy(p))
+                    .map(|p| p.id.clone())
+                    .collect(),
             },
         });
     }
@@ -789,7 +796,13 @@ impl App {
     /// the space is still there, and that the close takes no space and no
     /// session the question did not name, nor a busy session it did not
     /// warn about.
-    fn close_space(&mut self, named: &[Workspace], label: &str, counted: &[String], warned: bool) {
+    fn close_space(
+        &mut self,
+        named: &[Workspace],
+        label: &str,
+        counted: &[String],
+        warned: &[String],
+    ) {
         let Some(first) = named.first() else {
             return;
         };
@@ -836,10 +849,7 @@ impl App {
         let changed = panes
             .iter()
             .filter(|p| group.iter().any(|w| w.id == p.workspace) && self.is_session(p))
-            .any(|p| {
-                !counted.contains(&p.id)
-                    || (!warned && matches!(p.status.as_deref(), Some("working") | Some("blocked")))
-            });
+            .any(|p| !counted.contains(&p.id) || (Self::busy(p) && !warned.contains(&p.id)));
         if changed {
             self.flash(
                 format!("{label} changed since the question; nothing was closed. Press d again"),
@@ -876,6 +886,10 @@ impl App {
             let back = forgot.is_empty()
                 || self.update(|s| {
                     for (id, name, account) in &forgot {
+                        // A choice made meanwhile (another list) wins.
+                        if s.space_account(id).is_some() {
+                            continue;
+                        }
                         s.assign(id, name, Some(account));
                     }
                 });
@@ -2012,7 +2026,7 @@ impl App {
                 label,
                 sessions,
                 warned,
-            } => self.close_space(&spaces, &label, &sessions, warned),
+            } => self.close_space(&spaces, &label, &sessions, &warned),
             ConfirmFor::Setup => {
                 match setup::apply() {
                     Ok(msg) => self.flash(msg, crate::theme::GREEN),
@@ -3962,6 +3976,18 @@ mod tests {
         assert!(spaces_closed().is_empty());
         assert!(flash_text(&a).contains("changed since the question"));
 
+        // The question warned about one; another started working since.
+        let mut a = spaces();
+        a.panes[0].status = Some("working".into());
+        set_fresh(Some(a.panes.clone()));
+        press(&mut a, KeyCode::Char('d'));
+        let mut now = a.panes.clone();
+        now[2].status = Some("working".into());
+        set_fresh(Some(now));
+        press(&mut a, KeyCode::Char('y'));
+        assert!(spaces_closed().is_empty());
+        assert!(flash_text(&a).contains("changed since the question"));
+
         // The question warned already, or a session ended: it closes.
         let mut a = spaces();
         a.space_sel = 1;
@@ -4022,6 +4048,17 @@ mod tests {
             "closed: stays forgotten"
         );
         assert_eq!(flash_text(&a), "Herdr could not close acme-app");
+
+        // Another list chose an account meanwhile: its choice stays.
+        let mut a = spaces();
+        a.space_sel = 2;
+        a.space_closer = |ws, group| {
+            STORED.with(|s| s.borrow_mut().assign("w3", "notes", Some("personal")));
+            cannot_close_space(ws, group)
+        };
+        press(&mut a, KeyCode::Char('d'));
+        press(&mut a, KeyCode::Char('y'));
+        assert_eq!(stored().space_account("w3"), Some("personal"));
     }
 
     #[test]
