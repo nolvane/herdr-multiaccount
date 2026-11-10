@@ -123,6 +123,15 @@ pub struct Moving {
     pub carry: Moved,
 }
 
+/// A move that runs: the session's pane and name, and the account it goes
+/// to, shown until its result arrives.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MoveRun {
+    pub pane: String,
+    pub label: String,
+    pub to: String,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct PickItem {
     pub label: String,
@@ -191,6 +200,14 @@ pub struct Confirm {
     pub question: String,
     pub lines: Vec<String>,
     pub purpose: ConfirmFor,
+}
+
+impl Confirm {
+    /// Whether Enter answers yes: only on the move question; on the others
+    /// (end, remove, setup) a stray Enter must not lose work.
+    pub fn enter_says_yes(&self) -> bool {
+        matches!(self.purpose, ConfirmFor::MoveSession { .. })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -265,6 +282,8 @@ pub struct App {
     pub confirm_scroll: u16,
     pub confirm_max: u16,
     pub confirm_of: String,
+    /// The question the quit bar (Ctrl+C) was asked over, back on "stay".
+    quit_over: Option<Confirm>,
     pub flash: Option<(String, Color, Instant)>,
     pub setup: setup::State,
     pub signin: Option<SignIn>,
@@ -277,8 +296,8 @@ pub struct App {
     pub mover: Mover,
     /// Whether the list runs inside Herdr (`herdr::inside`).
     pub in_herdr: bool,
-    /// A move that runs: its session's name, and where its result arrives.
-    pub moving: Option<String>,
+    /// A move that runs, and where its result arrives.
+    pub moving: Option<MoveRun>,
     move_rx: Option<Receiver<Result<String, String>>>,
     /// A failed move's message, kept until no other dialog is open.
     move_failed: Option<(String, String)>,
@@ -322,6 +341,7 @@ impl App {
             confirm_scroll: 0,
             confirm_max: 0,
             confirm_of: String::new(),
+            quit_over: None,
             flash: None,
             setup: setup::state(),
             signin: None,
@@ -675,9 +695,9 @@ impl App {
             self.flash("Only inside Herdr", crate::theme::MUTED);
             return;
         }
-        if let Some(label) = &self.moving {
+        if let Some(m) = &self.moving {
             self.flash(
-                format!("{label} is being moved; wait a moment"),
+                format!("{} is being moved; wait a moment", m.label),
                 crate::theme::MUTED,
             );
             return;
@@ -828,44 +848,53 @@ impl App {
 
     /// Starts the move after checking with Herdr once more that the session
     /// is still there, idle, and holds the same conversation.
+    /// The user answered yes and waits for an outcome: a refusal gets the
+    /// dialog a failed move gets, not a note in the footer.
+    fn move_refused(&mut self, label: &str, why: String) {
+        self.mode = Mode::Message {
+            title: format!("{label} was not moved"),
+            lines: vec![why],
+            good: false,
+        };
+    }
+
     fn move_session(&mut self, s: Moving, to: &str) {
+        let label = s.label.clone();
         let Some(now) = (self.pane_list)() else {
-            self.flash(
-                "Herdr could not be asked; nothing was moved",
-                crate::theme::RED,
+            self.move_refused(
+                &label,
+                "Herdr could not be asked whether it still waits for you. Try again in a moment."
+                    .into(),
             );
             return;
         };
-        let label = s.label.clone();
         let Some(p) = now.iter().find(|p| p.id == s.pane && self.is_session(p)) else {
-            self.flash(
-                format!("{label} has ended; nothing was moved"),
-                crate::theme::MUTED,
-            );
+            self.move_refused(&label, format!("{label} has ended."));
             return;
         };
         if let Some(why) = Self::not_idle(&label, p.status.as_deref()) {
-            self.flash(format!("{why}; nothing was moved"), crate::theme::YELLOW);
+            self.move_refused(&label, format!("{why}."));
             return;
         }
         let Some(held) = (self.conversation_of)(&s.pane)
             .filter(|h| h.session_id == s.session_id && h.pid == s.pid)
         else {
-            self.flash(
-                format!("{label} holds another conversation now; nothing was moved"),
-                crate::theme::YELLOW,
+            self.move_refused(
+                &label,
+                format!("{label} holds another conversation now. Press m again to move that one."),
             );
             return;
         };
         // The question named the model; a /model since then would move it
         // on another. A model noted only since is the one it runs on.
         if s.carry.model.is_some() && held.carry.model != s.carry.model {
-            self.flash(
-                format!("{label}'s model changed since; nothing was moved. Press m again"),
-                crate::theme::YELLOW,
+            self.move_refused(
+                &label,
+                format!("{label}'s model changed since the question. Press m again to move it on the new one."),
             );
             return;
         }
+        let plan_pane = s.pane.clone();
         let plan = relocate::Plan {
             pane: s.pane,
             label: label.clone(),
@@ -881,11 +910,12 @@ impl App {
             let _ = tx.send(mover(plan));
         });
         self.move_rx = Some(rx);
-        self.flash(
-            format!("Moving {label} to {}…", self.store.name_of(to)),
-            crate::theme::ACCENT,
-        );
-        self.moving = Some(label);
+        // The footer shows it until the result arrives (`ui::draw_footer`).
+        self.moving = Some(MoveRun {
+            pane: plan_pane,
+            label,
+            to: self.store.name_of(to),
+        });
     }
 
     /// Takes the result of a move once it is done.
@@ -910,7 +940,7 @@ impl App {
             }
         };
         self.move_rx = None;
-        let label = self.moving.take().unwrap_or_default();
+        let label = self.moving.take().map(|m| m.label).unwrap_or_default();
         match result {
             Ok(msg) => self.flash(msg, crate::theme::GREEN),
             Err(e) => {
@@ -1654,6 +1684,11 @@ impl App {
         });
     }
 
+    /// Says that a move the user turned back did not run.
+    fn not_moved(&mut self, label: &str) {
+        self.flash(format!("{label} was not moved"), crate::theme::MUTED);
+    }
+
     fn confirmed(&mut self, c: Confirm) {
         self.mode = Mode::Normal;
         match c.purpose {
@@ -1732,17 +1767,25 @@ impl App {
         }
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         if ctrl && k.code == KeyCode::Char('c') {
+            if let Mode::Confirm(c) = &self.mode {
+                self.quit_over = Some(c.clone());
+            }
             self.mode = Mode::AskQuit;
             return;
         }
         match self.mode.clone() {
             Mode::AskQuit => {
-                self.mode = Mode::Normal;
+                // Staying goes back to the question it was asked over.
+                self.mode = self
+                    .quit_over
+                    .take()
+                    .map(Mode::Confirm)
+                    .unwrap_or(Mode::Normal);
                 if k.code == KeyCode::Char('y') {
                     // Quitting halfway would leave the session ended.
-                    if let Some(label) = self.moving.clone() {
+                    if let Some(m) = self.moving.clone() {
                         self.flash(
-                            format!("{label} is being moved; quit once it is done"),
+                            format!("{} is being moved; quit once it is done", m.label),
                             crate::theme::YELLOW,
                         );
                     } else {
@@ -1762,26 +1805,37 @@ impl App {
                 KeyCode::End | KeyCode::Char('G') => self.help_scroll = self.help_max,
                 _ => {}
             },
+            // `y` answers yes, `n` and Esc no; Enter is yes only on the
+            // move question, which follows the Enter that picked the
+            // account (the owner's decision on #10). Any other key leaves
+            // the question open: a stray key never answers.
             Mode::Confirm(c) => match k.code {
-                // Only a question taller than the pane scrolls; otherwise
-                // these keys answer no, as any other.
-                KeyCode::Up | KeyCode::Char('k') if self.confirm_max > 0 => {
-                    self.scroll_confirm(-1, c)
-                }
-                KeyCode::Down | KeyCode::Char('j') if self.confirm_max > 0 => {
-                    self.scroll_confirm(1, c)
-                }
+                KeyCode::Up | KeyCode::Char('k') => self.scroll_confirm(-1, c),
+                KeyCode::Down | KeyCode::Char('j') => self.scroll_confirm(1, c),
                 KeyCode::Char('y') => {
                     self.confirm_of.clear();
                     self.confirmed(c)
                 }
-                _ => {
+                KeyCode::Enter if c.enter_says_yes() => {
                     self.confirm_of.clear();
-                    self.mode = Mode::Normal
+                    self.confirmed(c)
                 }
+                KeyCode::Char('n') | KeyCode::Esc => {
+                    self.confirm_of.clear();
+                    self.mode = Mode::Normal;
+                    if let ConfirmFor::MoveSession { session, .. } = &c.purpose {
+                        self.not_moved(&session.label);
+                    }
+                }
+                _ => {}
             },
             Mode::Pick(mut p) => match k.code {
-                KeyCode::Esc | KeyCode::Char('q') => self.mode = Mode::Normal,
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    self.mode = Mode::Normal;
+                    if let PickFor::MoveSession(session) = &p.purpose {
+                        self.not_moved(&session.label);
+                    }
+                }
                 KeyCode::Up | KeyCode::Char('k') => {
                     p.sel = p.sel.saturating_sub(1);
                     self.mode = Mode::Pick(p);
@@ -1921,9 +1975,9 @@ impl App {
             },
             _ if self.section == Section::Sessions => match k.code {
                 KeyCode::Char('d') | KeyCode::Delete => {
-                    if let Some(label) = self.moving.clone() {
+                    if let Some(m) = self.moving.clone() {
                         self.flash(
-                            format!("{label} is being moved; wait a moment"),
+                            format!("{} is being moved; wait a moment", m.label),
                             crate::theme::MUTED,
                         );
                     } else {
@@ -2905,12 +2959,7 @@ mod tests {
 
     #[test]
     fn any_other_answer_keeps_the_session() {
-        for key in [
-            KeyCode::Char('n'),
-            KeyCode::Esc,
-            KeyCode::Char('x'),
-            KeyCode::Enter,
-        ] {
+        for key in [KeyCode::Char('n'), KeyCode::Esc] {
             let mut a = agents();
             let before = a.panes.clone();
             press(&mut a, KeyCode::Char('d'));
@@ -2919,6 +2968,52 @@ mod tests {
             assert!(closed().is_empty(), "{key:?}");
             assert_eq!(a.panes, before, "{key:?}");
         }
+    }
+
+    #[test]
+    fn enter_and_other_keys_leave_the_other_questions_open() {
+        let end = || {
+            let mut a = agents();
+            press(&mut a, KeyCode::Char('d'));
+            a
+        };
+        let remove = || {
+            let mut a = agents();
+            a.section = Section::Accounts;
+            a.sel = 1;
+            press(&mut a, KeyCode::Char('d'));
+            a
+        };
+        // Never answered here: yes would change the real setup.
+        let setup = || {
+            let mut a = agents();
+            a.mode = Mode::Confirm(Confirm {
+                question: "Set up the accounts?".into(),
+                lines: vec!["Adds the claude function.".into()],
+                purpose: ConfirmFor::Setup,
+            });
+            a
+        };
+        let asks: [fn() -> App; 3] = [end, remove, setup];
+        for ask in asks {
+            for key in [KeyCode::Enter, KeyCode::Char('x'), KeyCode::Char(' ')] {
+                let mut a = ask();
+                let before = confirm(&a);
+                press(&mut a, key);
+                assert_eq!(confirm(&a), before, "{}: {key:?}", before.question);
+                assert!(closed().is_empty());
+            }
+            let mut a = ask();
+            press(&mut a, KeyCode::Esc);
+            assert_eq!(a.mode, Mode::Normal);
+            assert_eq!(flash_text(&a), "", "only a move says it did not run");
+        }
+        // Their buttons name y and Esc n, not Enter.
+        let mut a = end();
+        let screen = screen_of(&mut a, 100, 30).join("\n");
+        assert!(screen.contains(" y yes "), "{screen}");
+        assert!(screen.contains(" Esc n no "), "{screen}");
+        assert!(!screen.contains("⏎ y yes"), "{screen}");
     }
 
     #[test]
@@ -3244,7 +3339,10 @@ mod tests {
         assert!(text.contains("unsent text in it is lost"), "{text}");
         assert!(!text.contains("limit,"), "no fallback note: {text}");
         press(&mut a, KeyCode::Char('y'));
-        assert_eq!(a.moving.as_deref(), Some("Fix the login bug"));
+        assert_eq!(
+            a.moving.as_ref().map(|m| m.label.as_str()),
+            Some("Fix the login bug")
+        );
         finish(&mut a);
         assert_eq!(
             flash_text(&a),
@@ -3288,11 +3386,11 @@ mod tests {
                     now[0].status = Some("working".into());
                     set_fresh(Some(now));
                 },
-                "it is working; nothing was moved",
+                "it is working",
             ),
             (
                 |_| set_fresh(Some(vec![shell("w91:p1", "w91:t1")])),
-                "has ended; nothing was moved",
+                "has ended",
             ),
             (
                 |a| a.conversation_of = knows_another,
@@ -3307,36 +3405,122 @@ mod tests {
             change(&mut a);
             press(&mut a, KeyCode::Char('y'));
             assert!(a.moving.is_none(), "{says}");
-            assert!(flash_text(&a).contains(says), "{says}: {}", flash_text(&a));
+            refused(&a, says);
+        }
+    }
+
+    /// The dialog a move refused after yes opens, naming why.
+    fn refused(a: &App, says: &str) {
+        match &a.mode {
+            Mode::Message { title, lines, good } => {
+                assert_eq!(title, "Fix the login bug was not moved", "{says}");
+                let text = lines.join(" ");
+                assert!(text.contains(says), "{says}: {text}");
+                assert!(!text.contains("nothing was moved"), "said once: {text}");
+                assert!(!good);
+            }
+            m => panic!("{says}: no dialog: {m:?}"),
+        }
+    }
+
+    /// Opens the move question for Fix the login bug to Work.
+    fn asked_to_move() -> App {
+        let mut a = movable();
+        press(&mut a, KeyCode::Char('m'));
+        press(&mut a, KeyCode::Char('2'));
+        assert_eq!(confirm(&a).question, "Move Fix the login bug to Work?");
+        a
+    }
+
+    #[test]
+    fn enter_on_the_move_question_moves() {
+        // The steps of #10: m, Enter on the account, Enter on the question.
+        let mut a = movable();
+        press(&mut a, KeyCode::Char('m'));
+        press(&mut a, KeyCode::Enter);
+        confirm(&a);
+        press(&mut a, KeyCode::Enter);
+        assert_eq!(a.mode, Mode::Normal);
+        assert!(a.moving.is_some(), "the move runs");
+        finish(&mut a);
+        assert!(
+            flash_text(&a).starts_with("moved w91:p1 Fix the login bug"),
+            "{}",
+            flash_text(&a)
+        );
+    }
+
+    #[test]
+    fn no_on_the_move_question_says_the_session_was_not_moved() {
+        for key in [KeyCode::Char('n'), KeyCode::Esc] {
+            let mut a = asked_to_move();
+            press(&mut a, key);
+            assert_eq!(a.mode, Mode::Normal, "{key:?}");
+            assert!(a.moving.is_none(), "{key:?}");
+            assert_eq!(flash_text(&a), "Fix the login bug was not moved", "{key:?}");
+            assert_eq!(a.flash.as_ref().map(|f| f.1), Some(crate::theme::MUTED));
+        }
+        // A click on the no button too.
+        let mut a = asked_to_move();
+        screen_of(&mut a, 100, 30);
+        let spot = a
+            .hits
+            .iter()
+            .find_map(|(r, h)| (*h == Hit::Key('n')).then_some(*r))
+            .expect("the no button");
+        a.click(spot.x, spot.y);
+        assert_eq!(a.mode, Mode::Normal);
+        assert!(a.moving.is_none());
+        assert_eq!(flash_text(&a), "Fix the login bug was not moved");
+    }
+
+    #[test]
+    fn leaving_the_move_picker_says_the_session_was_not_moved() {
+        for key in [KeyCode::Esc, KeyCode::Char('q')] {
+            let mut a = movable();
+            press(&mut a, KeyCode::Char('m'));
+            picker(&a);
+            press(&mut a, key);
+            assert_eq!(a.mode, Mode::Normal, "{key:?}");
+            assert!(a.moving.is_none(), "{key:?}");
+            assert_eq!(flash_text(&a), "Fix the login bug was not moved", "{key:?}");
         }
     }
 
     #[test]
-    fn any_answer_but_yes_leaves_the_session() {
-        for key in [KeyCode::Char('n'), KeyCode::Esc, KeyCode::Enter] {
-            let mut a = movable();
-            press(&mut a, KeyCode::Char('m'));
-            press(&mut a, KeyCode::Enter);
-            press(&mut a, key);
-            assert_eq!(a.mode, Mode::Normal);
-            assert!(a.moving.is_none(), "{key:?}");
-        }
-        // Up and Down answer no as well when the question fits.
-        for key in [KeyCode::Down, KeyCode::Char('k')] {
-            let mut a = movable();
-            press(&mut a, KeyCode::Char('m'));
-            press(&mut a, KeyCode::Enter);
+    fn other_keys_leave_the_move_question_open() {
+        for key in [
+            KeyCode::Char('x'),
+            KeyCode::Char('Y'),
+            KeyCode::Char(' '),
+            KeyCode::Tab,
+            KeyCode::Down,
+            KeyCode::Up,
+            KeyCode::Char('j'),
+            KeyCode::Char('k'),
+            KeyCode::Char('m'),
+        ] {
+            let mut a = asked_to_move();
             screen_of(&mut a, 160, 40);
-            assert_eq!(a.confirm_max, 0);
+            assert_eq!(a.confirm_max, 0, "the question fits");
+            let before = confirm(&a);
             press(&mut a, key);
-            assert_eq!(a.mode, Mode::Normal, "{key:?}");
+            assert_eq!(confirm(&a), before, "{key:?}");
+            assert!(a.moving.is_none(), "{key:?}");
+            assert_eq!(flash_text(&a), "", "{key:?}");
         }
-        // Esc in the picker too.
-        let mut a = movable();
-        press(&mut a, KeyCode::Char('m'));
-        press(&mut a, KeyCode::Esc);
-        assert_eq!(a.mode, Mode::Normal);
-        assert!(a.moving.is_none());
+    }
+
+    #[test]
+    fn staying_after_ctrl_c_keeps_the_question() {
+        let mut a = asked_to_move();
+        let before = confirm(&a);
+        a.key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert_eq!(a.mode, Mode::AskQuit);
+        press(&mut a, KeyCode::Char('n'));
+        assert_eq!(confirm(&a), before);
+        press(&mut a, KeyCode::Char('y'));
+        assert!(a.moving.is_some(), "the question still answers");
     }
 
     #[test]
@@ -3526,7 +3710,11 @@ mod tests {
     #[test]
     fn while_a_move_runs_the_list_stays_and_the_session_is_kept() {
         let mut a = movable();
-        a.moving = Some("Fix the login bug".into());
+        a.moving = Some(MoveRun {
+            pane: "w91:p1".into(),
+            label: "Fix the login bug".into(),
+            to: "Work".into(),
+        });
         press(&mut a, KeyCode::Char('q'));
         press(&mut a, KeyCode::Char('y'));
         assert!(!a.quit);
@@ -3536,6 +3724,90 @@ mod tests {
         press(&mut a, KeyCode::Char('m'));
         assert_eq!(a.mode, Mode::Normal);
         assert!(flash_text(&a).contains("being moved"));
+    }
+
+    #[test]
+    fn a_running_move_shows_until_its_result() {
+        let mut a = asked_to_move();
+        press(&mut a, KeyCode::Char('y'));
+        assert!(a.moving.is_some());
+        // Past the 5 seconds of a flash, and during a refresh as well.
+        a.flash = None;
+        for (loading, probing) in [(false, false), (true, false), (false, true)] {
+            a.info_loading = loading;
+            a.probing = probing;
+            for (w, h) in [(160, 40), (100, 30), (60, 20)] {
+                let rows = screen_of(&mut a, w, h);
+                let footer = &rows[h as usize - 1];
+                assert!(
+                    footer.contains("Moving Fix the login bug to Work…"),
+                    "{w}x{h} {loading} {probing}: {footer}"
+                );
+                let screen = rows.join("\n");
+                assert!(screen.contains("moving to Work…"), "{w}x{h}: {screen}");
+            }
+        }
+        // A newer note shows for its time, then the move again.
+        a.flash(
+            "Write the docs is being moved; wait a moment",
+            crate::theme::MUTED,
+        );
+        let rows = screen_of(&mut a, 160, 40);
+        assert!(rows[39].contains("wait a moment"), "{}", rows[39]);
+        a.flash = None;
+        a.info_loading = false;
+        a.probing = false;
+        finish(&mut a);
+        let rows = screen_of(&mut a, 160, 40);
+        assert!(rows[39].contains("moved w91:p1"), "{}", rows[39]);
+        let screen = rows.join("\n");
+        assert!(!screen.contains("oving to Work…"), "{screen}");
+    }
+
+    #[test]
+    fn the_buttons_name_the_keys_at_every_size() {
+        for (w, h) in [(160, 40), (100, 30), (60, 20), (40, 12), (24, 20), (20, 30)] {
+            let mut a = asked_to_move();
+            let screen = screen_of(&mut a, w, h).join("\n");
+            assert!(screen.contains("y yes "), "{w}x{h}: {screen}");
+            assert!(
+                screen.contains(" n no "),
+                "{w}x{h}: the whole no button\n{screen}"
+            );
+            if w >= 40 {
+                assert!(screen.contains(" ⏎ y yes "), "{w}x{h}: {screen}");
+                assert!(screen.contains(" Esc n no "), "{w}x{h}: {screen}");
+            }
+            // The no button answers no where it is drawn.
+            let spot = a
+                .hits
+                .iter()
+                .find_map(|(r, h)| (*h == Hit::Key('n')).then_some(*r))
+                .expect("the no button");
+            assert!(spot.x + spot.width <= w, "{w}x{h}");
+            a.click(spot.x, spot.y);
+            assert_eq!(flash_text(&a), "Fix the login bug was not moved", "{w}x{h}");
+        }
+    }
+
+    #[test]
+    fn the_keys_overlay_says_how_questions_are_answered() {
+        let mut a = movable();
+        a.mode = Mode::Help;
+        let mut seen = screen_of(&mut a, 120, 60).join("\n");
+        for _ in 0..a.help_max {
+            press(&mut a, KeyCode::Down);
+            seen.push_str(&screen_of(&mut a, 120, 60).join("\n"));
+        }
+        assert!(seen.contains("Questions"), "{seen}");
+        assert!(
+            seen.contains("yes on the move question; nothing on the others"),
+            "{seen}"
+        );
+        assert!(
+            seen.contains("any other key leaves the question open"),
+            "{seen}"
+        );
     }
 
     #[test]
@@ -3593,11 +3865,7 @@ mod tests {
         a.conversation_of = knows_other_model;
         press(&mut a, KeyCode::Char('y'));
         assert!(a.moving.is_none(), "nothing started");
-        assert!(
-            flash_text(&a).contains("model changed"),
-            "{}",
-            flash_text(&a)
-        );
+        refused(&a, "model changed");
     }
 
     #[test]

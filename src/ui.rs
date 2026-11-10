@@ -674,7 +674,13 @@ fn draw_sessions(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
     let now = app.now();
     let mut rows = Vec::new();
     for (i, p) in sessions.iter().enumerate().skip(first).take(visible) {
-        let (color, word) = agent_status(p.status.as_deref());
+        let (color, word) = match app.moving.as_ref().filter(|m| m.pane == p.id) {
+            Some(m) => (ACCENT, format!("moving to {}…", m.to)),
+            None => {
+                let (color, word) = agent_status(p.status.as_deref());
+                (color, word.to_string())
+            }
+        };
         let label = if p.label.is_empty() {
             p.id.clone()
         } else {
@@ -810,6 +816,12 @@ fn draw_footer(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
     }
     let right = if let Some((text, color, _)) = &app.flash {
         Span::styled(format!("{text} "), Style::new().fg(*color))
+    } else if let Some(m) = &app.moving {
+        // For the whole move, not only a flash's 5 seconds.
+        Span::styled(
+            format!("Moving {} to {}… ", m.label, m.to),
+            Style::new().fg(ACCENT),
+        )
     } else if app.info_loading {
         Span::styled(
             format!("{} checking accounts… ", icons.refresh()),
@@ -830,7 +842,7 @@ fn draw_footer(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
             Style::new().fg(FAINT),
         )
     };
-    let refresh = if app.flash.is_none() && !app.info_loading {
+    let refresh = if app.flash.is_none() && app.moving.is_none() && !app.info_loading {
         vec![
             Span::styled("r", Style::new().fg(MUTED).add_modifier(Modifier::BOLD)),
             Span::styled(" refresh  ", Style::new().fg(FAINT)),
@@ -1089,8 +1101,19 @@ fn draw_confirm(frame: &mut Frame, app: &mut App, c: &crate::app::Confirm) {
         );
     }
     let y = inner.y + inner.height.saturating_sub(1);
-    let yes = " y yes ";
-    let no = " n no ";
+    // The buttons name the keys that answer; on a narrow pane the short
+    // ones, so the no button shows whole.
+    let full_yes = if c.enter_says_yes() {
+        " ⏎ y yes "
+    } else {
+        " y yes "
+    };
+    let (yes, no) = if full_yes.width() + 1 + " Esc n no ".width() <= inner.width as usize {
+        (full_yes, " Esc n no ")
+    } else {
+        (" y yes ", " n no ")
+    };
+    let (yes_w, no_w) = (yes.width() as u16, no.width() as u16);
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(
@@ -1105,9 +1128,11 @@ fn draw_confirm(frame: &mut Frame, app: &mut App, c: &crate::app::Confirm) {
         ])),
         Rect::new(inner.x, y, inner.width, 1),
     );
-    app.hits.push((Rect::new(inner.x, y, 7, 1), Hit::Key('y')));
+    let right = inner.x + inner.width;
+    let clip = |x: u16, w: u16| Rect::new(x.min(right), y, w.min(right.saturating_sub(x)), 1);
+    app.hits.push((clip(inner.x, yes_w), Hit::Key('y')));
     app.hits
-        .push((Rect::new(inner.x + 8, y, 6, 1), Hit::Key('n')));
+        .push((clip(inner.x + yes_w + 1, no_w), Hit::Key('n')));
 }
 
 fn key_hint(key: &'static str, what: &'static str) -> [Span<'static>; 2] {
@@ -1284,7 +1309,7 @@ pub fn wrap(text: &str, width: usize) -> Vec<String> {
 }
 
 fn draw_help(frame: &mut Frame, app: &mut App) {
-    let groups: [(&str, &[(&str, &str)]); 4] = [
+    let groups: [(&str, &[(&str, &str)]); 5] = [
         (
             "Accounts",
             &[
@@ -1317,6 +1342,15 @@ fn draw_help(frame: &mut Frame, app: &mut App) {
                     "move it to another account, with its conversation (asks first)",
                 ),
                 ("d", "end the session: its pane closes (asks first)"),
+            ],
+        ),
+        (
+            "Questions",
+            &[
+                ("y", "yes"),
+                ("n  Esc", "no"),
+                ("⏎", "yes on the move question; nothing on the others"),
+                ("", "any other key leaves the question open"),
             ],
         ),
         (

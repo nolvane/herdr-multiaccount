@@ -456,3 +456,27 @@ the move.
   nothing is moved; a model noted only after the question is used. A question
   taller than the pane scrolls with ↑ ↓, as the keys overlay does. The way
   by hand adds `--model '<id>'` and names the options to add.
+
+## 2026-11-10: Questions answer only to their keys, and a move is never silent
+
+On every question in the list, any key but `y` used to close it without a
+word, so `Enter` after picking the move's account cancelled the move
+silently (#10). Now `y` answers yes and `n` or `Esc` no; any other key
+leaves the question open. `Enter` answers yes only on the move question,
+because it follows the `Enter` that picked the account; on the questions
+that end a session, remove an account or change setup it does nothing, so a
+stray `Enter` never loses work (the owner's decision on #10). The buttons
+name these keys, and fall back to `y yes` / `n no` where the pane is too
+narrow for the longer ones. Ctrl+C over a question shows the quit bar, and
+staying brings the question back.
+
+A move says how it ended in every case: turning it back (`n`/`Esc` on the
+question, `Esc`/`q` in the account list) says "<session> was not moved" in
+the footer; a refusal after yes (Herdr not reachable, the session ended,
+got busy, holds another conversation, its model changed) opens the same
+dialog as a failed move, since the user just answered and waits for an
+outcome; refusals at `m` stay footer notes, as nothing was decided yet.
+While the move runs (up to about half a minute) the footer keeps "Moving
+<session> to <account>…" (a newer note covers it only for its 5 seconds),
+and the session's row in the Agents tab says "moving to <account>…".
+Closing the list while a move runs is #12.

@@ -25,6 +25,11 @@ All notable changes to this project are documented here. The format follows
 ### Fixed
 
 - Questions wrap to narrow panes instead of being cut off at the edge.
+- Moving a session never ends without a word: `⏎` on the move question
+  moves it, turning it back says it was not moved, a refusal after yes
+  opens a dialog with the reason, and the footer and the session's row show
+  the move until it is done. On every question only `y`, `n` and `Esc`
+  answer (and `⏎` on the move question); other keys leave it open.
 - `o` in the sign-in dialog says when the browser opener could not be
   started, and opened links no longer leave an ended opener process behind
   while the list is open.
