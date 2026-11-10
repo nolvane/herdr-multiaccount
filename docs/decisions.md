@@ -440,13 +440,19 @@ the move.
   conversation and the hand-over is under 2 minutes old, deletes it in every
   case, filters it through the same table again (so a file put there by
   something else cannot add other options), and records the options again
-  for the next move. Without a usable hand-over it starts as before and
-  says so in one line. The list deletes the hand-over when the move stops
-  before the command is typed; after that the launcher may still read it,
-  and it expires by itself.
+  for the next move, with the names the first start dropped. Without a
+  usable hand-over it starts as before, says so in one line, and notes its
+  start options as not known, as it does when the list did not know them
+  either, so a later move never claims options it lost. The list deletes
+  the hand-over when the move stops before the command is typed; after that
+  the launcher may still read it, and every write or read of a hand-over
+  removes the ones older than 2 minutes, so none with option values stays
+  behind.
 - **The question.** It names the model and the carried options (values only
   for short single words, so a long `--append-system-prompt` never stretches
-  it) and the dropped ones, or says the start options are not known. If the
-  model changed between the question and `y`, nothing is moved. A question
+  it) and the dropped ones, or says the start options are not known.
+  `--resume` and `--continue` are not named as dropped: the move resumes the
+  conversation itself. If the model the question named changed before `y`,
+  nothing is moved; a model noted only after the question is used. A question
   taller than the pane scrolls with ↑ ↓, as the keys overlay does. The way
   by hand adds `--model '<id>'` and names the options to add.
