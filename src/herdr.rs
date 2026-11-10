@@ -85,7 +85,8 @@ pub fn workspaces_from(v: &Value) -> Option<Vec<Workspace>> {
                         repo_key: key.to_string(),
                         linked: w["worktree"]["is_linked_worktree"]
                             .as_bool()
-                            .unwrap_or(false),
+                            // Unknown: alone, never a group by mistake.
+                            .unwrap_or(true),
                     }),
                 })
             })
@@ -429,6 +430,16 @@ mod tests {
             ]
         );
         assert_eq!(list[0].label, "acme-app");
+        // Without the flag a space counts as a worktree: it closes alone.
+        let v = json!({"result": {"workspaces": [{"workspace_id": "w1",
+            "worktree": {"repo_key": "k"}}]}});
+        assert_eq!(
+            workspaces_from(&v).unwrap()[0]
+                .worktree
+                .as_ref()
+                .map(|t| t.linked),
+            Some(true)
+        );
         assert!(list[0].focused);
     }
 }

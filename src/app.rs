@@ -217,6 +217,10 @@ pub enum ConfirmFor {
     CloseSpace {
         spaces: Vec<Workspace>,
         label: String,
+        /// The sessions the question counted, and whether it warned that
+        /// their work stops.
+        sessions: Vec<String>,
+        warned: bool,
     },
 }
 
@@ -666,13 +670,7 @@ impl App {
             self.flash(format!("{label} had already ended"), crate::theme::MUTED);
         }
         self.panes = now;
-        self.session_sel = self
-            .session_sel
-            .min(self.sessions().len().saturating_sub(1));
-        // A read started before the close would bring the row back; the
-        // next one (spaces too) runs a moment after Herdr is done closing.
-        self.herdr_rx = None;
-        self.next_herdr = Instant::now() + Duration::from_secs(1);
+        self.after_close();
     }
 
     /// A space's name in the list: its label, else its number.
@@ -725,7 +723,7 @@ impl App {
         if group {
             let others: Vec<String> = spaces[1..].iter().map(Self::space_name).collect();
             lines.push(format!(
-                "It is the main checkout of its repository: its worktree spaces {} close with it.",
+                "It is the main checkout of its repository: the repository's other spaces {} close with it.",
                 others.join(", ")
             ));
         }
@@ -774,17 +772,24 @@ impl App {
                 if group { "one of them" } else { "it" }
             ));
         }
+        let ids = sessions.iter().map(|p| p.id.clone()).collect();
         self.mode = Mode::Confirm(Confirm {
             question: format!("Close {label}?"),
             lines,
-            purpose: ConfirmFor::CloseSpace { spaces, label },
+            purpose: ConfirmFor::CloseSpace {
+                spaces,
+                label,
+                sessions: ids,
+                warned: busy > 0,
+            },
         });
     }
 
     /// Closes the spaces the question named, after checking with Herdr that
-    /// the space is still there and that the close takes no space the
-    /// question did not name.
-    fn close_space(&mut self, named: &[Workspace], label: &str) {
+    /// the space is still there, and that the close takes no space and no
+    /// session the question did not name, nor a busy session it did not
+    /// warn about.
+    fn close_space(&mut self, named: &[Workspace], label: &str, counted: &[String], warned: bool) {
         let Some(first) = named.first() else {
             return;
         };
@@ -821,31 +826,57 @@ impl App {
             self.after_close();
             return;
         }
-        // The account choices go first: when the list runs in one of these
-        // spaces, Herdr ends it with the close.
-        let kept: Vec<(Workspace, String)> = group
+        let Some(panes) = (self.pane_list)() else {
+            self.flash(
+                "Herdr could not be asked; nothing was closed",
+                crate::theme::RED,
+            );
+            return;
+        };
+        let changed = panes
             .iter()
-            .filter_map(|w| {
-                self.store
-                    .space_account(&w.id)
-                    .map(|a| (w.clone(), a.to_string()))
-            })
+            .filter(|p| group.iter().any(|w| w.id == p.workspace) && self.is_session(p))
+            .any(|p| {
+                !counted.contains(&p.id)
+                    || (!warned && matches!(p.status.as_deref(), Some("working") | Some("blocked")))
+            });
+        if changed {
+            self.flash(
+                format!("{label} changed since the question; nothing was closed. Press d again"),
+                crate::theme::YELLOW,
+            );
+            self.workspaces = now;
+            self.panes = panes;
+            self.after_close();
+            return;
+        }
+        // The account choices go first: when the list runs in one of these
+        // spaces, Herdr ends it with the close. Read from the stored file
+        // itself, which another list may have changed since.
+        let spaces: Vec<(String, String)> = group
+            .iter()
+            .map(|w| (w.id.clone(), w.label.clone()))
             .collect();
-        if !kept.is_empty() {
-            let forget = kept.clone();
-            if !self.update(move |s| {
-                for (w, _) in &forget {
-                    s.assign(&w.id, &w.label, None);
+        let mut forgot: Vec<(String, String, String)> = vec![];
+        if !self.update(|s| {
+            for (id, name) in &spaces {
+                if let Some(account) = s.space_account(id).map(str::to_string) {
+                    s.assign(id, name, None);
+                    forgot.push((id.clone(), name.clone(), account));
                 }
-            }) {
-                return;
             }
+        }) {
+            return;
         }
         if !(self.space_closer)(&first.id, group.len() > 1) {
-            let back = kept.is_empty()
-                || self.update(move |s| {
-                    for (w, account) in &kept {
-                        s.assign(&w.id, &w.label, Some(account));
+            // Back only for the spaces still open (Herdr may have closed
+            // part of them before it failed).
+            let open = (self.space_list)();
+            forgot.retain(|(id, _, _)| open.as_ref().is_none_or(|l| l.iter().any(|w| &w.id == id)));
+            let back = forgot.is_empty()
+                || self.update(|s| {
+                    for (id, name, account) in &forgot {
+                        s.assign(id, name, Some(account));
                     }
                 });
             self.flash(
@@ -858,6 +889,7 @@ impl App {
             );
             return;
         }
+        self.panes = panes;
         let gone: Vec<&str> = group.iter().map(|w| w.id.as_str()).collect();
         self.workspaces = now;
         self.workspaces.retain(|w| !gone.contains(&w.id.as_str()));
@@ -1975,7 +2007,12 @@ impl App {
             ConfirmFor::Remove(id) => self.remove(&id),
             ConfirmFor::EndSession { pane, label } => self.end_session(&pane, &label),
             ConfirmFor::MoveSession { session, to } => self.move_session(session, &to),
-            ConfirmFor::CloseSpace { spaces, label } => self.close_space(&spaces, &label),
+            ConfirmFor::CloseSpace {
+                spaces,
+                label,
+                sessions,
+                warned,
+            } => self.close_space(&spaces, &label, &sessions, warned),
             ConfirmFor::Setup => {
                 match setup::apply() {
                     Ok(msg) => self.flash(msg, crate::theme::GREEN),
@@ -3584,7 +3621,9 @@ mod tests {
         ];
         a.space_list = fresh_spaces;
         a.space_closer = closes_space;
+        a.pane_list = fresh;
         set_fresh_spaces(Some(a.workspaces.clone()));
+        set_fresh(Some(a.panes.clone()));
         spaces_closed();
         a.section = Section::Spaces;
         a
@@ -3752,12 +3791,13 @@ mod tests {
             pane("w4:p1", "w4:t1", "Docs", Some("working"), None),
         ));
         set_fresh_spaces(Some(a.workspaces.clone()));
+        set_fresh(Some(a.panes.clone()));
         press(&mut a, KeyCode::Char('d'));
         let c = confirm(&a);
         assert_eq!(c.question, "Close acme-app?");
         let text = c.lines.join(" ");
         assert!(
-            text.contains("main checkout of its repository: its worktree spaces fix-login, docs-site close with it."),
+            text.contains("main checkout of its repository: the repository's other spaces fix-login, docs-site close with it."),
             "{text}"
         );
         assert!(!text.contains("other-repo"), "{text}");
@@ -3790,7 +3830,7 @@ mod tests {
         set_fresh_spaces(Some(a.workspaces.clone()));
         press(&mut a, KeyCode::Char('d'));
         let text = confirm(&a).lines.join(" ");
-        assert!(!text.contains("worktree spaces"), "{text}");
+        assert!(!text.contains("other spaces"), "{text}");
         assert!(text.contains("1 Claude Code session runs in it."), "{text}");
         press(&mut a, KeyCode::Char('y'));
         assert_eq!(spaces_closed(), vec![("w1".to_string(), false)]);
@@ -3888,6 +3928,100 @@ mod tests {
             "{}",
             flash_text(&a)
         );
+    }
+
+    #[test]
+    fn sessions_that_changed_since_the_question_close_nothing() {
+        // One started working without the question warning about it.
+        let mut a = spaces();
+        a.space_sel = 1;
+        press(&mut a, KeyCode::Char('d'));
+        let mut now = a.panes.clone();
+        now[2].status = Some("working".into());
+        set_fresh(Some(now.clone()));
+        press(&mut a, KeyCode::Char('y'));
+        assert!(spaces_closed().is_empty());
+        assert_eq!(
+            flash_text(&a),
+            "fix-login changed since the question; nothing was closed. Press d again"
+        );
+        assert_eq!(stored(), a.store, "account choices kept");
+        assert_eq!(a.panes, now, "the list shows what Herdr says now");
+
+        // A new session opened in it.
+        let mut a = spaces();
+        a.space_sel = 2;
+        press(&mut a, KeyCode::Char('d'));
+        let mut now = a.panes.clone();
+        now.push(in_space(
+            "w3",
+            pane("w3:p2", "w3:t1", "New", Some("idle"), None),
+        ));
+        set_fresh(Some(now));
+        press(&mut a, KeyCode::Char('y'));
+        assert!(spaces_closed().is_empty());
+        assert!(flash_text(&a).contains("changed since the question"));
+
+        // The question warned already, or a session ended: it closes.
+        let mut a = spaces();
+        a.space_sel = 1;
+        a.panes[2].status = Some("blocked".into());
+        let mut now = a.panes.clone();
+        now[2].status = Some("working".into());
+        press(&mut a, KeyCode::Char('d'));
+        set_fresh(Some(now));
+        press(&mut a, KeyCode::Char('y'));
+        assert_eq!(spaces_closed(), vec![("w2".to_string(), false)]);
+        let mut a = spaces();
+        press(&mut a, KeyCode::Char('d'));
+        set_fresh(Some(vec![a.panes[1].clone()]));
+        press(&mut a, KeyCode::Char('y'));
+        assert_eq!(spaces_closed(), vec![("w1".to_string(), true)]);
+
+        // Herdr's panes cannot be read: nothing closes.
+        let mut a = spaces();
+        press(&mut a, KeyCode::Char('d'));
+        set_fresh(None);
+        press(&mut a, KeyCode::Char('y'));
+        assert!(spaces_closed().is_empty());
+        assert_eq!(a.flash.as_ref().map(|f| f.1), Some(crate::theme::RED));
+    }
+
+    #[test]
+    fn the_stored_choices_are_forgotten_also_when_this_list_has_not_read_them() {
+        let mut a = spaces();
+        // Another list chose an account for acme-app since this one read.
+        STORED.with(|s| s.borrow_mut().assign("w1", "acme-app", Some("work")));
+        press(&mut a, KeyCode::Char('d'));
+        press(&mut a, KeyCode::Char('y'));
+        assert_eq!(spaces_closed(), vec![("w1".to_string(), true)]);
+        assert_eq!(stored().space_account("w1"), None);
+        assert_eq!(stored().space_account("w2"), None);
+        assert_eq!(stored().space_account("w3"), Some("work"));
+    }
+
+    #[test]
+    fn a_close_that_failed_halfway_puts_back_only_the_open_spaces() {
+        let mut a = spaces();
+        a.store.assign("w1", "acme-app", Some("work"));
+        STORED.with(|s| *s.borrow_mut() = a.store.clone());
+        a.space_closer = |ws, group| {
+            // fix-login went, acme-app stayed.
+            set_fresh_spaces(
+                fresh_spaces().map(|l| l.into_iter().filter(|w| w.id != "w2").collect()),
+            );
+            cannot_close_space(ws, group)
+        };
+        press(&mut a, KeyCode::Char('d'));
+        press(&mut a, KeyCode::Char('y'));
+        assert_eq!(spaces_closed(), vec![("w1".to_string(), true)]);
+        assert_eq!(stored().space_account("w1"), Some("work"), "still open");
+        assert_eq!(
+            stored().space_account("w2"),
+            None,
+            "closed: stays forgotten"
+        );
+        assert_eq!(flash_text(&a), "Herdr could not close acme-app");
     }
 
     #[test]

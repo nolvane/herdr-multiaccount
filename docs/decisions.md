@@ -555,7 +555,11 @@ space and its branch stay: closing a space only closes Herdr's state.
   again: a space that is gone is "had already closed", and a group that grew
   since the question closes nothing, so `y` never takes a space it did not
   name. `--group` is passed only when the fresh group has two or more
-  spaces.
+  spaces. A space whose answer lacks `is_linked_worktree` counts as a
+  worktree, so it closes alone and never takes a group by mistake. The
+  panes are read again too: a Claude Code session that opened in those
+  spaces since the question, or one that started working without the
+  question warning about it, closes nothing ("changed since the question").
 - **The list's own space.** Closing it is allowed (the owner's decision on
   #11); the question says that the list closes too. The list's pane is
   `HERDR_PANE_ID`, kept in `App::own_pane`, which `is_session` uses as well.
@@ -564,7 +568,9 @@ space and its branch stay: closing a space only closes Herdr's state.
   startup hook would otherwise hand it to a new space with the same name
   (see "Spaces by id"). It is removed before the close, because Herdr ends
   the list itself when the list's space closes, and put back when Herdr
-  refuses.
+  refuses, only for the spaces still open. The choices are taken from the
+  file under its lock, not from what the list read earlier, so a choice
+  another list made meanwhile goes too.
 - **Tests.** The space reader, the closer and the write of `accounts.json`
   (`App::store_update`) are fields, so tests reach neither Herdr nor the
   real config directory.
