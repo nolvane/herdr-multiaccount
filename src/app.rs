@@ -786,9 +786,15 @@ impl App {
             "It restarts there and its conversation carries on; unsent text in it is lost.".into(),
         );
         // The conversation's cache stays with the old login.
-        lines.push(format!(
-            "The first answer is slower and counts more against {to}'s limit (an API key: costs more)."
-        ));
+        let api_key = self
+            .store
+            .account(&choice.id)
+            .is_some_and(|a| a.kind == Kind::ApiKey);
+        lines.push(if api_key {
+            "The first answer is slower and costs more on its key.".to_string()
+        } else {
+            format!("The first answer is slower and counts more against {to}'s limit.")
+        });
         self.mode = Mode::Confirm(Confirm {
             question: format!("Move {} to {to}?", session.label),
             lines,
@@ -3098,7 +3104,6 @@ mod tests {
         let text = c.lines.join(" ");
         assert!(text.contains("slower"), "{text}");
         assert!(text.contains("counts more against Work"), "{text}");
-        assert!(text.contains("API key"), "{text}");
         assert!(text.contains("unsent text in it is lost"), "{text}");
         assert!(!text.contains("limit,"), "no fallback note: {text}");
         press(&mut a, KeyCode::Char('y'));
