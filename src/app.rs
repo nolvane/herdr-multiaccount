@@ -1,5 +1,6 @@
 //! The list's state and what the keys and the mouse do.
 
+use crate::carry::Moved;
 use crate::config::{self, Config};
 use crate::herdr::{self, Pane, Workspace};
 use crate::info::{self, Info};
@@ -69,11 +70,29 @@ pub type Opener = fn(&str, &str) -> bool;
 /// fields of the app so tests never reach Herdr.
 pub type PaneList = fn() -> Option<Vec<Pane>>;
 pub type PaneCloser = fn(&str) -> bool;
+/// Reads Herdr's spaces (`herdr::workspaces`), and closes one, with its
+/// worktree group when asked (`herdr::close_workspace`).
+pub type SpaceList = fn() -> Option<Vec<Workspace>>;
+pub type SpaceCloser = fn(&str, bool) -> bool;
+/// Changes `accounts.json` under its lock (`Store::update`); a field so
+/// tests never write the real config directory.
+pub type StoreUpdate = for<'a> fn(Box<dyn FnOnce(&mut Store) + 'a>) -> std::io::Result<Store>;
 /// The conversation a pane holds now and its Claude Code process
-/// (`real_conversation`), and the move itself (`relocate::perform`); fields
-/// so tests never reach Herdr.
-pub type ConversationOf = fn(&str) -> Option<(String, u32)>;
-pub type Mover = fn(relocate::Plan) -> Result<String, String>;
+/// (`real_conversation`), and the start of the move (`relocate::perform`,
+/// which notes it in the folder given and starts its process); fields so
+/// tests never reach Herdr.
+pub type ConversationOf = fn(&str) -> Option<Held>;
+
+/// The conversation a pane holds, its Claude Code process, and what a move
+/// carries over.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Held {
+    pub session_id: String,
+    pub pid: u32,
+    pub carry: Moved,
+}
+/// The folder of the notes, this list's id and the plan.
+pub type Mover = fn(&std::path::Path, u32, relocate::Plan) -> Result<(), String>;
 
 /// The program that opens links: `open` on macOS, `xdg-open` elsewhere.
 const OPENER: &str = if cfg!(target_os = "macos") {
@@ -109,6 +128,27 @@ pub struct Moving {
     pub pid: u32,
     /// The account it runs on now (the main login when unknown).
     pub from: String,
+    /// The start options and model the move carries over.
+    pub carry: Moved,
+}
+
+/// A move that runs: the session's pane and name, and the account it goes
+/// to, shown until its result arrives.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MoveRun {
+    pub pane: String,
+    pub label: String,
+    pub to: String,
+}
+
+impl MoveRun {
+    fn of(p: &relocate::Plan) -> MoveRun {
+        MoveRun {
+            pane: p.pane.clone(),
+            label: p.label.clone(),
+            to: p.account_name.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -172,6 +212,16 @@ pub enum ConfirmFor {
         session: Moving,
         to: String,
     },
+    /// Closes a space (`spaces[0]`), with the worktree spaces the question
+    /// named when it is their main checkout.
+    CloseSpace {
+        spaces: Vec<Workspace>,
+        label: String,
+        /// The sessions the question counted, and those it warned about
+        /// (working or waiting for an answer).
+        sessions: Vec<String>,
+        warned: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -179,6 +229,14 @@ pub struct Confirm {
     pub question: String,
     pub lines: Vec<String>,
     pub purpose: ConfirmFor,
+}
+
+impl Confirm {
+    /// Whether Enter answers yes: only on the move question; on the others
+    /// (end, remove, setup) a stray Enter must not lose work.
+    pub fn enter_says_yes(&self) -> bool {
+        matches!(self.purpose, ConfirmFor::MoveSession { .. })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -248,6 +306,13 @@ pub struct App {
     /// drawn).
     pub help_scroll: u16,
     pub help_max: u16,
+    /// The same for a question taller than the pane (set when drawn), and
+    /// the question it belongs to, so a new one starts at the top.
+    pub confirm_scroll: u16,
+    pub confirm_max: u16,
+    pub confirm_of: String,
+    /// The dialog the quit bar (Ctrl+C) was asked over, back on "stay".
+    quit_over: Option<Mode>,
     pub flash: Option<(String, Color, Instant)>,
     pub setup: setup::State,
     pub signin: Option<SignIn>,
@@ -256,15 +321,23 @@ pub struct App {
     pub opener: Opener,
     pub pane_list: PaneList,
     pub pane_closer: PaneCloser,
+    pub space_list: SpaceList,
+    pub space_closer: SpaceCloser,
+    pub store_update: StoreUpdate,
+    /// The list's own pane in Herdr (`HERDR_PANE_ID`).
+    pub own_pane: Option<String>,
     pub conversation_of: ConversationOf,
     pub mover: Mover,
     /// Whether the list runs inside Herdr (`herdr::inside`).
     pub in_herdr: bool,
-    /// A move that runs: its session's name, and where its result arrives.
-    pub moving: Option<String>,
-    move_rx: Option<Receiver<Result<String, String>>>,
-    /// A failed move's message, kept until no other dialog is open.
-    move_failed: Option<(String, String)>,
+    /// A move that runs, from the notes of moves (`relocate::Note`), also
+    /// one another list started.
+    pub moving: Option<MoveRun>,
+    /// Where the notes of moves are (`<config>/moving`).
+    pub moves_dir: PathBuf,
+    next_moves: Instant,
+    /// This list, in the notes of the moves it starts (its process id).
+    pub me: u32,
     pub cwd: Option<String>,
     pub read_at: Instant,
     next_files: Instant,
@@ -282,6 +355,7 @@ impl App {
         let store = Store::load();
         let twins = crate::login::twins(&store, &crate::login::all(&store));
         let usage = launch::load_usage_with(&store, &twins);
+        let moves_dir = dir.join(relocate::MOVING);
         App {
             config,
             dir,
@@ -302,6 +376,10 @@ impl App {
             mode: Mode::Normal,
             help_scroll: 0,
             help_max: 0,
+            confirm_scroll: 0,
+            confirm_max: 0,
+            confirm_of: String::new(),
+            quit_over: None,
             flash: None,
             setup: setup::state(),
             signin: None,
@@ -310,12 +388,17 @@ impl App {
             opener: open_in_browser,
             pane_list: herdr::panes,
             pane_closer: herdr::close_pane,
+            space_list: herdr::workspaces,
+            space_closer: herdr::close_workspace,
+            store_update: |change| Store::update(change),
+            own_pane: std::env::var("HERDR_PANE_ID").ok(),
             conversation_of: real_conversation,
             mover: relocate::perform,
             in_herdr: herdr::inside(),
             moving: None,
-            move_rx: None,
-            move_failed: None,
+            moves_dir,
+            next_moves: Instant::now(),
+            me: std::process::id(),
             cwd: std::env::current_dir()
                 .ok()
                 .map(|p| p.to_string_lossy().to_string()),
@@ -587,11 +670,256 @@ impl App {
             self.flash(format!("{label} had already ended"), crate::theme::MUTED);
         }
         self.panes = now;
+        self.after_close();
+    }
+
+    /// Whether a session is working or waiting for an answer: closing it
+    /// stops that.
+    fn busy(p: &Pane) -> bool {
+        matches!(p.status.as_deref(), Some("working") | Some("blocked"))
+    }
+
+    /// A space's name in the list: its label, else its number.
+    fn space_name(ws: &Workspace) -> String {
+        if ws.label.is_empty() {
+            format!("space {}", ws.number)
+        } else {
+            ws.label.clone()
+        }
+    }
+
+    /// The spaces closing `id` takes, by Herdr's own rule: the main checkout
+    /// of a repository takes every open space of that repository with it
+    /// (when there are any); every other space closes alone.
+    fn space_group(spaces: &[Workspace], id: &str) -> Vec<Workspace> {
+        let Some(ws) = spaces.iter().find(|w| w.id == id) else {
+            return vec![];
+        };
+        let group: Vec<Workspace> = match ws.worktree.as_ref().filter(|t| !t.linked) {
+            Some(main) => spaces
+                .iter()
+                .filter(|w| {
+                    w.worktree
+                        .as_ref()
+                        .is_some_and(|t| t.repo_key == main.repo_key)
+                })
+                .cloned()
+                .collect(),
+            None => vec![],
+        };
+        if group.len() >= 2 {
+            // The chosen space first, the others in Herdr's order.
+            let mut list = vec![ws.clone()];
+            list.extend(group.into_iter().filter(|w| w.id != id));
+            list
+        } else {
+            vec![ws.clone()]
+        }
+    }
+
+    /// Asks before closing the selected space (`d` in the Spaces tab).
+    fn ask_close_space(&mut self) {
+        let Some(ws) = self.workspaces.get(self.space_sel).cloned() else {
+            return;
+        };
+        let label = Self::space_name(&ws);
+        let spaces = Self::space_group(&self.workspaces, &ws.id);
+        let group = spaces.len() > 1;
+        let mut lines = vec![];
+        if group {
+            let others: Vec<String> = spaces[1..].iter().map(Self::space_name).collect();
+            lines.push(format!(
+                "It is the main checkout of its repository: the repository's other spaces {} close with it.",
+                others.join(", ")
+            ));
+        }
+        let sessions: Vec<&Pane> = spaces
+            .iter()
+            .flat_map(|w| self.sessions_in(&w.id))
+            .collect();
+        let place = if group { "in them" } else { "in it" };
+        lines.push(match sessions.len() {
+            0 => format!("No Claude Code session runs {place}."),
+            1 => format!("1 Claude Code session runs {place}."),
+            n => format!("{n} Claude Code sessions run {place}."),
+        });
+        let busy = sessions.iter().filter(|p| Self::busy(p)).count();
+        if busy > 0 {
+            lines.push(if sessions.len() == 1 {
+                "It is working or waiting for your answer: its current work stops.".into()
+            } else {
+                format!(
+                    "{busy} of them {} working or waiting for your answer: their current work stops.",
+                    if busy == 1 { "is" } else { "are" }
+                )
+            });
+        }
+        lines.push(
+            "Its tabs and everything running in them close; claude --resume finds the conversations again."
+                .into(),
+        );
+        if spaces
+            .iter()
+            .any(|w| w.worktree.as_ref().is_some_and(|t| t.linked))
+        {
+            lines.push("Worktree checkouts and their branches stay on disk.".into());
+        }
+        let own = self
+            .own_pane
+            .as_deref()
+            .and_then(|me| self.panes.iter().find(|p| p.id == me))
+            .is_some_and(|me| spaces.iter().any(|w| w.id == me.workspace));
+        if own {
+            lines.push(format!(
+                "This list runs in {}: it closes too.",
+                if group { "one of them" } else { "it" }
+            ));
+        }
+        let ids = sessions.iter().map(|p| p.id.clone()).collect();
+        self.mode = Mode::Confirm(Confirm {
+            question: format!("Close {label}?"),
+            lines,
+            purpose: ConfirmFor::CloseSpace {
+                spaces,
+                label,
+                sessions: ids,
+                warned: sessions
+                    .iter()
+                    .filter(|p| Self::busy(p))
+                    .map(|p| p.id.clone())
+                    .collect(),
+            },
+        });
+    }
+
+    /// Closes the spaces the question named, after checking with Herdr that
+    /// the space is still there, and that the close takes no space and no
+    /// session the question did not name, nor a busy session it did not
+    /// warn about.
+    fn close_space(
+        &mut self,
+        named: &[Workspace],
+        label: &str,
+        counted: &[String],
+        warned: &[String],
+    ) {
+        let Some(first) = named.first() else {
+            return;
+        };
+        if let Some(m) = self.running_move() {
+            self.flash(
+                format!("{} is being moved; nothing was closed", m.label),
+                crate::theme::MUTED,
+            );
+            return;
+        }
+        let Some(now) = (self.space_list)() else {
+            self.flash(
+                "Herdr could not be asked; nothing was closed",
+                crate::theme::RED,
+            );
+            return;
+        };
+        if !now.iter().any(|w| w.id == first.id) {
+            self.flash(format!("{label} had already closed"), crate::theme::MUTED);
+            self.workspaces = now;
+            self.after_close();
+            return;
+        }
+        let group = Self::space_group(&now, &first.id);
+        if let Some(new) = group.iter().find(|w| !named.iter().any(|n| n.id == w.id)) {
+            self.flash(
+                format!(
+                    "{} opened since; nothing was closed. Press d again",
+                    Self::space_name(new)
+                ),
+                crate::theme::YELLOW,
+            );
+            self.workspaces = now;
+            self.after_close();
+            return;
+        }
+        let Some(panes) = (self.pane_list)() else {
+            self.flash(
+                "Herdr could not be asked; nothing was closed",
+                crate::theme::RED,
+            );
+            return;
+        };
+        let changed = panes
+            .iter()
+            .filter(|p| group.iter().any(|w| w.id == p.workspace) && self.is_session(p))
+            .any(|p| !counted.contains(&p.id) || (Self::busy(p) && !warned.contains(&p.id)));
+        if changed {
+            self.flash(
+                format!("{label} changed since the question; nothing was closed. Press d again"),
+                crate::theme::YELLOW,
+            );
+            self.workspaces = now;
+            self.panes = panes;
+            self.after_close();
+            return;
+        }
+        // The account choices go first: when the list runs in one of these
+        // spaces, Herdr ends it with the close. Read from the stored file
+        // itself, which another list may have changed since.
+        let spaces: Vec<(String, String)> = group
+            .iter()
+            .map(|w| (w.id.clone(), w.label.clone()))
+            .collect();
+        let mut forgot: Vec<(String, String, String)> = vec![];
+        if !self.update(|s| {
+            for (id, name) in &spaces {
+                if let Some(account) = s.space_account(id).map(str::to_string) {
+                    s.assign(id, name, None);
+                    forgot.push((id.clone(), name.clone(), account));
+                }
+            }
+        }) {
+            return;
+        }
+        if !(self.space_closer)(&first.id, group.len() > 1) {
+            // Back only for the spaces still open (Herdr may have closed
+            // part of them before it failed).
+            let open = (self.space_list)();
+            forgot.retain(|(id, _, _)| open.as_ref().is_none_or(|l| l.iter().any(|w| &w.id == id)));
+            let back = forgot.is_empty()
+                || self.update(|s| {
+                    for (id, name, account) in &forgot {
+                        // A choice made meanwhile (another list) wins.
+                        if s.space_account(id).is_some() {
+                            continue;
+                        }
+                        s.assign(id, name, Some(account));
+                    }
+                });
+            self.flash(
+                if back {
+                    format!("Herdr could not close {label}")
+                } else {
+                    format!("Herdr could not close {label}, and its account choice is lost: choose it again with ⏎")
+                },
+                crate::theme::RED,
+            );
+            return;
+        }
+        self.panes = panes;
+        let gone: Vec<&str> = group.iter().map(|w| w.id.as_str()).collect();
+        self.workspaces = now;
+        self.workspaces.retain(|w| !gone.contains(&w.id.as_str()));
+        self.panes.retain(|p| !gone.contains(&p.workspace.as_str()));
+        self.flash(format!("Closed {label}"), crate::theme::ACCENT);
+        self.after_close();
+    }
+
+    /// Keeps the selections on rows that exist, and reads Herdr again a
+    /// moment after it is done closing (a read started before would bring
+    /// the rows back).
+    fn after_close(&mut self) {
+        self.space_sel = self.space_sel.min(self.workspaces.len().saturating_sub(1));
         self.session_sel = self
             .session_sel
             .min(self.sessions().len().saturating_sub(1));
-        // A read started before the close would bring the row back; the
-        // next one (spaces too) runs a moment after Herdr is done closing.
         self.herdr_rx = None;
         self.next_herdr = Instant::now() + Duration::from_secs(1);
     }
@@ -655,9 +983,9 @@ impl App {
             self.flash("Only inside Herdr", crate::theme::MUTED);
             return;
         }
-        if let Some(label) = &self.moving {
+        if let Some(m) = &self.moving {
             self.flash(
-                format!("{label} is being moved; wait a moment"),
+                format!("{} is being moved; wait a moment", m.label),
                 crate::theme::MUTED,
             );
             return;
@@ -671,7 +999,7 @@ impl App {
             return;
         }
         let from = self.session_account_id(&p);
-        let Some((session_id, pid)) = (self.conversation_of)(&p.id) else {
+        let Some(held) = (self.conversation_of)(&p.id) else {
             self.mode = Mode::Message {
                 title: format!("Which conversation {label} holds is not known"),
                 lines: vec![
@@ -733,9 +1061,10 @@ impl App {
             purpose: PickFor::MoveSession(Moving {
                 pane: p.id,
                 label,
-                session_id,
-                pid,
+                session_id: held.session_id,
+                pid: held.pid,
                 from,
+                carry: held.carry,
             }),
         });
     }
@@ -784,6 +1113,7 @@ impl App {
         lines.push(
             "It restarts there and its conversation carries on; unsent text in it is lost.".into(),
         );
+        lines.extend(session.carry.lines());
         // The conversation's cache stays with the old login.
         let api_key = self
             .store
@@ -804,32 +1134,52 @@ impl App {
         });
     }
 
+    /// The user answered yes and waits for an outcome: a refusal gets the
+    /// dialog a failed move gets, not a note in the footer.
+    fn move_refused(&mut self, label: &str, why: String) {
+        self.mode = Mode::Message {
+            title: format!("{label} was not moved"),
+            lines: vec![why],
+            good: false,
+        };
+    }
+
     /// Starts the move after checking with Herdr once more that the session
     /// is still there, idle, and holds the same conversation.
     fn move_session(&mut self, s: Moving, to: &str) {
+        let label = s.label.clone();
         let Some(now) = (self.pane_list)() else {
-            self.flash(
-                "Herdr could not be asked; nothing was moved",
-                crate::theme::RED,
+            self.move_refused(
+                &label,
+                format!(
+                    "Herdr could not be asked whether {label} is still there and waits for you. Try again in a moment."
+                ),
             );
             return;
         };
-        let label = s.label.clone();
         let Some(p) = now.iter().find(|p| p.id == s.pane && self.is_session(p)) else {
-            self.flash(
-                format!("{label} has ended; nothing was moved"),
-                crate::theme::MUTED,
-            );
+            self.move_refused(&label, format!("{label} has ended."));
             return;
         };
         if let Some(why) = Self::not_idle(&label, p.status.as_deref()) {
-            self.flash(format!("{why}; nothing was moved"), crate::theme::YELLOW);
+            self.move_refused(&label, format!("{why}."));
             return;
         }
-        if (self.conversation_of)(&s.pane) != Some((s.session_id.clone(), s.pid)) {
-            self.flash(
-                format!("{label} holds another conversation now; nothing was moved"),
-                crate::theme::YELLOW,
+        let Some(held) = (self.conversation_of)(&s.pane)
+            .filter(|h| h.session_id == s.session_id && h.pid == s.pid)
+        else {
+            self.move_refused(
+                &label,
+                format!("{label} holds another conversation now. Press m again to move that one."),
+            );
+            return;
+        };
+        // The question named the model; a /model since then would move it
+        // on another. A model noted only since is the one it runs on.
+        if s.carry.model.is_some() && held.carry.model != s.carry.model {
+            self.move_refused(
+                &label,
+                format!("{label}'s model changed since the question. Press m again to move it on the new one."),
             );
             return;
         }
@@ -840,54 +1190,87 @@ impl App {
             pid: s.pid,
             account_id: to.to_string(),
             account_name: self.store.name_of(to),
+            carry: held.carry,
         };
-        let (tx, rx) = channel();
-        let mover = self.mover;
-        std::thread::spawn(move || {
-            let _ = tx.send(mover(plan));
-        });
-        self.move_rx = Some(rx);
-        self.flash(
-            format!("Moving {label} to {}…", self.store.name_of(to)),
-            crate::theme::ACCENT,
-        );
-        self.moving = Some(label);
+        // Another list may have started a move since this one last looked.
+        if let Some(m) = self.running_move() {
+            self.move_refused(
+                &label,
+                format!(
+                    "{} is being moved; one move runs at a time. Try again once it is done.",
+                    m.label
+                ),
+            );
+            return;
+        }
+        let run = MoveRun::of(&plan);
+        if let Err(e) = (self.mover)(&self.moves_dir, self.me, plan) {
+            self.move_refused(&label, e);
+            return;
+        }
+        // The footer shows it until the result arrives (`ui::draw_footer`).
+        self.moving = Some(run);
+        self.next_moves = Instant::now();
     }
 
-    /// Takes the result of a move once it is done.
+    /// The move that runs now, from its note.
+    fn running_move(&self) -> Option<MoveRun> {
+        let now = crate::time::now();
+        relocate::notes(&self.moves_dir)
+            .iter()
+            .find(|n| relocate::state(n, now, &crate::sessions::alive) == relocate::State::Running)
+            .map(|n| MoveRun::of(&n.plan))
+    }
+
+    /// Reads the notes of moves (every half second): which one runs, and
+    /// the results this list tells (`relocate::tells`). A result is taken
+    /// only while no other dialog is open, so it is never held by a list
+    /// that may close before showing it; the move process tells it
+    /// otherwise.
     pub fn receive_move(&mut self) {
-        if self.mode == Mode::Normal {
-            if let Some((title, line)) = self.move_failed.take() {
-                self.mode = Mode::Message {
-                    title,
-                    lines: vec![line],
-                    good: false,
-                };
-            }
-        }
-        let Some(rx) = &self.move_rx else {
+        if Instant::now() < self.next_moves {
             return;
-        };
-        let result = match rx.try_recv() {
-            Ok(r) => r,
-            Err(std::sync::mpsc::TryRecvError::Empty) => return,
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                Err("The move stopped unexpectedly; look at the pane.".into())
-            }
-        };
-        self.move_rx = None;
-        let label = self.moving.take().unwrap_or_default();
-        match result {
-            Ok(msg) => self.flash(msg, crate::theme::GREEN),
-            Err(e) => {
-                // Shown now, or once the dialog the user is in has closed.
-                self.move_failed = Some((format!("{label} was not moved"), e));
-                self.receive_move();
-            }
         }
-        // The pane's new label and note show on the next read.
-        self.herdr_rx = None;
-        self.next_herdr = Instant::now() + Duration::from_secs(1);
+        self.next_moves = Instant::now() + Duration::from_millis(500);
+        let dir = self.moves_dir.clone();
+        let now = crate::time::now();
+        let alive = crate::sessions::alive;
+        let mut running = None;
+        let mut finished = false;
+        for note in relocate::notes(&dir) {
+            let p = &note.plan;
+            let state = relocate::state(&note, now, &alive);
+            if state == relocate::State::Running {
+                running.get_or_insert_with(|| MoveRun::of(p));
+                continue;
+            }
+            if self.mode != Mode::Normal
+                || !relocate::tells(&note, &state, self.me, &alive)
+                || !relocate::take(&dir, &p.pane)
+            {
+                continue;
+            }
+            finished = true;
+            let (title, line) = match state {
+                relocate::State::Done(Ok(msg)) => {
+                    self.flash(msg, crate::theme::GREEN);
+                    continue;
+                }
+                relocate::State::Done(Err(e)) => (format!("{} was not moved", p.label), e),
+                _ => relocate::stopped_text(p),
+            };
+            self.mode = Mode::Message {
+                title,
+                lines: vec![line],
+                good: false,
+            };
+        }
+        self.moving = running;
+        if finished {
+            // The pane's new label and note show on the next read.
+            self.herdr_rx = None;
+            self.next_herdr = Instant::now() + Duration::from_secs(1);
+        }
     }
 
     pub fn refresh_all(&mut self) {
@@ -907,7 +1290,7 @@ impl App {
     /// result. False when it could not be saved.
     fn update(&mut self, change: impl FnOnce(&mut Store)) -> bool {
         let keep = self.selected().map(|a| a.id.clone());
-        match Store::update(change) {
+        match (self.store_update)(Box::new(change)) {
             Ok(store) => {
                 self.store = store;
                 if let Some(id) = keep {
@@ -954,9 +1337,16 @@ impl App {
     /// for a moment (to check logins and limits), which Herdr may take for
     /// a session: its own panes never count.
     pub fn is_session(&self, p: &Pane) -> bool {
-        let ours =
-            p.label == "Multiaccount" || std::env::var("HERDR_PANE_ID").is_ok_and(|me| me == p.id);
+        let ours = p.label == "Multiaccount" || self.own_pane.as_deref() == Some(p.id.as_str());
         !ours && (p.agent.as_deref() == Some("claude") || p.account_id.is_some())
+    }
+
+    /// The Claude Code sessions in a space, as the Spaces tab counts them.
+    pub fn sessions_in(&self, ws: &str) -> Vec<&Pane> {
+        self.panes
+            .iter()
+            .filter(|p| p.workspace == ws && self.is_session(p))
+            .collect()
     }
 
     /// Live Claude Code sessions per account, from the pane labels.
@@ -1620,12 +2010,23 @@ impl App {
         });
     }
 
+    /// Says that a move the user turned back did not run.
+    fn not_moved(&mut self, label: &str) {
+        self.flash(format!("{label} was not moved"), crate::theme::MUTED);
+    }
+
     fn confirmed(&mut self, c: Confirm) {
         self.mode = Mode::Normal;
         match c.purpose {
             ConfirmFor::Remove(id) => self.remove(&id),
             ConfirmFor::EndSession { pane, label } => self.end_session(&pane, &label),
             ConfirmFor::MoveSession { session, to } => self.move_session(session, &to),
+            ConfirmFor::CloseSpace {
+                spaces,
+                label,
+                sessions,
+                warned,
+            } => self.close_space(&spaces, &label, &sessions, &warned),
             ConfirmFor::Setup => {
                 match setup::apply() {
                     Ok(msg) => self.flash(msg, crate::theme::GREEN),
@@ -1698,22 +2099,21 @@ impl App {
         }
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         if ctrl && k.code == KeyCode::Char('c') {
+            if self.mode != Mode::AskQuit {
+                self.quit_over = (self.mode != Mode::Normal).then(|| self.mode.clone());
+            }
             self.mode = Mode::AskQuit;
             return;
         }
         match self.mode.clone() {
             Mode::AskQuit => {
-                self.mode = Mode::Normal;
+                // Staying goes back to the dialog it was asked over, so a
+                // question or a move's account list never vanishes unsaid.
+                self.mode = self.quit_over.take().unwrap_or(Mode::Normal);
+                // A move goes on in its own process (the owner's decision
+                // on #12).
                 if k.code == KeyCode::Char('y') {
-                    // Quitting halfway would leave the session ended.
-                    if let Some(label) = self.moving.clone() {
-                        self.flash(
-                            format!("{label} is being moved; quit once it is done"),
-                            crate::theme::YELLOW,
-                        );
-                    } else {
-                        self.quit = true;
-                    }
+                    self.quit = true;
                 }
             }
             Mode::Help => match k.code {
@@ -1728,12 +2128,41 @@ impl App {
                 KeyCode::End | KeyCode::Char('G') => self.help_scroll = self.help_max,
                 _ => {}
             },
+            // `y` answers yes, `n` and Esc no; Enter is yes only on the
+            // move question, which follows the Enter that picked the
+            // account (the owner's decision on #10). Any other key leaves
+            // the question open: a stray key never answers.
+            // Ctrl+Y, Alt+N and the like are other keys too.
+            Mode::Confirm(_)
+                if k.modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => {}
             Mode::Confirm(c) => match k.code {
-                KeyCode::Char('y') => self.confirmed(c),
-                _ => self.mode = Mode::Normal,
+                KeyCode::Up | KeyCode::Char('k') => self.scroll_confirm(-1, c),
+                KeyCode::Down | KeyCode::Char('j') => self.scroll_confirm(1, c),
+                KeyCode::Char('y') => {
+                    self.confirm_of.clear();
+                    self.confirmed(c)
+                }
+                KeyCode::Enter if c.enter_says_yes() => {
+                    self.confirm_of.clear();
+                    self.confirmed(c)
+                }
+                KeyCode::Char('n') | KeyCode::Esc => {
+                    self.confirm_of.clear();
+                    self.mode = Mode::Normal;
+                    if let ConfirmFor::MoveSession { session, .. } = &c.purpose {
+                        self.not_moved(&session.label);
+                    }
+                }
+                _ => {}
             },
             Mode::Pick(mut p) => match k.code {
-                KeyCode::Esc | KeyCode::Char('q') => self.mode = Mode::Normal,
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    self.mode = Mode::Normal;
+                    if let PickFor::MoveSession(session) = &p.purpose {
+                        self.not_moved(&session.label);
+                    }
+                }
                 KeyCode::Up | KeyCode::Char('k') => {
                     p.sel = p.sel.saturating_sub(1);
                     self.mode = Mode::Pick(p);
@@ -1822,7 +2251,10 @@ impl App {
     fn normal_key(&mut self, k: KeyEvent) {
         let shift = k.modifiers.contains(KeyModifiers::SHIFT);
         match k.code {
-            KeyCode::Char('q') => self.mode = Mode::AskQuit,
+            KeyCode::Char('q') => {
+                self.quit_over = None;
+                self.mode = Mode::AskQuit
+            }
             KeyCode::Esc => {}
             KeyCode::Char('?') => {
                 self.help_scroll = 0;
@@ -1873,9 +2305,9 @@ impl App {
             },
             _ if self.section == Section::Sessions => match k.code {
                 KeyCode::Char('d') | KeyCode::Delete => {
-                    if let Some(label) = self.moving.clone() {
+                    if let Some(m) = self.moving.clone() {
                         self.flash(
-                            format!("{label} is being moved; wait a moment"),
+                            format!("{} is being moved; wait a moment", m.label),
                             crate::theme::MUTED,
                         );
                     } else {
@@ -1886,6 +2318,18 @@ impl App {
                 _ => {}
             },
             _ if self.section == Section::Spaces => match k.code {
+                // `d` only: Delete keeps "back to the active account" (the
+                // owner's decision on #11).
+                KeyCode::Char('d') => {
+                    if let Some(m) = self.moving.clone() {
+                        self.flash(
+                            format!("{} is being moved; wait a moment", m.label),
+                            crate::theme::MUTED,
+                        );
+                    } else {
+                        self.ask_close_space();
+                    }
+                }
                 KeyCode::Char('x') | KeyCode::Backspace | KeyCode::Delete => {
                     if let Some(ws) = self.workspaces.get(self.space_sel).cloned() {
                         if !self.update(|s| s.assign(&ws.id, &ws.label, None)) {
@@ -1989,6 +2433,18 @@ impl App {
                 MouseEventKind::Down(MouseButton::Left) => self.click(m.column, m.row),
                 MouseEventKind::ScrollDown if self.mode == Mode::Help => self.scroll_help(2),
                 MouseEventKind::ScrollUp if self.mode == Mode::Help => self.scroll_help(-2),
+                MouseEventKind::ScrollDown | MouseEventKind::ScrollUp
+                    if matches!(self.mode, Mode::Confirm(_)) =>
+                {
+                    if let Mode::Confirm(c) = self.mode.clone() {
+                        let by = if m.kind == MouseEventKind::ScrollDown {
+                            1
+                        } else {
+                            -1
+                        };
+                        self.scroll_confirm(by, c);
+                    }
+                }
                 MouseEventKind::ScrollDown => {
                     if let Mode::Pick(mut p) = self.mode.clone() {
                         p.sel = (p.sel + 1).min(p.items.len().saturating_sub(1));
@@ -2009,6 +2465,13 @@ impl App {
             },
             _ => {}
         }
+    }
+
+    /// Scrolls a question taller than the pane; it stays open.
+    fn scroll_confirm(&mut self, by: i32, c: Confirm) {
+        self.confirm_scroll =
+            (self.confirm_scroll as i32 + by).clamp(0, self.confirm_max as i32) as u16;
+        self.mode = Mode::Confirm(c);
     }
 
     fn scroll_help(&mut self, by: i32) {
@@ -2068,10 +2531,30 @@ impl App {
 
 /// The conversation the status line noted for a pane, while its Claude
 /// Code still runs in front there: its session id and process.
-pub fn real_conversation(pane: &str) -> Option<(String, u32)> {
+pub fn real_conversation(pane: &str) -> Option<Held> {
     let note = crate::sessions::conversation(pane)?;
     let pid = crate::sessions::front_process(&note, &herdr::process_info(pane)?)?;
-    Some((note.session_id, pid))
+    Some(held_from(note, pid, crate::sessions::get(pane)))
+}
+
+/// What a move carries: the model from the status line's note, the start
+/// options from the launcher's note, which counts only for the same Claude
+/// Code process (the launcher execs, so the pid stays).
+fn held_from(
+    note: crate::sessions::Conversation,
+    pid: u32,
+    launcher: Option<crate::sessions::Entry>,
+) -> Held {
+    let launcher = launcher.filter(|e| e.pid == pid);
+    Held {
+        session_id: note.session_id,
+        pid,
+        carry: Moved {
+            options: launcher.as_ref().and_then(|e| e.options.clone()),
+            dropped: launcher.map(|e| e.dropped).unwrap_or_default(),
+            model: note.model,
+        },
+    }
 }
 
 /// Starts `opener` (`open`, `xdg-open`) on `url`. It is waited on in the
@@ -2168,8 +2651,56 @@ mod tests {
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
+    /// A folder of its own for each test's notes of moves.
+    fn moves_dir() -> PathBuf {
+        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let d = std::env::temp_dir().join(format!("hm-moving-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        d
+    }
+
+    thread_local! {
+        /// What the test `accounts.json` holds, per test thread.
+        static STORED: std::cell::RefCell<Store> = std::cell::RefCell::new(Store::default());
+    }
+
+    /// `Store::update` on the test's own store, never the real file.
+    fn stores(change: Box<dyn FnOnce(&mut Store) + '_>) -> std::io::Result<Store> {
+        STORED.with(|s| {
+            let mut s = s.borrow_mut();
+            change(&mut s);
+            Ok(s.clone())
+        })
+    }
+
+    fn cannot_store(_: Box<dyn FnOnce(&mut Store) + '_>) -> std::io::Result<Store> {
+        Err(std::io::Error::other("disk full"))
+    }
+
+    thread_local! {
+        static STORE_BROKEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// `stores`, until a test breaks the disk.
+    fn stores_until_broken(change: Box<dyn FnOnce(&mut Store) + '_>) -> std::io::Result<Store> {
+        if STORE_BROKEN.with(|b| b.get()) {
+            cannot_store(change)
+        } else {
+            stores(change)
+        }
+    }
+
+    fn stored() -> Store {
+        STORED.with(|s| s.borrow().clone())
+    }
+
     fn app() -> App {
         let mut a = App::new(Config::default(), std::env::temp_dir());
+        a.moves_dir = moves_dir();
+        a.own_pane = None;
+        a.store_update = stores;
+        a.space_closer = |_, _| panic!("a test closed a space without a fake closer");
         a.store = Store::default();
         a.store.accounts.push(Account {
             id: "personal".into(),
@@ -2185,7 +2716,9 @@ mod tests {
             label: "acme-app".into(),
             number: 1,
             focused: true,
+            worktree: None,
         }];
+        STORED.with(|s| *s.borrow_mut() = a.store.clone());
         a
     }
 
@@ -2818,12 +3351,7 @@ mod tests {
 
     #[test]
     fn any_other_answer_keeps_the_session() {
-        for key in [
-            KeyCode::Char('n'),
-            KeyCode::Esc,
-            KeyCode::Char('x'),
-            KeyCode::Enter,
-        ] {
+        for key in [KeyCode::Char('n'), KeyCode::Esc] {
             let mut a = agents();
             let before = a.panes.clone();
             press(&mut a, KeyCode::Char('d'));
@@ -2832,6 +3360,58 @@ mod tests {
             assert!(closed().is_empty(), "{key:?}");
             assert_eq!(a.panes, before, "{key:?}");
         }
+    }
+
+    #[test]
+    fn enter_and_other_keys_leave_the_other_questions_open() {
+        let end = || {
+            let mut a = agents();
+            press(&mut a, KeyCode::Char('d'));
+            a
+        };
+        let remove = || {
+            let mut a = agents();
+            a.section = Section::Accounts;
+            a.sel = 1;
+            press(&mut a, KeyCode::Char('d'));
+            a
+        };
+        // Never answered here: yes would change the real setup.
+        let setup = || {
+            let mut a = agents();
+            a.mode = Mode::Confirm(Confirm {
+                question: "Set up the accounts?".into(),
+                lines: vec!["Adds the claude function.".into()],
+                purpose: ConfirmFor::Setup,
+            });
+            a
+        };
+        let close = || {
+            let mut a = spaces();
+            press(&mut a, KeyCode::Char('d'));
+            a
+        };
+        let asks: [fn() -> App; 4] = [end, remove, setup, close];
+        for ask in asks {
+            for key in [KeyCode::Enter, KeyCode::Char('x'), KeyCode::Char(' ')] {
+                let mut a = ask();
+                let before = confirm(&a);
+                press(&mut a, key);
+                assert_eq!(confirm(&a), before, "{}: {key:?}", before.question);
+                assert!(closed().is_empty());
+                assert!(spaces_closed().is_empty());
+            }
+            let mut a = ask();
+            press(&mut a, KeyCode::Esc);
+            assert_eq!(a.mode, Mode::Normal);
+            assert_eq!(flash_text(&a), "", "only a move says it did not run");
+        }
+        // Their buttons name y and Esc n, not Enter.
+        let mut a = end();
+        let screen = screen_of(&mut a, 100, 30).join("\n");
+        assert!(screen.contains(" y yes "), "{screen}");
+        assert!(screen.contains(" Esc n no "), "{screen}");
+        assert!(!screen.contains("⏎ y yes"), "{screen}");
     }
 
     #[test]
@@ -2956,32 +3536,758 @@ mod tests {
         }
     }
 
+    // ---- closing a space (d in Spaces) --------------------------------
+
+    thread_local! {
+        /// The spaces the test closer was asked to close (with `--group` or
+        /// not), and what the test space list hands back.
+        static SPACES_CLOSED: std::cell::RefCell<Vec<(String, bool)>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+        static FRESH_SPACES: std::cell::RefCell<Option<Vec<Workspace>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    fn closes_space(ws: &str, group: bool) -> bool {
+        SPACES_CLOSED.with(|c| c.borrow_mut().push((ws.into(), group)));
+        true
+    }
+
+    fn cannot_close_space(ws: &str, group: bool) -> bool {
+        closes_space(ws, group);
+        false
+    }
+
+    fn spaces_closed() -> Vec<(String, bool)> {
+        SPACES_CLOSED.with(|c| c.borrow_mut().drain(..).collect())
+    }
+
+    fn fresh_spaces() -> Option<Vec<Workspace>> {
+        FRESH_SPACES.with(|f| f.borrow().clone())
+    }
+
+    fn set_fresh_spaces(list: Option<Vec<Workspace>>) {
+        FRESH_SPACES.with(|f| *f.borrow_mut() = list);
+    }
+
+    fn space(id: &str, number: u64, label: &str, tree: Option<(&str, bool)>) -> Workspace {
+        Workspace {
+            id: id.into(),
+            label: label.into(),
+            number,
+            focused: false,
+            worktree: tree.map(|(key, linked)| herdr::Worktree {
+                repo_key: key.into(),
+                linked,
+            }),
+        }
+    }
+
+    fn in_space(ws: &str, p: Pane) -> Pane {
+        Pane {
+            workspace: ws.into(),
+            ..p
+        }
+    }
+
+    /// The Spaces tab: acme-app (main checkout, one idle session and a
+    /// shell), its worktree space fix-login (one session), and notes (no
+    /// session, on Work). Herdr reports the same.
+    fn spaces() -> App {
+        let mut a = app();
+        a.store.accounts.push(Account {
+            id: "work".into(),
+            name: "Work".into(),
+            kind: Kind::Subscription,
+            sso: false,
+            fallback: true,
+        });
+        a.store.assign("w3", "notes", Some("work"));
+        a.store.assign("w2", "fix-login", Some("personal"));
+        STORED.with(|s| *s.borrow_mut() = a.store.clone());
+        a.workspaces = vec![
+            space("w1", 1, "acme-app", Some(("/src/acme/.git", false))),
+            space("w2", 2, "fix-login", Some(("/src/acme/.git", true))),
+            space("w3", 3, "notes", None),
+        ];
+        a.panes = vec![
+            in_space(
+                "w1",
+                pane(
+                    "w1:p1",
+                    "w1:t1",
+                    "Fix the login bug",
+                    Some("idle"),
+                    Some("personal"),
+                ),
+            ),
+            in_space("w1", shell("w1:p2", "w1:t1")),
+            in_space(
+                "w2",
+                pane(
+                    "w2:p1",
+                    "w2:t1",
+                    "Write the docs",
+                    Some("idle"),
+                    Some("personal"),
+                ),
+            ),
+            in_space("w3", shell("w3:p1", "w3:t1")),
+        ];
+        a.space_list = fresh_spaces;
+        a.space_closer = closes_space;
+        a.pane_list = fresh;
+        set_fresh_spaces(Some(a.workspaces.clone()));
+        set_fresh(Some(a.panes.clone()));
+        spaces_closed();
+        a.section = Section::Spaces;
+        a
+    }
+
+    fn ids(list: &[Workspace]) -> Vec<String> {
+        list.iter().map(|w| w.id.clone()).collect()
+    }
+
+    #[test]
+    fn d_asks_before_closing_a_space_and_names_its_sessions() {
+        let mut a = spaces();
+        a.space_sel = 1;
+        press(&mut a, KeyCode::Char('d'));
+        let c = confirm(&a);
+        assert_eq!(c.question, "Close fix-login?");
+        let text = c.lines.join(" ");
+        assert!(text.contains("1 Claude Code session runs in it."), "{text}");
+        assert!(
+            text.contains("tabs and everything running in them close"),
+            "{text}"
+        );
+        assert!(text.contains("claude --resume"), "{text}");
+        assert!(!text.contains("current work stops"), "idle: {text}");
+        assert!(!text.contains("closes too"), "{text}");
+        assert!(spaces_closed().is_empty(), "nothing closed yet");
+        assert_eq!(a.workspaces.len(), 3);
+    }
+
+    #[test]
+    fn a_space_without_sessions_says_so_and_a_nameless_one_has_its_number() {
+        let mut a = spaces();
+        a.space_sel = 2;
+        press(&mut a, KeyCode::Char('d'));
+        let text = confirm(&a).lines.join(" ");
+        assert!(
+            text.contains("No Claude Code session runs in it."),
+            "{text}"
+        );
+        assert!(!text.contains("stay on disk"), "no worktree: {text}");
+        let mut a = spaces();
+        a.workspaces[2].label.clear();
+        a.space_sel = 2;
+        press(&mut a, KeyCode::Char('d'));
+        assert_eq!(confirm(&a).question, "Close space 3?");
+    }
+
+    #[test]
+    fn busy_sessions_are_warned_about() {
+        for status in ["working", "blocked"] {
+            let mut a = spaces();
+            a.space_sel = 1;
+            a.panes[2].status = Some(status.into());
+            press(&mut a, KeyCode::Char('d'));
+            let text = confirm(&a).lines.join(" ");
+            assert!(text.contains("its current work stops"), "{status}: {text}");
+        }
+        // Several sessions, one of them busy.
+        let mut a = spaces();
+        a.panes[0].status = Some("working".into());
+        press(&mut a, KeyCode::Char('d'));
+        let text = confirm(&a).lines.join(" ");
+        assert!(
+            text.contains("2 Claude Code sessions run in them."),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "1 of them is working or waiting for your answer: their current work stops."
+            ),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn yes_closes_the_space_and_its_rows_go() {
+        let mut a = spaces();
+        a.space_sel = 2;
+        a.section = Section::Sessions;
+        a.session_sel = 1;
+        a.section = Section::Spaces;
+        press(&mut a, KeyCode::Char('d'));
+        press(&mut a, KeyCode::Char('y'));
+        assert_eq!(spaces_closed(), vec![("w3".to_string(), false)]);
+        assert_eq!(a.mode, Mode::Normal);
+        assert_eq!(ids(&a.workspaces), vec!["w1", "w2"], "the row is gone");
+        assert_eq!(a.space_sel, 1, "the selection moves to the row above");
+        assert!(a.panes.iter().all(|p| p.workspace != "w3"));
+        assert_eq!(flash_text(&a), "Closed notes");
+        let rows = screen_of(&mut a, 100, 30);
+        assert!(rows[0].contains("Spaces (2)"), "{}", rows[0]);
+
+        // Its sessions leave the Agents tab too.
+        let mut a = spaces();
+        a.space_sel = 1;
+        press(&mut a, KeyCode::Char('d'));
+        press(&mut a, KeyCode::Char('y'));
+        assert_eq!(spaces_closed(), vec![("w2".to_string(), false)]);
+        let left: Vec<String> = a.sessions().into_iter().map(|p| p.id).collect();
+        assert_eq!(left, vec!["w1:p1".to_string()]);
+        assert_eq!(a.space_sel, 1, "the next space moves up");
+        assert_eq!(a.running("personal"), 1);
+    }
+
+    #[test]
+    fn closing_the_only_space_leaves_the_empty_tab() {
+        let mut a = spaces();
+        a.workspaces.truncate(1);
+        a.workspaces[0].worktree = None;
+        set_fresh_spaces(Some(a.workspaces.clone()));
+        press(&mut a, KeyCode::Char('d'));
+        press(&mut a, KeyCode::Char('y'));
+        assert_eq!(spaces_closed(), vec![("w1".to_string(), false)]);
+        assert!(a.workspaces.is_empty());
+        assert_eq!(a.space_sel, 0);
+        let rows = screen_of(&mut a, 100, 30).join("\n");
+        assert!(rows.contains("Spaces (0)"), "{rows}");
+        press(&mut a, KeyCode::Char('d'));
+        assert_eq!(a.mode, Mode::Normal, "nothing to ask about");
+    }
+
+    #[test]
+    fn no_and_esc_keep_the_space() {
+        for key in [KeyCode::Char('n'), KeyCode::Esc] {
+            let mut a = spaces();
+            let before = (a.workspaces.clone(), a.panes.clone());
+            press(&mut a, KeyCode::Char('d'));
+            press(&mut a, key);
+            assert_eq!(a.mode, Mode::Normal, "{key:?}");
+            assert!(spaces_closed().is_empty(), "{key:?}");
+            assert_eq!((a.workspaces.clone(), a.panes.clone()), before);
+            assert_eq!(stored(), a.store, "{key:?}: account choices kept");
+        }
+    }
+
+    #[test]
+    fn a_worktree_space_closes_alone_and_its_checkout_stays() {
+        let mut a = spaces();
+        a.space_sel = 1;
+        press(&mut a, KeyCode::Char('d'));
+        let text = confirm(&a).lines.join(" ");
+        assert!(
+            text.contains("Worktree checkouts and their branches stay on disk."),
+            "{text}"
+        );
+        assert!(!text.contains("main checkout"), "{text}");
+        press(&mut a, KeyCode::Char('y'));
+        assert_eq!(spaces_closed(), vec![("w2".to_string(), false)]);
+        assert_eq!(ids(&a.workspaces), vec!["w1", "w3"]);
+    }
+
+    #[test]
+    fn a_main_checkout_names_its_worktree_spaces_and_closes_them_together() {
+        let mut a = spaces();
+        a.workspaces
+            .push(space("w4", 4, "docs-site", Some(("/src/acme/.git", true))));
+        a.workspaces.push(space(
+            "w5",
+            5,
+            "other-repo",
+            Some(("/src/other/.git", false)),
+        ));
+        a.panes.push(in_space(
+            "w4",
+            pane("w4:p1", "w4:t1", "Docs", Some("working"), None),
+        ));
+        set_fresh_spaces(Some(a.workspaces.clone()));
+        set_fresh(Some(a.panes.clone()));
+        press(&mut a, KeyCode::Char('d'));
+        let c = confirm(&a);
+        assert_eq!(c.question, "Close acme-app?");
+        let text = c.lines.join(" ");
+        assert!(
+            text.contains("main checkout of its repository: the repository's other spaces fix-login, docs-site close with it."),
+            "{text}"
+        );
+        assert!(!text.contains("other-repo"), "{text}");
+        assert!(
+            text.contains("3 Claude Code sessions run in them."),
+            "{text}"
+        );
+        assert!(text.contains("1 of them is working"), "{text}");
+        assert!(text.contains("stay on disk"), "{text}");
+        press(&mut a, KeyCode::Char('y'));
+        assert_eq!(spaces_closed(), vec![("w1".to_string(), true)], "--group");
+        assert_eq!(ids(&a.workspaces), vec!["w3", "w5"]);
+        assert!(a.sessions().is_empty());
+        assert_eq!(
+            stored().space_account("w2"),
+            None,
+            "fix-login's choice goes"
+        );
+        assert_eq!(
+            stored().space_account("w3"),
+            Some("work"),
+            "notes keeps its"
+        );
+    }
+
+    #[test]
+    fn a_main_checkout_without_open_worktree_spaces_closes_alone() {
+        let mut a = spaces();
+        a.workspaces.remove(1);
+        set_fresh_spaces(Some(a.workspaces.clone()));
+        press(&mut a, KeyCode::Char('d'));
+        let text = confirm(&a).lines.join(" ");
+        assert!(!text.contains("other spaces"), "{text}");
+        assert!(text.contains("1 Claude Code session runs in it."), "{text}");
+        press(&mut a, KeyCode::Char('y'));
+        assert_eq!(spaces_closed(), vec![("w1".to_string(), false)]);
+    }
+
+    #[test]
+    fn a_group_that_grew_since_the_question_closes_nothing() {
+        let mut a = spaces();
+        press(&mut a, KeyCode::Char('d'));
+        let mut now = a.workspaces.clone();
+        now.push(space("w4", 4, "docs-site", Some(("/src/acme/.git", true))));
+        set_fresh_spaces(Some(now));
+        press(&mut a, KeyCode::Char('y'));
+        assert!(spaces_closed().is_empty());
+        assert!(
+            flash_text(&a).contains("docs-site opened since"),
+            "{}",
+            flash_text(&a)
+        );
+        assert_eq!(stored(), a.store, "account choices kept");
+        assert_eq!(a.workspaces.len(), 4, "the new space shows");
+
+        // A group that shrank closes what is left of it.
+        let mut a = spaces();
+        press(&mut a, KeyCode::Char('d'));
+        set_fresh_spaces(Some(vec![a.workspaces[0].clone(), a.workspaces[2].clone()]));
+        press(&mut a, KeyCode::Char('y'));
+        assert_eq!(spaces_closed(), vec![("w1".to_string(), false)]);
+    }
+
+    #[test]
+    fn a_space_closed_meanwhile_changes_nothing_else() {
+        let mut a = spaces();
+        a.space_sel = 2;
+        press(&mut a, KeyCode::Char('d'));
+        set_fresh_spaces(Some(a.workspaces[..2].to_vec()));
+        press(&mut a, KeyCode::Char('y'));
+        assert!(spaces_closed().is_empty());
+        assert_eq!(flash_text(&a), "notes had already closed");
+        assert_eq!(stored().space_account("w3"), Some("work"), "kept");
+        assert_eq!(a.space_sel, 1, "the selection stays on a row");
+    }
+
+    #[test]
+    fn a_space_herdr_cannot_close_stays_with_its_account() {
+        let mut a = spaces();
+        a.space_sel = 2;
+        a.space_closer = cannot_close_space;
+        press(&mut a, KeyCode::Char('d'));
+        press(&mut a, KeyCode::Char('y'));
+        assert_eq!(spaces_closed(), vec![("w3".to_string(), false)]);
+        assert_eq!(
+            a.flash.clone().map(|f| (f.0, f.1)),
+            Some(("Herdr could not close notes".to_string(), crate::theme::RED))
+        );
+        assert_eq!(a.workspaces.len(), 3, "the row stays");
+        assert_eq!(stored().space_account("w3"), Some("work"), "choice back");
+        assert_eq!(a.store.space_account("w3"), Some("work"));
+
+        // Herdr cannot be asked at all.
+        let mut a = spaces();
+        press(&mut a, KeyCode::Char('d'));
+        set_fresh_spaces(None);
+        press(&mut a, KeyCode::Char('y'));
+        assert!(spaces_closed().is_empty());
+        assert_eq!(a.flash.as_ref().map(|f| f.1), Some(crate::theme::RED));
+        assert_eq!(a.workspaces.len(), 3);
+
+        // Herdr refuses and the choice cannot be put back: both are said.
+        let mut a = spaces();
+        a.space_sel = 2;
+        a.space_closer = |ws, group| {
+            STORE_BROKEN.with(|b| b.set(true));
+            cannot_close_space(ws, group)
+        };
+        a.store_update = stores_until_broken;
+        press(&mut a, KeyCode::Char('d'));
+        press(&mut a, KeyCode::Char('y'));
+        STORE_BROKEN.with(|b| b.set(false));
+        assert_eq!(spaces_closed(), vec![("w3".to_string(), false)]);
+        assert_eq!(
+            flash_text(&a),
+            "Herdr could not close notes, and its account choice is lost: choose it again with ⏎"
+        );
+
+        // The account choice cannot be forgotten: nothing closes either.
+        let mut a = spaces();
+        a.space_sel = 2;
+        a.store_update = cannot_store;
+        press(&mut a, KeyCode::Char('d'));
+        press(&mut a, KeyCode::Char('y'));
+        assert!(spaces_closed().is_empty());
+        assert!(
+            flash_text(&a).starts_with("Not saved"),
+            "{}",
+            flash_text(&a)
+        );
+    }
+
+    #[test]
+    fn sessions_that_changed_since_the_question_close_nothing() {
+        // One started working without the question warning about it.
+        let mut a = spaces();
+        a.space_sel = 1;
+        press(&mut a, KeyCode::Char('d'));
+        let mut now = a.panes.clone();
+        now[2].status = Some("working".into());
+        set_fresh(Some(now.clone()));
+        press(&mut a, KeyCode::Char('y'));
+        assert!(spaces_closed().is_empty());
+        assert_eq!(
+            flash_text(&a),
+            "fix-login changed since the question; nothing was closed. Press d again"
+        );
+        assert_eq!(stored(), a.store, "account choices kept");
+        assert_eq!(a.panes, now, "the list shows what Herdr says now");
+
+        // A new session opened in it.
+        let mut a = spaces();
+        a.space_sel = 2;
+        press(&mut a, KeyCode::Char('d'));
+        let mut now = a.panes.clone();
+        now.push(in_space(
+            "w3",
+            pane("w3:p2", "w3:t1", "New", Some("idle"), None),
+        ));
+        set_fresh(Some(now));
+        press(&mut a, KeyCode::Char('y'));
+        assert!(spaces_closed().is_empty());
+        assert!(flash_text(&a).contains("changed since the question"));
+
+        // The question warned about one; another started working since.
+        let mut a = spaces();
+        a.panes[0].status = Some("working".into());
+        set_fresh(Some(a.panes.clone()));
+        press(&mut a, KeyCode::Char('d'));
+        let mut now = a.panes.clone();
+        now[2].status = Some("working".into());
+        set_fresh(Some(now));
+        press(&mut a, KeyCode::Char('y'));
+        assert!(spaces_closed().is_empty());
+        assert!(flash_text(&a).contains("changed since the question"));
+
+        // The question warned already, or a session ended: it closes.
+        let mut a = spaces();
+        a.space_sel = 1;
+        a.panes[2].status = Some("blocked".into());
+        let mut now = a.panes.clone();
+        now[2].status = Some("working".into());
+        press(&mut a, KeyCode::Char('d'));
+        set_fresh(Some(now));
+        press(&mut a, KeyCode::Char('y'));
+        assert_eq!(spaces_closed(), vec![("w2".to_string(), false)]);
+        let mut a = spaces();
+        press(&mut a, KeyCode::Char('d'));
+        set_fresh(Some(vec![a.panes[1].clone()]));
+        press(&mut a, KeyCode::Char('y'));
+        assert_eq!(spaces_closed(), vec![("w1".to_string(), true)]);
+
+        // Herdr's panes cannot be read: nothing closes.
+        let mut a = spaces();
+        press(&mut a, KeyCode::Char('d'));
+        set_fresh(None);
+        press(&mut a, KeyCode::Char('y'));
+        assert!(spaces_closed().is_empty());
+        assert_eq!(a.flash.as_ref().map(|f| f.1), Some(crate::theme::RED));
+    }
+
+    #[test]
+    fn the_stored_choices_are_forgotten_also_when_this_list_has_not_read_them() {
+        let mut a = spaces();
+        // Another list chose an account for acme-app since this one read.
+        STORED.with(|s| s.borrow_mut().assign("w1", "acme-app", Some("work")));
+        press(&mut a, KeyCode::Char('d'));
+        press(&mut a, KeyCode::Char('y'));
+        assert_eq!(spaces_closed(), vec![("w1".to_string(), true)]);
+        assert_eq!(stored().space_account("w1"), None);
+        assert_eq!(stored().space_account("w2"), None);
+        assert_eq!(stored().space_account("w3"), Some("work"));
+    }
+
+    #[test]
+    fn a_close_that_failed_halfway_puts_back_only_the_open_spaces() {
+        let mut a = spaces();
+        a.store.assign("w1", "acme-app", Some("work"));
+        STORED.with(|s| *s.borrow_mut() = a.store.clone());
+        a.space_closer = |ws, group| {
+            // fix-login went, acme-app stayed.
+            set_fresh_spaces(
+                fresh_spaces().map(|l| l.into_iter().filter(|w| w.id != "w2").collect()),
+            );
+            cannot_close_space(ws, group)
+        };
+        press(&mut a, KeyCode::Char('d'));
+        press(&mut a, KeyCode::Char('y'));
+        assert_eq!(spaces_closed(), vec![("w1".to_string(), true)]);
+        assert_eq!(stored().space_account("w1"), Some("work"), "still open");
+        assert_eq!(
+            stored().space_account("w2"),
+            None,
+            "closed: stays forgotten"
+        );
+        assert_eq!(flash_text(&a), "Herdr could not close acme-app");
+
+        // Another list chose an account meanwhile: its choice stays.
+        let mut a = spaces();
+        a.space_sel = 2;
+        a.space_closer = |ws, group| {
+            STORED.with(|s| s.borrow_mut().assign("w3", "notes", Some("personal")));
+            cannot_close_space(ws, group)
+        };
+        press(&mut a, KeyCode::Char('d'));
+        press(&mut a, KeyCode::Char('y'));
+        assert_eq!(stored().space_account("w3"), Some("personal"));
+    }
+
+    #[test]
+    fn closing_forgets_the_space_account_choice() {
+        let mut a = spaces();
+        a.space_sel = 2;
+        assert_eq!(stored().space_account("w3"), Some("work"));
+        press(&mut a, KeyCode::Char('d'));
+        press(&mut a, KeyCode::Char('y'));
+        assert_eq!(spaces_closed(), vec![("w3".to_string(), false)]);
+        assert_eq!(stored().space_account("w3"), None);
+        assert!(
+            stored().spaces.iter().all(|s| s.label != "notes"),
+            "a new space named notes starts on the active account"
+        );
+        assert_eq!(
+            stored().space_account("w2"),
+            Some("personal"),
+            "others stay"
+        );
+        assert_eq!(a.store, stored());
+    }
+
+    #[test]
+    fn d_in_spaces_waits_while_a_session_is_moved() {
+        let mut a = spaces();
+        a.moving = Some(MoveRun {
+            pane: "w1:p1".into(),
+            label: "Fix the login bug".into(),
+            to: "Work".into(),
+        });
+        press(&mut a, KeyCode::Char('d'));
+        assert_eq!(a.mode, Mode::Normal, "asks nothing");
+        assert_eq!(
+            flash_text(&a),
+            "Fix the login bug is being moved; wait a moment"
+        );
+        assert!(spaces_closed().is_empty());
+    }
+
+    #[test]
+    fn the_list_says_when_it_closes_with_its_space() {
+        let mut a = spaces();
+        a.own_pane = Some("w3:p9".into());
+        a.panes.push(in_space(
+            "w3",
+            pane("w3:p9", "w3:t1", "Multiaccount", None, None),
+        ));
+        a.space_sel = 2;
+        press(&mut a, KeyCode::Char('d'));
+        let text = confirm(&a).lines.join(" ");
+        assert!(
+            text.contains("This list runs in it: it closes too."),
+            "{text}"
+        );
+        assert!(
+            text.contains("No Claude Code session"),
+            "the list is none: {text}"
+        );
+        a.mode = Mode::Normal;
+        a.space_sel = 0;
+        press(&mut a, KeyCode::Char('d'));
+        let text = confirm(&a).lines.join(" ");
+        assert!(!text.contains("closes too"), "{text}");
+    }
+
+    #[test]
+    fn the_footer_and_the_keys_overlay_show_d_and_x_keeps_its_meaning() {
+        let mut a = spaces();
+        let rows = screen_of(&mut a, 100, 30);
+        assert!(rows[29].contains("d close space"), "{}", rows[29]);
+        assert!(rows[29].contains("x use active"), "{}", rows[29]);
+        let spot = a
+            .hits
+            .iter()
+            .find_map(|(r, h)| (*h == Hit::Key('d')).then_some(*r))
+            .expect("d in the footer");
+        a.click(spot.x, spot.y);
+        assert_eq!(confirm(&a).question, "Close acme-app?");
+        let mut a = spaces();
+        a.mode = Mode::Help;
+        let screen = screen_of(&mut a, 120, 60).join("\n");
+        assert!(
+            screen.contains("close the space with everything in it"),
+            "{screen}"
+        );
+        assert!(screen.contains("back to the active account"), "{screen}");
+        // x, Backspace and Delete still go back to the active account (the
+        // failing store stops them before they reach Herdr) and ask nothing.
+        for key in [KeyCode::Char('x'), KeyCode::Backspace, KeyCode::Delete] {
+            let mut a = spaces();
+            a.store_update = cannot_store;
+            press(&mut a, key);
+            assert_eq!(a.mode, Mode::Normal, "{key:?}");
+            assert!(flash_text(&a).starts_with("Not saved"), "{key:?}");
+        }
+        // Enter still picks the space's account.
+        let mut a = spaces();
+        press(&mut a, KeyCode::Enter);
+        assert!(matches!(a.mode, Mode::Pick(_)), "{:?}", a.mode);
+    }
+
+    #[test]
+    fn the_close_question_draws_at_many_sizes() {
+        for (w, h) in [(160, 40), (100, 30), (60, 20), (40, 12), (24, 20), (20, 30)] {
+            let mut a = spaces();
+            a.own_pane = Some("w1:p2".into());
+            a.panes[0].status = Some("working".into());
+            press(&mut a, KeyCode::Char('d'));
+            let screen = screen_of(&mut a, w, h).join("\n");
+            assert!(screen.contains("Close"), "{w}x{h}: {screen}");
+            assert!(screen.contains("y yes"), "{w}x{h}: {screen}");
+            assert!(!screen.contains("⏎ y yes"), "{w}x{h}: {screen}");
+            // Smaller panes scroll the question (tested with the move).
+            if w >= 60 {
+                let shown: Vec<&str> = screen.split_whitespace().collect();
+                for word in confirm(&a).lines.iter().flat_map(|l| l.split_whitespace()) {
+                    assert!(shown.contains(&word), "{w}x{h}: {word} cut off\n{screen}");
+                }
+            }
+        }
+    }
+
     // ---- moving a session (m) ----------------------------------------
 
     const CONV: &str = "0b7f3c2e-1d4a-4c6b-9e8f-a1b2c3d4e5f6";
 
-    fn knows(_: &str) -> Option<(String, u32)> {
-        Some((CONV.into(), 4242))
+    fn held(session_id: &str, pid: u32, carry: Moved) -> Option<Held> {
+        Some(Held {
+            session_id: session_id.into(),
+            pid,
+            carry,
+        })
     }
 
-    fn knows_nothing(_: &str) -> Option<(String, u32)> {
+    /// A session started with options, on a model changed since.
+    fn started_with_options() -> Moved {
+        Moved {
+            options: Some(vec![
+                "--model=sonnet".into(),
+                "--add-dir=/work/lib".into(),
+                "--permission-mode=plan".into(),
+                format!("--append-system-prompt={}", "Be very careful. ".repeat(40)),
+            ]),
+            dropped: vec!["--worktree".into()],
+            model: Some("claude-opus-4-5[1m]".into()),
+        }
+    }
+
+    fn knows(_: &str) -> Option<Held> {
+        held(CONV, 4242, started_with_options())
+    }
+
+    fn knows_nothing(_: &str) -> Option<Held> {
         None
     }
 
-    fn knows_another(_: &str) -> Option<(String, u32)> {
-        Some(("11111111-2222-4333-8444-555555555555".into(), 4243))
+    fn knows_another(_: &str) -> Option<Held> {
+        held(
+            "11111111-2222-4333-8444-555555555555",
+            4243,
+            Moved::default(),
+        )
     }
 
-    /// Hands back what it was asked to do, without Herdr.
-    fn moves(p: relocate::Plan) -> Result<String, String> {
-        Ok(format!(
-            "moved {} {} {} {} to {}",
-            p.pane, p.label, p.session_id, p.pid, p.account_id
-        ))
+    /// The same conversation, after a /model since the question.
+    fn knows_other_model(_: &str) -> Option<Held> {
+        let mut c = started_with_options();
+        c.model = Some("claude-haiku-4-5".into());
+        held(CONV, 4242, c)
     }
 
-    fn fails(_: relocate::Plan) -> Result<String, String> {
-        Err("Claude Code did not end in it, so nothing was started. By hand: type /exit in it, then HERDR_MULTIACCOUNT_USE=work claude --resume x.".into())
+    /// A session started before this version, whose status line noted no
+    /// model either.
+    fn knows_only_the_conversation(_: &str) -> Option<Held> {
+        held(CONV, 4242, Moved::default())
+    }
+
+    /// Notes a move as its process would once done (this test process
+    /// stands in for it), without Herdr.
+    fn noted(
+        dir: &std::path::Path,
+        list: u32,
+        p: relocate::Plan,
+        result: Option<Result<String, String>>,
+    ) {
+        assert!(relocate::write_note(
+            dir,
+            &relocate::Note {
+                plan: p,
+                at: crate::time::now(),
+                list: Some(list),
+                mover: Some(std::process::id()),
+                result,
+            }
+        ));
+    }
+
+    /// Hands back what it was asked to do.
+    fn moves(dir: &std::path::Path, list: u32, p: relocate::Plan) -> Result<(), String> {
+        let text = format!(
+            "moved {} {} {} {} to {} with {}",
+            p.pane,
+            p.label,
+            p.session_id,
+            p.pid,
+            p.account_id,
+            p.carry.args().len()
+        );
+        noted(dir, list, p, Some(Ok(text)));
+        Ok(())
+    }
+
+    const FAILED: &str = "Claude Code did not end in it, so nothing was started. By hand: type /exit in it, then HERDR_MULTIACCOUNT_USE=work claude --resume x.";
+
+    fn fails(dir: &std::path::Path, list: u32, p: relocate::Plan) -> Result<(), String> {
+        noted(dir, list, p, Some(Err(FAILED.into())));
+        Ok(())
+    }
+
+    /// A move whose process runs (this test process stands in for it).
+    fn runs(dir: &std::path::Path, list: u32, p: relocate::Plan) -> Result<(), String> {
+        noted(dir, list, p, None);
+        Ok(())
+    }
+
+    /// A move whose process could not be started.
+    fn cannot_start(_: &std::path::Path, _: u32, _: relocate::Plan) -> Result<(), String> {
+        Err("Nothing was changed: the move could not be started. By hand: type /exit in it.".into())
     }
 
     fn signed_in(plan: &str) -> Info {
@@ -3032,6 +4338,7 @@ mod tests {
     /// Waits for the move started in the background.
     fn finish(a: &mut App) {
         for _ in 0..200 {
+            a.next_moves = Instant::now();
             a.receive_move();
             if a.moving.is_none() {
                 return;
@@ -3113,11 +4420,14 @@ mod tests {
         assert!(text.contains("unsent text in it is lost"), "{text}");
         assert!(!text.contains("limit,"), "no fallback note: {text}");
         press(&mut a, KeyCode::Char('y'));
-        assert_eq!(a.moving.as_deref(), Some("Fix the login bug"));
+        assert_eq!(
+            a.moving.as_ref().map(|m| m.label.as_str()),
+            Some("Fix the login bug")
+        );
         finish(&mut a);
         assert_eq!(
             flash_text(&a),
-            format!("moved w91:p1 Fix the login bug {CONV} 4242 to work")
+            format!("moved w91:p1 Fix the login bug {CONV} 4242 to work with 4")
         );
         assert_eq!(a.mode, Mode::Normal);
     }
@@ -3157,11 +4467,11 @@ mod tests {
                     now[0].status = Some("working".into());
                     set_fresh(Some(now));
                 },
-                "it is working; nothing was moved",
+                "it is working",
             ),
             (
                 |_| set_fresh(Some(vec![shell("w91:p1", "w91:t1")])),
-                "has ended; nothing was moved",
+                "has ended",
             ),
             (
                 |a| a.conversation_of = knows_another,
@@ -3176,26 +4486,156 @@ mod tests {
             change(&mut a);
             press(&mut a, KeyCode::Char('y'));
             assert!(a.moving.is_none(), "{says}");
-            assert!(flash_text(&a).contains(says), "{says}: {}", flash_text(&a));
+            refused(&a, says);
+        }
+    }
+
+    /// The dialog a move refused after yes opens, naming why.
+    fn refused(a: &App, says: &str) {
+        match &a.mode {
+            Mode::Message { title, lines, good } => {
+                assert_eq!(title, "Fix the login bug was not moved", "{says}");
+                let text = lines.join(" ");
+                assert!(text.contains(says), "{says}: {text}");
+                assert!(!text.contains("nothing was moved"), "said once: {text}");
+                assert!(!good);
+            }
+            m => panic!("{says}: no dialog: {m:?}"),
+        }
+    }
+
+    /// Opens the move question for Fix the login bug to Work.
+    fn asked_to_move() -> App {
+        let mut a = movable();
+        press(&mut a, KeyCode::Char('m'));
+        press(&mut a, KeyCode::Char('2'));
+        assert_eq!(confirm(&a).question, "Move Fix the login bug to Work?");
+        a
+    }
+
+    #[test]
+    fn enter_on_the_move_question_moves() {
+        // The steps of #10: m, Enter on the account, Enter on the question.
+        let mut a = movable();
+        press(&mut a, KeyCode::Char('m'));
+        press(&mut a, KeyCode::Enter);
+        confirm(&a);
+        press(&mut a, KeyCode::Enter);
+        assert_eq!(a.mode, Mode::Normal);
+        assert!(a.moving.is_some(), "the move runs");
+        finish(&mut a);
+        assert!(
+            flash_text(&a).starts_with("moved w91:p1 Fix the login bug"),
+            "{}",
+            flash_text(&a)
+        );
+    }
+
+    #[test]
+    fn no_on_the_move_question_says_the_session_was_not_moved() {
+        for key in [KeyCode::Char('n'), KeyCode::Esc] {
+            let mut a = asked_to_move();
+            press(&mut a, key);
+            assert_eq!(a.mode, Mode::Normal, "{key:?}");
+            assert!(a.moving.is_none(), "{key:?}");
+            assert_eq!(flash_text(&a), "Fix the login bug was not moved", "{key:?}");
+            assert_eq!(a.flash.as_ref().map(|f| f.1), Some(crate::theme::MUTED));
+        }
+        // A click on the no button too.
+        let mut a = asked_to_move();
+        screen_of(&mut a, 100, 30);
+        let spot = a
+            .hits
+            .iter()
+            .find_map(|(r, h)| (*h == Hit::Key('n')).then_some(*r))
+            .expect("the no button");
+        a.click(spot.x, spot.y);
+        assert_eq!(a.mode, Mode::Normal);
+        assert!(a.moving.is_none());
+        assert_eq!(flash_text(&a), "Fix the login bug was not moved");
+    }
+
+    #[test]
+    fn leaving_the_move_picker_says_the_session_was_not_moved() {
+        for key in [KeyCode::Esc, KeyCode::Char('q')] {
+            let mut a = movable();
+            press(&mut a, KeyCode::Char('m'));
+            picker(&a);
+            press(&mut a, key);
+            assert_eq!(a.mode, Mode::Normal, "{key:?}");
+            assert!(a.moving.is_none(), "{key:?}");
+            assert_eq!(flash_text(&a), "Fix the login bug was not moved", "{key:?}");
         }
     }
 
     #[test]
-    fn any_answer_but_yes_leaves_the_session() {
-        for key in [KeyCode::Char('n'), KeyCode::Esc, KeyCode::Enter] {
-            let mut a = movable();
-            press(&mut a, KeyCode::Char('m'));
-            press(&mut a, KeyCode::Enter);
+    fn other_keys_leave_the_move_question_open() {
+        for key in [
+            KeyCode::Char('x'),
+            KeyCode::Char('Y'),
+            KeyCode::Char(' '),
+            KeyCode::Tab,
+            KeyCode::Down,
+            KeyCode::Up,
+            KeyCode::Char('j'),
+            KeyCode::Char('k'),
+            KeyCode::Char('m'),
+        ] {
+            let mut a = asked_to_move();
+            screen_of(&mut a, 160, 40);
+            assert_eq!(a.confirm_max, 0, "the question fits");
+            let before = confirm(&a);
             press(&mut a, key);
-            assert_eq!(a.mode, Mode::Normal);
+            assert_eq!(confirm(&a), before, "{key:?}");
             assert!(a.moving.is_none(), "{key:?}");
+            assert_eq!(flash_text(&a), "", "{key:?}");
         }
-        // Esc in the picker too.
+    }
+
+    #[test]
+    fn staying_after_ctrl_c_keeps_the_question() {
+        let mut a = asked_to_move();
+        let before = confirm(&a);
+        a.key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert_eq!(a.mode, Mode::AskQuit);
+        press(&mut a, KeyCode::Char('n'));
+        assert_eq!(confirm(&a), before);
+        press(&mut a, KeyCode::Char('y'));
+        assert!(a.moving.is_some(), "the question still answers");
+        // The move's account list comes back too.
         let mut a = movable();
         press(&mut a, KeyCode::Char('m'));
+        let before = picker(&a);
+        a.key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        press(&mut a, KeyCode::Char('n'));
+        assert_eq!(picker(&a), before);
+        // q from the list itself stays in the list.
+        let mut a = movable();
+        a.key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        press(&mut a, KeyCode::Char('n'));
+        press(&mut a, KeyCode::Char('m'));
         press(&mut a, KeyCode::Esc);
+        press(&mut a, KeyCode::Char('q'));
+        press(&mut a, KeyCode::Char('n'));
         assert_eq!(a.mode, Mode::Normal);
-        assert!(a.moving.is_none());
+    }
+
+    #[test]
+    fn keys_with_ctrl_or_alt_never_answer() {
+        for mods in [KeyModifiers::CONTROL, KeyModifiers::ALT] {
+            for code in [KeyCode::Char('y'), KeyCode::Char('n'), KeyCode::Enter] {
+                let mut a = asked_to_move();
+                let before = confirm(&a);
+                a.key(KeyEvent::new(code, mods));
+                assert_eq!(confirm(&a), before, "{mods:?} {code:?}");
+                assert!(a.moving.is_none());
+                let mut a = agents();
+                press(&mut a, KeyCode::Char('d'));
+                a.key(KeyEvent::new(code, mods));
+                confirm(&a);
+                assert!(closed().is_empty(), "{mods:?} {code:?}");
+            }
+        }
     }
 
     #[test]
@@ -3265,7 +4705,7 @@ mod tests {
         assert!(a.moving.is_none(), "the move finished");
         assert_eq!(a.mode, Mode::Help, "the overlay stays");
         a.mode = Mode::Normal;
-        a.receive_move();
+        poll(&mut a);
         match &a.mode {
             Mode::Message { title, .. } => assert_eq!(title, "Fix the login bug was not moved"),
             m => panic!("{m:?}"),
@@ -3312,7 +4752,11 @@ mod tests {
         );
         press(&mut a, KeyCode::Char('y'));
         finish(&mut a);
-        assert!(flash_text(&a).ends_with("to spare"), "{}", flash_text(&a));
+        assert!(
+            flash_text(&a).ends_with("to spare with 4"),
+            "{}",
+            flash_text(&a)
+        );
     }
 
     #[test]
@@ -3369,6 +4813,8 @@ mod tests {
             pid: 1,
             wanted: (c.id != c.wanted).then(|| c.wanted.clone()),
             told: false,
+            options: None,
+            dropped: vec![],
         };
         assert_eq!(
             crate::remind::due(&note, "work", &a.store, &Usage::default(), 95.0, a.now()),
@@ -3377,18 +4823,359 @@ mod tests {
     }
 
     #[test]
-    fn while_a_move_runs_the_list_stays_and_the_session_is_kept() {
+    fn while_a_move_runs_the_session_is_kept_and_q_closes_the_list() {
         let mut a = movable();
-        a.moving = Some("Fix the login bug".into());
-        press(&mut a, KeyCode::Char('q'));
+        a.mover = runs;
+        press(&mut a, KeyCode::Char('m'));
+        press(&mut a, KeyCode::Enter);
         press(&mut a, KeyCode::Char('y'));
-        assert!(!a.quit);
-        assert!(flash_text(&a).contains("quit once it is done"));
+        a.receive_move();
+        assert!(a.moving.is_some());
         press(&mut a, KeyCode::Char('d'));
         assert_eq!(a.mode, Mode::Normal);
         press(&mut a, KeyCode::Char('m'));
         assert_eq!(a.mode, Mode::Normal);
         assert!(flash_text(&a).contains("being moved"));
+        // The move goes on in its own process (the owner's decision on
+        // #12), so q closes the list, as Ctrl+C does.
+        press(&mut a, KeyCode::Char('q'));
+        press(&mut a, KeyCode::Char('y'));
+        assert!(a.quit);
+        assert!(
+            relocate::read_note(&a.moves_dir, "w91:p1").is_some(),
+            "the move is left to its process"
+        );
+        let mut b = movable();
+        b.mover = runs;
+        press(&mut b, KeyCode::Char('m'));
+        press(&mut b, KeyCode::Enter);
+        press(&mut b, KeyCode::Char('y'));
+        b.key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        press(&mut b, KeyCode::Char('y'));
+        assert!(b.quit);
+    }
+
+    /// Reads the notes again now, as the list does every half second.
+    fn poll(a: &mut App) {
+        a.next_moves = Instant::now();
+        a.receive_move();
+    }
+
+    #[test]
+    fn a_move_started_by_a_closed_list_reports_in_the_next_one() {
+        let mut a = movable();
+        a.mover = runs;
+        // Its process is gone once the list closed.
+        a.me = dead_pid();
+        press(&mut a, KeyCode::Char('m'));
+        press(&mut a, KeyCode::Enter);
+        press(&mut a, KeyCode::Char('y'));
+        let dir = a.moves_dir.clone();
+        let note = relocate::read_note(&dir, "w91:p1").unwrap();
+        assert_eq!(note.list, Some(a.me));
+        drop(a);
+        // The move process finishes after the list closed.
+        let ok = relocate::Note {
+            result: Some(Ok("Moved Fix the login bug to Work".into())),
+            ..note.clone()
+        };
+        assert!(relocate::write_note(&dir, &ok));
+        let mut b = movable();
+        b.moves_dir = dir.clone();
+        poll(&mut b);
+        assert_eq!(flash_text(&b), "Moved Fix the login bug to Work");
+        assert!(b.moving.is_none());
+        assert!(relocate::notes(&dir).is_empty(), "told once, then gone");
+        // A failure while the next list is in a dialog stays in its note
+        // (the move process's popup tells it if the list closes), and
+        // shows once the dialog is closed.
+        let failed = relocate::Note {
+            result: Some(Err(FAILED.into())),
+            ..note
+        };
+        assert!(relocate::write_note(&dir, &failed));
+        let mut c = movable();
+        c.moves_dir = dir.clone();
+        c.mode = Mode::Help;
+        poll(&mut c);
+        assert_eq!(c.mode, Mode::Help);
+        assert_eq!(relocate::notes(&dir).len(), 1, "left in its note");
+        c.mode = Mode::Normal;
+        poll(&mut c);
+        match &c.mode {
+            Mode::Message { title, lines, good } => {
+                assert_eq!(title, "Fix the login bug was not moved");
+                assert!(lines.join(" ").contains("/exit"));
+                assert!(!good);
+            }
+            m => panic!("{m:?}"),
+        }
+        assert_eq!(
+            std::fs::read_dir(&dir).unwrap().count(),
+            0,
+            "gone once shown"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_list_leaves_the_result_of_another_open_list_to_it() {
+        let mut a = asked_to_move();
+        a.mover = fails;
+        let mut b = movable();
+        b.moves_dir = a.moves_dir.clone();
+        // Another list, whose process (pid 1) runs.
+        b.me = 1;
+        press(&mut a, KeyCode::Char('y'));
+        poll(&mut b);
+        assert_eq!(b.mode, Mode::Normal, "not in a tab the user may not see");
+        poll(&mut a);
+        refused(&a, "did not end");
+        let _ = std::fs::remove_dir_all(&a.moves_dir);
+    }
+
+    /// A pid no process has: one that just ended.
+    fn dead_pid() -> u32 {
+        let mut c = std::process::Command::new("true").spawn().unwrap();
+        let pid = c.id();
+        c.wait().unwrap();
+        pid
+    }
+
+    #[test]
+    fn a_list_opened_during_a_move_shows_it_and_refuses_m_and_d() {
+        let mut a = asked_to_move();
+        a.mover = runs;
+        // The list that started it has closed.
+        a.me = dead_pid();
+        press(&mut a, KeyCode::Char('y'));
+        let mut b = movable();
+        b.moves_dir = a.moves_dir.clone();
+        poll(&mut b);
+        assert_eq!(
+            b.moving.as_ref().map(|m| (m.label.as_str(), m.to.as_str())),
+            Some(("Fix the login bug", "Work"))
+        );
+        let rows = screen_of(&mut b, 160, 40);
+        assert!(
+            rows[39].contains("Moving Fix the login bug to Work…"),
+            "{}",
+            rows[39]
+        );
+        for key in ['m', 'd'] {
+            press(&mut b, KeyCode::Char(key));
+            assert_eq!(b.mode, Mode::Normal, "{key}");
+            assert!(
+                flash_text(&b).contains("being moved; wait a moment"),
+                "{key}"
+            );
+        }
+        // The result shows there when the move ends.
+        let n = relocate::read_note(&b.moves_dir, "w91:p1").unwrap();
+        noted(
+            &b.moves_dir,
+            n.list.unwrap(),
+            n.plan,
+            Some(Ok("Moved Fix the login bug to Work".into())),
+        );
+        poll(&mut b);
+        assert!(b.moving.is_none());
+        assert_eq!(flash_text(&b), "Moved Fix the login bug to Work");
+        let _ = std::fs::remove_dir_all(&b.moves_dir);
+    }
+
+    #[test]
+    fn two_lists_run_one_move_at_a_time() {
+        let mut a = movable();
+        a.mover = runs;
+        let mut b = movable();
+        b.mover = runs;
+        b.moves_dir = a.moves_dir.clone();
+        // b asks before a starts, and answers after.
+        press(&mut b, KeyCode::Char('j'));
+        press(&mut b, KeyCode::Char('m'));
+        press(&mut b, KeyCode::Enter);
+        press(&mut a, KeyCode::Char('m'));
+        press(&mut a, KeyCode::Enter);
+        press(&mut a, KeyCode::Char('y'));
+        press(&mut b, KeyCode::Char('y'));
+        match &b.mode {
+            Mode::Message { title, lines, .. } => {
+                assert_eq!(title, "Write the docs was not moved");
+                assert!(
+                    lines[0].contains("Fix the login bug is being moved"),
+                    "{lines:?}"
+                );
+            }
+            m => panic!("{m:?}"),
+        }
+        assert_eq!(relocate::notes(&a.moves_dir).len(), 1);
+        let _ = std::fs::remove_dir_all(&a.moves_dir);
+    }
+
+    #[test]
+    fn a_move_whose_process_is_gone_is_reported_once() {
+        let a = movable();
+        let dir = a.moves_dir.clone();
+        let plan = relocate::Plan {
+            pane: "w91:p1".into(),
+            label: "Fix the login bug".into(),
+            session_id: CONV.into(),
+            pid: 4242,
+            account_id: "work".into(),
+            account_name: "Work".into(),
+            carry: started_with_options(),
+        };
+        // Killed halfway, and one that never noted itself.
+        let now = crate::time::now();
+        for (mover, at) in [(Some(dead_pid()), now), (None, now - 31)] {
+            assert!(relocate::write_note(
+                &dir,
+                &relocate::Note {
+                    plan: plan.clone(),
+                    at,
+                    list: Some(std::process::id()),
+                    mover,
+                    result: None,
+                }
+            ));
+            let mut b = movable();
+            b.moves_dir = dir.clone();
+            poll(&mut b);
+            assert!(b.moving.is_none());
+            match &b.mode {
+                Mode::Message { title, lines, good } => {
+                    assert_eq!(
+                        title,
+                        "The move of Fix the login bug stopped before it finished"
+                    );
+                    let text = lines.join(" ");
+                    assert!(text.contains("Look at the pane"), "{text}");
+                    assert!(
+                        text.contains(&format!(
+                            "HERDR_MULTIACCOUNT_USE=work claude --resume {CONV} --model 'claude-opus-4-5[1m]'"
+                        )),
+                        "{text}"
+                    );
+                    assert!(!good);
+                }
+                m => panic!("{m:?}"),
+            }
+            b.mode = Mode::Normal;
+            poll(&mut b);
+            assert_eq!(b.mode, Mode::Normal, "said once");
+            assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_move_that_cannot_start_presses_nothing_and_says_so() {
+        let mut a = movable();
+        a.mover = cannot_start;
+        press(&mut a, KeyCode::Char('m'));
+        press(&mut a, KeyCode::Enter);
+        press(&mut a, KeyCode::Char('y'));
+        assert!(a.moving.is_none());
+        refused(&a, "could not be started");
+    }
+
+    #[test]
+    fn a_running_move_shows_until_its_result() {
+        let mut a = asked_to_move();
+        press(&mut a, KeyCode::Char('y'));
+        assert!(a.moving.is_some());
+        // Past the 5 seconds of a flash, and during a refresh as well.
+        a.flash = None;
+        for (loading, probing) in [(false, false), (true, false), (false, true)] {
+            a.info_loading = loading;
+            a.probing = probing;
+            for (w, h) in [(160, 40), (100, 30), (60, 20)] {
+                let rows = screen_of(&mut a, w, h);
+                let footer = &rows[h as usize - 1];
+                assert!(
+                    footer.contains("Moving Fix the login bug to Work…"),
+                    "{w}x{h} {loading} {probing}: {footer}"
+                );
+                let screen = rows.join("\n");
+                assert!(screen.contains("moving to Work…"), "{w}x{h}: {screen}");
+            }
+        }
+        // A newer note shows for its time, then the move again.
+        a.flash(
+            "Write the docs is being moved; wait a moment",
+            crate::theme::MUTED,
+        );
+        let rows = screen_of(&mut a, 160, 40);
+        assert!(rows[39].contains("wait a moment"), "{}", rows[39]);
+        a.flash = None;
+        a.info_loading = false;
+        a.probing = false;
+        finish(&mut a);
+        let rows = screen_of(&mut a, 160, 40);
+        assert!(rows[39].contains("moved w91:p1"), "{}", rows[39]);
+        let screen = rows.join("\n");
+        assert!(!screen.contains("oving to Work…"), "{screen}");
+    }
+
+    #[test]
+    fn a_long_session_name_leaves_the_footer_its_keys() {
+        let mut a = movable();
+        a.moving = Some(MoveRun {
+            pane: "w91:p1".into(),
+            label: "Refactor the whole billing module and write the migration notes".into(),
+            to: "Work".into(),
+        });
+        let rows = screen_of(&mut a, 100, 30);
+        assert!(rows[29].contains("m move"), "{}", rows[29]);
+        assert!(rows[29].contains("Moving Refactor"), "{}", rows[29]);
+        assert!(rows[29].contains("… to Work…"), "{}", rows[29]);
+    }
+
+    #[test]
+    fn the_buttons_name_the_keys_at_every_size() {
+        for (w, h) in [(160, 40), (100, 30), (60, 20), (40, 12), (24, 20), (20, 30)] {
+            let mut a = asked_to_move();
+            let screen = screen_of(&mut a, w, h).join("\n");
+            assert!(screen.contains("y yes "), "{w}x{h}: {screen}");
+            assert!(
+                screen.contains(" n no "),
+                "{w}x{h}: the whole no button\n{screen}"
+            );
+            if w >= 40 {
+                assert!(screen.contains(" ⏎ y yes "), "{w}x{h}: {screen}");
+                assert!(screen.contains(" Esc n no "), "{w}x{h}: {screen}");
+            }
+            // The no button answers no where it is drawn.
+            let spot = a
+                .hits
+                .iter()
+                .find_map(|(r, h)| (*h == Hit::Key('n')).then_some(*r))
+                .expect("the no button");
+            assert!(spot.x + spot.width <= w, "{w}x{h}");
+            a.click(spot.x, spot.y);
+            assert_eq!(flash_text(&a), "Fix the login bug was not moved", "{w}x{h}");
+        }
+    }
+
+    #[test]
+    fn the_keys_overlay_says_how_questions_are_answered() {
+        let mut a = movable();
+        a.mode = Mode::Help;
+        let mut seen = screen_of(&mut a, 120, 60).join("\n");
+        for _ in 0..a.help_max {
+            press(&mut a, KeyCode::Down);
+            seen.push_str(&screen_of(&mut a, 120, 60).join("\n"));
+        }
+        assert!(seen.contains("Questions"), "{seen}");
+        assert!(
+            seen.contains("yes on the move question; nothing on the others"),
+            "{seen}"
+        );
+        assert!(
+            seen.contains("any other key leaves the question open"),
+            "{seen}"
+        );
     }
 
     #[test]
@@ -3408,6 +5195,74 @@ mod tests {
             .expect("m in the footer");
         a.click(spot.x, spot.y);
         picker(&a);
+    }
+
+    #[test]
+    fn the_question_names_what_carries_over_and_what_not() {
+        let mut a = movable();
+        press(&mut a, KeyCode::Char('m'));
+        press(&mut a, KeyCode::Char('2'));
+        let c = confirm(&a);
+        let text = c.lines.join("\n");
+        assert!(
+            text.contains("Carries over: model claude-opus-4-5[1m], --add-dir, --permission-mode plan, --append-system-prompt."),
+            "{text}"
+        );
+        assert!(text.contains("Not carried: --worktree."), "{text}");
+        assert!(!text.contains("Be very careful"), "no long values: {text}");
+        // Old sessions: says the options are not known.
+        let mut a = movable();
+        a.conversation_of = knows_only_the_conversation;
+        press(&mut a, KeyCode::Char('m'));
+        press(&mut a, KeyCode::Char('2'));
+        let text = confirm(&a).lines.join(" ");
+        assert!(
+            text.contains("start options and model are not known"),
+            "{text}"
+        );
+        press(&mut a, KeyCode::Char('y'));
+        finish(&mut a);
+        assert!(flash_text(&a).ends_with("with 0"), "{}", flash_text(&a));
+    }
+
+    #[test]
+    fn a_model_changed_after_the_question_stops_the_move() {
+        let mut a = movable();
+        press(&mut a, KeyCode::Char('m'));
+        press(&mut a, KeyCode::Char('2'));
+        a.conversation_of = knows_other_model;
+        press(&mut a, KeyCode::Char('y'));
+        assert!(a.moving.is_none(), "nothing started");
+        refused(&a, "model changed");
+    }
+
+    #[test]
+    fn start_options_count_only_for_the_process_that_was_started_with_them() {
+        let note = crate::sessions::Conversation {
+            session_id: CONV.into(),
+            pids: vec![4242],
+            model: Some("opus".into()),
+        };
+        let launcher = |pid| crate::sessions::Entry {
+            account: "work".into(),
+            pid,
+            wanted: None,
+            told: false,
+            options: Some(vec!["--verbose".into()]),
+            dropped: vec!["--worktree".into()],
+        };
+        let h = held_from(note.clone(), 4242, Some(launcher(4242)));
+        assert_eq!(h.carry.options, Some(vec!["--verbose".to_string()]));
+        assert_eq!(h.carry.dropped, vec!["--worktree".to_string()]);
+        assert_eq!(h.carry.model.as_deref(), Some("opus"));
+        // An older Claude Code's note in the same pane: options unknown,
+        // the current model still kept.
+        let h = held_from(note.clone(), 4242, Some(launcher(1111)));
+        assert_eq!(h.carry.options, None);
+        assert!(h.carry.dropped.is_empty());
+        assert_eq!(h.carry.model.as_deref(), Some("opus"));
+        let h = held_from(note, 4242, None);
+        assert_eq!(h.carry.options, None);
     }
 
     #[test]
@@ -3433,14 +5288,44 @@ mod tests {
             press(&mut a, KeyCode::Char('2'));
             let screen = screen_of(&mut a, w, h).join("\n");
             assert!(screen.contains("y yes"), "{w}x{h}: {screen}");
-            let shown: Vec<&str> = screen.split_whitespace().collect();
+            // A question taller than the pane scrolls: every word shows on
+            // the way down.
+            let mut seen = screen.clone();
+            for _ in 0..a.confirm_max {
+                assert!(seen.contains("scroll"), "{w}x{h}: says it scrolls");
+                press(&mut a, KeyCode::Down);
+                seen.push('\n');
+                seen.push_str(&screen_of(&mut a, w, h).join("\n"));
+            }
+            let screen = seen;
+            let shown: Vec<&str> = screen
+                .split(|c: char| c.is_whitespace() || c == '│')
+                .collect();
+            // The width the question's text wraps to: its box less 6
+            // (`ui::draw_confirm`).
+            let width = screen
+                .lines()
+                .find(|l| l.contains('╭'))
+                .map(|l| l.trim().chars().count().saturating_sub(6))
+                .unwrap_or(0);
+            // Only a word longer than the line is split, across lines in a
+            // row; the text without borders and spaces holds it whole.
+            let flat: String = screen
+                .chars()
+                .filter(|c| !c.is_whitespace() && *c != '│')
+                .collect();
             let c = confirm(&a);
             // The title may be cut on a narrow pane; the text names where
             // the session goes.
             let to = if full { "Main login's" } else { "Work's" };
             assert!(c.lines.join(" ").contains(to), "{w}x{h}");
             for word in c.lines.iter().flat_map(|l| l.split_whitespace()) {
-                assert!(shown.contains(&word), "{w}x{h}: {word} cut off\n{screen}");
+                let whole = if word.chars().count() > width {
+                    flat.contains(word)
+                } else {
+                    shown.contains(&word)
+                };
+                assert!(whole, "{w}x{h}: {word} cut off\n{screen}");
             }
         }
     }

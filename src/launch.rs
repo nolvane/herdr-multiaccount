@@ -4,6 +4,7 @@
 //! replaces itself with the real `claude`, so signals and exit codes are
 //! Claude Code's own.
 
+use crate::carry::Carried;
 use crate::config::Config;
 use crate::herdr;
 use crate::info;
@@ -277,7 +278,47 @@ pub fn session_env(store: &Store, id: &str) -> Result<SessionEnv, String> {
     Ok((set, remove))
 }
 
-pub fn run(args: Vec<String>) -> i32 {
+/// The launcher's arguments for a session the list moved here (`run
+/// --moved`): the start options and model from the move's hand-over, when
+/// it is there for this conversation; otherwise as given, with a note.
+/// Also what the session's note keeps of its start options: `None` when
+/// they are not known (the hand-over was missing, or did not know them).
+fn moved_args(args: Vec<String>) -> (Vec<String>, Option<Carried>) {
+    let pane = std::env::var("HERDR_PANE_ID")
+        .ok()
+        .filter(|_| herdr::inside());
+    let result = match &pane {
+        Some(pane) => crate::sessions::take_hand_over(pane, &args),
+        None => Err("it runs outside Herdr"),
+    };
+    match result {
+        Ok(h) => {
+            // Its own `--resume` is no start option the user gave; what the
+            // first start dropped is named again instead.
+            let carried = h.dropped.map(|dropped| Carried {
+                options: crate::carry::carried(&h.args, None).options,
+                dropped,
+            });
+            (h.args, carried)
+        }
+        Err(why) => {
+            eprintln!(
+                "herdr-multiaccount: the session's start options and model were not carried over ({why}); it starts without them."
+            );
+            (args, None)
+        }
+    }
+}
+
+pub fn run(args: Vec<String>, moved: bool) -> i32 {
+    let (args, carried) = if moved {
+        moved_args(args)
+    } else {
+        // What a move of this session carries over (`carry.rs`).
+        let cwd = std::env::current_dir().ok();
+        let c = crate::carry::carried(&args, cwd.as_deref());
+        (args, Some(c))
+    };
     let Some(claude) = find_claude() else {
         eprintln!("herdr-multiaccount: claude was not found on PATH");
         return 127;
@@ -334,7 +375,13 @@ pub fn run(args: Vec<String>) -> i32 {
             );
             // Herdr does not hand labels back, so the list reads this.
             let wanted = (choice.id != choice.wanted).then_some(choice.wanted.as_str());
-            crate::sessions::record(&pane, &choice.id, wanted, std::process::id());
+            crate::sessions::record(
+                &pane,
+                &choice.id,
+                wanted,
+                std::process::id(),
+                carried.as_ref(),
+            );
         }
     }
 

@@ -564,12 +564,7 @@ fn draw_spaces(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
             Cell::from(Text::from(vec![first_line, second])),
         ];
         if wide {
-            let claude: Vec<&crate::herdr::Pane> = app
-                .panes
-                .iter()
-                .filter(|p| p.workspace == ws.id)
-                .filter(|p| app.is_session(p))
-                .collect();
+            let claude = app.sessions_in(&ws.id);
             let mut names: Vec<String> = claude
                 .iter()
                 .filter_map(|p| p.account_id.as_deref())
@@ -630,6 +625,22 @@ fn draw_spaces(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
 // ---- sessions --------------------------------------------------------
 
 /// What an agent status looks like: colour and word.
+/// `text` cut to `width` columns, with "…" where it was cut.
+fn shorten(text: &str, width: usize) -> String {
+    if text.width() <= width {
+        return text.to_string();
+    }
+    let mut out = String::new();
+    for c in text.chars() {
+        if out.width() + c.to_string().width() + 1 > width {
+            break;
+        }
+        out.push(c);
+    }
+    out.push('…');
+    out
+}
+
 fn agent_status(status: Option<&str>) -> (ratatui::style::Color, &'static str) {
     match status {
         Some("working") => (GREEN, "working"),
@@ -674,7 +685,13 @@ fn draw_sessions(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
     let now = app.now();
     let mut rows = Vec::new();
     for (i, p) in sessions.iter().enumerate().skip(first).take(visible) {
-        let (color, word) = agent_status(p.status.as_deref());
+        let (color, word) = match app.moving.as_ref().filter(|m| m.pane == p.id) {
+            Some(m) => (ACCENT, format!("moving to {}…", m.to)),
+            None => {
+                let (color, word) = agent_status(p.status.as_deref());
+                (color, word.to_string())
+            }
+        };
         let label = if p.label.is_empty() {
             p.id.clone()
         } else {
@@ -810,6 +827,15 @@ fn draw_footer(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
     }
     let right = if let Some((text, color, _)) = &app.flash {
         Span::styled(format!("{text} "), Style::new().fg(*color))
+    } else if let Some(m) = &app.moving {
+        // For the whole move, not only a flash's 5 seconds; a long session
+        // name is cut so the keys keep a third of the footer.
+        let rest = format!(" to {}… ", m.to);
+        let room = (area.width as usize * 2 / 3).saturating_sub("Moving ".len() + rest.width());
+        Span::styled(
+            format!("Moving {}{rest}", shorten(&m.label, room.max(8))),
+            Style::new().fg(ACCENT),
+        )
     } else if app.info_loading {
         Span::styled(
             format!("{} checking accounts… ", icons.refresh()),
@@ -830,7 +856,7 @@ fn draw_footer(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
             Style::new().fg(FAINT),
         )
     };
-    let refresh = if app.flash.is_none() && !app.info_loading {
+    let refresh = if app.flash.is_none() && app.moving.is_none() && !app.info_loading {
         vec![
             Span::styled("r", Style::new().fg(MUTED).add_modifier(Modifier::BOLD)),
             Span::styled(" refresh  ", Style::new().fg(FAINT)),
@@ -866,6 +892,7 @@ fn draw_footer(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
         Section::Spaces => vec![
             ("⏎", "choose account", '\n'),
             ("x", "use active", 'x'),
+            ("d", "close space", 'd'),
             ("?", "all keys", '?'),
             ("q", "close", 'q'),
         ],
@@ -1059,18 +1086,49 @@ fn draw_confirm(frame: &mut Frame, app: &mut App, c: &crate::app::Confirm) {
     } else {
         (1, 3)
     };
+    // Taller than the pane: the text scrolls, with a line that says so.
+    let room = inner.height.saturating_sub(rest);
+    let lines = wrapped.len() as u16;
+    // The hint needs a line of its own and at least one line of text.
+    let hint = lines > room && room >= 2;
+    let visible = if hint { room - 1 } else { room };
+    let asked = format!("{}\n{}", c.question, c.lines.join("\n"));
+    if app.confirm_of != asked {
+        app.confirm_of = asked;
+        app.confirm_scroll = 0;
+    }
+    app.confirm_max = lines.saturating_sub(visible);
+    app.confirm_scroll = app.confirm_scroll.min(app.confirm_max);
     frame.render_widget(
-        Paragraph::new(Text::from(wrapped)),
-        Rect::new(
-            inner.x,
-            inner.y + top,
-            inner.width,
-            inner.height.saturating_sub(rest),
-        ),
+        Paragraph::new(Text::from(wrapped)).scroll((app.confirm_scroll, 0)),
+        Rect::new(inner.x, inner.y + top, inner.width, visible),
     );
+    if hint {
+        let left = app.confirm_max - app.confirm_scroll;
+        let hint = if left == 0 {
+            "↑ ↓ scroll · end".to_string()
+        } else {
+            format!("↑ ↓ scroll · {left} more lines")
+        };
+        frame.render_widget(
+            Paragraph::new(Span::styled(hint, Style::new().fg(FAINT))),
+            Rect::new(inner.x, inner.y + top + visible, inner.width, 1),
+        );
+    }
     let y = inner.y + inner.height.saturating_sub(1);
-    let yes = " y yes ";
-    let no = " n no ";
+    // The buttons name the keys that answer; on a narrow pane the short
+    // ones, so the no button shows whole.
+    let full_yes = if c.enter_says_yes() {
+        " ⏎ y yes "
+    } else {
+        " y yes "
+    };
+    let (yes, no) = if full_yes.width() + 1 + " Esc n no ".width() <= inner.width as usize {
+        (full_yes, " Esc n no ")
+    } else {
+        (" y yes ", " n no ")
+    };
+    let (yes_w, no_w) = (yes.width() as u16, no.width() as u16);
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(
@@ -1085,9 +1143,11 @@ fn draw_confirm(frame: &mut Frame, app: &mut App, c: &crate::app::Confirm) {
         ])),
         Rect::new(inner.x, y, inner.width, 1),
     );
-    app.hits.push((Rect::new(inner.x, y, 7, 1), Hit::Key('y')));
+    let right = inner.x + inner.width;
+    let clip = |x: u16, w: u16| Rect::new(x.min(right), y, w.min(right.saturating_sub(x)), 1);
+    app.hits.push((clip(inner.x, yes_w), Hit::Key('y')));
     app.hits
-        .push((Rect::new(inner.x + 8, y, 6, 1), Hit::Key('n')));
+        .push((clip(inner.x + yes_w + 1, no_w), Hit::Key('n')));
 }
 
 fn key_hint(key: &'static str, what: &'static str) -> [Span<'static>; 2] {
@@ -1264,7 +1324,7 @@ pub fn wrap(text: &str, width: usize) -> Vec<String> {
 }
 
 fn draw_help(frame: &mut Frame, app: &mut App) {
-    let groups: [(&str, &[(&str, &str)]); 4] = [
+    let groups: [(&str, &[(&str, &str)]); 5] = [
         (
             "Accounts",
             &[
@@ -1286,6 +1346,7 @@ fn draw_help(frame: &mut Frame, app: &mut App) {
             &[
                 ("⏎", "choose the account for the space"),
                 ("x", "back to the active account"),
+                ("d", "close the space with everything in it (asks first)"),
             ],
         ),
         (
@@ -1297,6 +1358,15 @@ fn draw_help(frame: &mut Frame, app: &mut App) {
                     "move it to another account, with its conversation (asks first)",
                 ),
                 ("d", "end the session: its pane closes (asks first)"),
+            ],
+        ),
+        (
+            "Questions",
+            &[
+                ("y", "yes"),
+                ("n  Esc", "no"),
+                ("⏎", "yes on the move question; nothing on the others"),
+                ("", "any other key leaves the question open"),
             ],
         ),
         (

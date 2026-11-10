@@ -373,8 +373,9 @@ no work in progress is cut off.
   note without a `wanted` account, so the reminder of an earlier fallback no
   longer fires. The list waits up to 20 s until Herdr sees Claude Code again;
   the launcher itself in front does not count, as it may still stop before
-  Claude Code starts (a missing key). Only `--resume <id>` is passed: options
-  the session was started with (such as `--model`) are not carried over.
+  Claude Code starts (a missing key). Its start options and current model
+  are carried over since #9 (see "A move keeps the start options and the
+  model").
 - **Which accounts.** Every account signed in with a login or key of its
   own, except the session's own and those with the same login. Sessions
   started without the plugin count as the main login. An account at its
@@ -387,4 +388,194 @@ no work in progress is cut off.
   and more against its limit. The question says so.
 - While a move runs (up to about half a minute), quitting the list, `d` and
   another `m` wait, since quitting halfway would leave the session ended.
+  (2026-11-10: replaced for quitting by "A move runs in a process of its
+  own"; `d` and another `m` still wait.)
 
+## 2026-11-10: A move keeps the start options and the model
+
+A session moved with `m` (#9) starts again with the options it was started
+with that are safe to give again, and on the model it ran on right before
+the move.
+
+- **Which options.** `carry.rs` reads `claude`'s arguments the way Claude
+  Code's parser (commander) does, from a table of every option in `claude
+  --help` (2.1.311) with the kind of value it takes: one value (also one
+  starting with `-`), an optional value (not one starting with `-`), lists
+  (`--add-dir a b`; `--add-dir=a b` takes only `a`), combined short flags
+  (`-cp`), options after the prompt, and `--`. Kept: `--model`,
+  `--permission-mode`, `--dangerously-skip-permissions`,
+  `--allow-dangerously-skip-permissions`, `--add-dir`, `--mcp-config`,
+  `--strict-mcp-config`, `--agent`, `--agents`, `--allowedTools`,
+  `--disallowedTools`, `--tools`, `--effort`, `--fallback-model`,
+  `--plugin-dir`, `--append-system-prompt`, `--system-prompt`, `--chrome`,
+  `--no-chrome`, `--ide`, `--verbose`, `--name`, and `--restricted`,
+  `--safe-mode` and `--disable-slash-commands`, because dropping those three
+  would let the moved session do more than before. Never: the prompt,
+  options that pick, fork or end a conversation or start it elsewhere
+  (`--continue`, `--resume`, `--session-id`, `--fork-session`, `--print` and
+  its options, `--from-pr`, `--teleport`, `--cloud`, `--desktop`, `--bg`,
+  `--worktree`, `--tmux`, `--remote-control`), options that can set or
+  force a credential and so undo the account switch (`--settings` can set
+  `apiKeyHelper`, `--setting-sources`, `--bare` reads only
+  `ANTHROPIC_API_KEY`), and anything not in the table (an option of a newer
+  Claude Code is dropped until the table knows it). Kept options are written
+  back as `--name=value`, one per value, so a value can never be read as an
+  option; folders (`--add-dir`, `--plugin-dir`, `--mcp-config` and `--agents`
+  files) are made absolute, so they point to the same place after the move.
+  The system prompt options are passed again, but Claude Code keeps the
+  system prompt it recorded for the conversation anyway
+  (`--system-prompt-snapshot`), so nothing is promised about them.
+- **Where they are kept.** The launcher stores the kept options and the
+  names of the dropped ones in its pane note, which is now readable only by
+  its owner (values such as `--mcp-config` JSON may hold tokens). They count
+  only while that note's process is the conversation's Claude Code. The
+  status line notes `model.id` with the conversation; model ids are checked
+  against letters, digits and `._:/@[]-`.
+- **How they get there.** Option values are never typed into the pane:
+  they would land in the shell's history, zsh reads a model id like
+  `…[1m]` as a pattern, and a multi-line value breaks the typed line.
+  Before the first Ctrl+C the list writes a one-time hand-over,
+  `moves/<pane>.json` (file 0600, folder 0700): the conversation id, the
+  options with the current model in place of a started `--model`, and the
+  time. It types `… run --moved -- --resume <id>`. The launcher uses the
+  hand-over only when its arguments are exactly `--resume <id>` of the same
+  conversation and the hand-over is under 2 minutes old, deletes it in every
+  case, filters it through the same table again (so a file put there by
+  something else cannot add other options), and records the options again
+  for the next move, with the names the first start dropped. Without a
+  usable hand-over it starts as before, says so in one line, and notes its
+  start options as not known, as it does when the list did not know them
+  either, so a later move never claims options it lost. The list deletes
+  the hand-over when the move stops before the command is typed; after that
+  the launcher may still read it, and every write or read of a hand-over
+  removes the ones older than 2 minutes, so none with option values stays
+  behind.
+- **The question.** It names the model and the carried options (values only
+  for short single words, so a long `--append-system-prompt` never stretches
+  it) and the dropped ones, or says the start options are not known.
+  `--resume` and `--continue` are not named as dropped: the move resumes the
+  conversation itself. If the model the question named changed before `y`,
+  nothing is moved; a model noted only after the question is used. A question
+  taller than the pane scrolls with ↑ ↓, as the keys overlay does. The way
+  by hand adds `--model '<id>'` and names the options to add.
+
+## 2026-11-10: Questions answer only to their keys, and a move is never silent
+
+On every question in the list, any key but `y` used to close it without a
+word, so `Enter` after picking the move's account cancelled the move
+silently (#10). Now `y` answers yes and `n` or `Esc` no; any other key
+leaves the question open. `Enter` answers yes only on the move question,
+because it follows the `Enter` that picked the account; on the questions
+that end a session, remove an account or change setup it does nothing, so a
+stray `Enter` never loses work (the owner's decision on #10). The buttons
+name these keys, and fall back to `y yes` / `n no` where the pane is too
+narrow for the longer ones. Keys held with Ctrl or Alt never answer. Ctrl+C
+over a dialog (a question, the move's account list) shows the quit bar, and
+staying brings the dialog back.
+
+A move says how it ended in every case: turning it back (`n`/`Esc` on the
+question, `Esc`/`q` in the account list) says "<session> was not moved" in
+the footer; a refusal after yes (Herdr not reachable, the session ended,
+got busy, holds another conversation, its model changed) opens the same
+dialog as a failed move, since the user just answered and waits for an
+outcome; refusals at `m` stay footer notes, as nothing was decided yet.
+While the move runs (up to about half a minute) the footer keeps "Moving
+<session> to <account>…" (a newer note covers it only for its 5 seconds),
+and the session's row in the Agents tab says "moving to <account>…".
+Closing the list while a move runs is #12.
+
+## 2026-11-10: A move runs in a process of its own
+
+A move ran on a thread of the list, so closing the list (the open-or-close
+action, Herdr's close key, closing its tab or space) stopped it halfway and
+could leave the session ended with no word (#12). Now the list writes the
+move to a note, `moving/<pane>.json` (owner-only: it holds the start option
+values from #9), and starts `herdr-multiaccount move <pane>`, which runs the
+same steps (`relocate::run_move`) and writes the result into the note.
+
+- **Its own session, not only its own process group.** Checked in a
+  throwaway Herdr 0.9.5 server with a stand-in process: after `herdr plugin
+  pane close` and after closing the workspace, children in the pane's
+  process group, in their own process group, and in their own group with
+  SIGHUP ignored all ended at once; only a child that called `setsid` kept
+  running. Rust's `CommandExt::setsid` is not stable yet, so `pre_exec`
+  calls the C `setsid` in one small `unsafe` block, the project's first;
+  a test checks the child leads a session of its own. The list keeps a
+  thread that waits for the child, so a killed move process is no zombie
+  that would look alive.
+- **Only the pane on the command line.** Other users can read command
+  lines, so the plan stays in the note; `move` takes the pane id only.
+- **Who tells.** Every list reads the notes (twice a second): a running
+  move shows as #10's moving state in any list, also one opened later or in
+  another tab, and `m` and `d` wait for it. A result is told once: whoever
+  removes the note tells it. The note names the list that started the move
+  (its pid); only that list takes the result while it runs, so a list in a
+  tab the user does not see never swallows it; once that list is gone, any
+  list may. A list takes a result only while no dialog of its own is open
+  and shows it at once, so a list that closes in between never holds one.
+  The move process leaves the result to a list for 3 s; then a success says
+  nothing (the owner's decision on #12) and a failure opens a popup
+  (entrypoint `moved`, reusing the reminder's dialog) that takes its text
+  from `<pane>.report`. If the popup cannot open or has not taken the text
+  within 10 s, a notification goes out instead; whoever removes the report
+  shows it, so never both. The text names the model and the option names to
+  add, never option values, so the notification's command line holds
+  nothing private.
+- **A move that stopped.** A note without result whose process is gone, or
+  that never noted its process within 30 s, or is older than 2 minutes (a
+  reused pid; a move takes about half a minute at most), is told as "The
+  move of X stopped before it finished" with the way to resume by hand. A
+  move process whose note was told that way writes no result.
+- **Known gaps, accepted.** Checking "a move runs" and writing the note are
+  two steps, so two lists answering yes in the same instant for different
+  sessions could start two moves; each still runs safely on its own pane.
+  The move process starts from the copy in `bin/` when there is one, since
+  on Linux the list's own file is gone after a rebuild.
+- **Quitting.** `q` / Ctrl+C then `y` close the list while a move runs (the
+  owner's decision on #12), since the move goes on.
+
+## 2026-11-10: Closing a space from the Spaces tab
+
+`d` in the Spaces tab closes a space after asking, with
+`herdr workspace close`: its tabs and panes close, and everything running in
+them stops. Only `d`: `Delete` and `Backspace` keep "back to the active
+account" there, and `Enter` does nothing on this question (the owner's
+decisions on #11 and #10). The question counts the space's Claude Code
+sessions as the "Sessions" column does (`App::sessions_in`) and warns when
+one of them is working or waiting for an answer. The checkout of a worktree
+space and its branch stay: closing a space only closes Herdr's state.
+
+- **Worktree groups.** Herdr refuses to close the main checkout of a
+  repository alone while worktree spaces of that repository are open; with
+  `--group` it closes all of them. The list reads each space's checkout from
+  `herdr workspace list` (`worktree.repo_key`, `is_linked_worktree`) and
+  works out the group by Herdr's own rule (`workspace_close_indices` at tag
+  `v0.9.0`), so the question names those spaces and counts their sessions
+  (the owner's decision on #11). Before closing, the list reads the spaces
+  again: a space that is gone is "had already closed", and a group that grew
+  since the question closes nothing, so `y` never takes a space it did not
+  name. `--group` is passed only when the fresh group has two or more
+  spaces. A space whose answer lacks `is_linked_worktree` counts as a
+  worktree, so it closes alone and never takes a group by mistake. The
+  panes are read again too: a Claude Code session that opened in those
+  spaces since the question, or one that started working without the
+  question warning about it, closes nothing ("changed since the question").
+- **The list's own space.** Closing it is allowed (the owner's decision on
+  #11); the question says that the list closes too. The list's pane is
+  `HERDR_PANE_ID`, kept in `App::own_pane`, which `is_session` uses as well.
+- **Forgetting the account choice first.** A closed space's account choice
+  is removed from `accounts.json`, as `x` does: after a Herdr restart the
+  startup hook would otherwise hand it to a new space with the same name
+  (see "Spaces by id"). It is removed before the close, because Herdr ends
+  the list itself when the list's space closes, and put back when Herdr
+  refuses, only for the spaces still open and still without a choice (one
+  another list made meanwhile wins). The choices are taken from the
+  file under its lock, not from what the list read earlier, so a choice
+  another list made meanwhile goes too.
+- **Tests.** The space reader, the closer and the write of `accounts.json`
+  (`App::store_update`) are fields, so tests reach neither Herdr nor the
+  real config directory.
+
+`herdr workspace close [--group]` and the `worktree` field are in Herdr
+0.9.0 (`src/cli/workspace.rs` and `src/api/schema/workspaces.rs` at tag
+`v0.9.0`), so `min_herdr_version` stays 0.9.0.

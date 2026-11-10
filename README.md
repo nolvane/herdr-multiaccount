@@ -37,6 +37,11 @@ to the next account when one is at its limit.
   subscription's limits every minute, also for accounts no session uses.
 - **Spaces.** In the Spaces tab, `⏎` on a space picks its account. New
   sessions in that space use it; the sidebar shows it next to the space.
+  `d` closes a space after asking, with its tabs and everything running in
+  them; the question says how many Claude Code sessions run in it and warns
+  when one of them is working or waiting for you. The main checkout of a
+  repository closes together with its open worktree spaces, which the
+  question names; worktree checkouts and branches stay on disk.
 - **Fallback.** When the account a session would get is used at least 95 %
   (in any window), the session goes to the next account in the list that has
   room. You get one Herdr notification when that starts. Once the full
@@ -62,11 +67,41 @@ to the next account when one is at its limit.
   one at its limit hands over to the next account with room, as at any
   start, and the question says where the session goes. The first answer
   afterwards is slower and counts more against the new account's limit,
-  because Claude Code's cache of the conversation stays with the old login;
-  text typed but not sent is lost, and options it was started with (such as
-  `--model`) are not carried over. A session that is working or waiting for
+  because Claude Code's cache of the conversation stays with the old login,
+  and text typed but not sent is lost. The session keeps the model it runs
+  on right before the move (also one picked with `/model`) and the options
+  it was started with that are safe to give again: `--model`,
+  `--permission-mode`, `--dangerously-skip-permissions`,
+  `--allow-dangerously-skip-permissions`, `--add-dir`, `--mcp-config`,
+  `--strict-mcp-config`, `--agent`, `--agents`, `--allowedTools`,
+  `--disallowedTools`, `--tools`, `--effort`, `--fallback-model`,
+  `--plugin-dir`, `--append-system-prompt`, `--system-prompt`, `--chrome`,
+  `--no-chrome`, `--ide`, `--verbose`, `--name`, `--restricted`,
+  `--safe-mode` and `--disable-slash-commands`. The prompt it was started
+  with is never sent again, and options that pick, fork or end a
+  conversation or start it elsewhere (`--continue`, `--resume`,
+  `--session-id`, `--fork-session`, `--print`, `--worktree`, `--bg` and the
+  like) or could replace the account's login (`--settings`,
+  `--setting-sources`, `--bare`) are never given again; the question names
+  what carries over and what does not. Sessions started before this version
+  or without the plugin's `claude` function keep only their model, when
+  their status line has noted it. A session that is working or waiting for
   an answer is not moved. Sessions started without the plugin count as the
   main login.
+  While a move runs, the footer and the session's row say so; then the list
+  says it was moved, or why not (with the way by hand when it failed
+  halfway). The move runs in a process of its own, so closing the list (with
+  `q`, the open-or-close action or Herdr) does not stop it: a list opened
+  later shows it, and when no list is open a failure opens a Herdr popup
+  (a notification when the popup cannot open) with the way to resume the
+  conversation by hand; a move that worked says nothing more. Turning the
+  move back (`n` or `Esc` on the question, `Esc` or `q` in the account
+  list) says the session was not moved.
+- **Questions.** `y` answers yes, `n` or `Esc` no, and any other key leaves
+  the question open. `⏎` answers yes only on the move question, which
+  follows the `⏎` that picked the account; on the questions that end a
+  session, remove an account or set up, it does nothing, so a stray `⏎`
+  never loses work.
 - **Pane labels.** Each Claude Code pane carries the account it runs on, for
   the sidebar (see "Install").
 - **A note on first open.** The list explains the main login, the active
@@ -204,19 +239,19 @@ terminal.
 | `a` | Add an account: subscription, subscription with SSO, or API key |
 | `l` | Sign in again, or store the key again |
 | `n` | Rename (the login stays) |
-| `d` | Remove: signs it out or deletes its key and deletes its folder of links; anything made only in that folder goes to `backups/` (asks first). Agents: end the session; its pane closes (asks first) |
+| `d` | Remove: signs it out or deletes its key and deletes its folder of links; anything made only in that folder goes to `backups/` (asks first). Spaces: close the space with everything in it (asks first). Agents: end the session; its pane closes (asks first) |
 | `m` | Agents: move the session to another account, with its conversation (asks first) |
 | `c` | Start Claude Code with this account in a new tab |
 | `f` | Take part in fallback, or not |
 | `K` `J`, `Shift+↑` `Shift+↓` | Move the account up or down; fallback goes down the list |
-| `x` | Spaces: back to the active account |
+| `x` `Delete` `Backspace` | Spaces: back to the active account |
 | `F` | Fallback on or off |
 | `S` | Set up the `claude` function and the status line |
 | `←` `→` `Tab` `1` `2` `3` | Accounts, spaces or agents |
 | `r` | Refresh now (sign-in state is checked every 10 minutes) |
 | `i` | Nerd Font icons or plain symbols |
 | `?` | All keys and how the list works (scrolls with `↑` `↓` when the window is low) |
-| `q` | Close the list (asks first); `Esc` only closes dialogs |
+| `q` | Close the list (asks first; a move that runs goes on); `Esc` only closes dialogs |
 
 ## Command line
 
@@ -261,6 +296,7 @@ Everything lives in the plugin's config directory
 | `backups/` | Files replaced by setup or when a link was restored; only you can open it, and each copy keeps the original's permissions |
 | `probe/` | Where the limit checks run (empty) |
 | `sessions/<pane>.json` | The account of each session started through the plugin, removed when it ends |
+| `moving/<pane>.json` | A move that runs, with its result until a list or popup has shown it; only you can read it |
 | `conversations/<pane>.json` | Which conversation each Claude Code pane holds, from its status line; dropped after a week |
 
 ## Development

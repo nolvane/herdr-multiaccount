@@ -11,14 +11,35 @@ All notable changes to this project are documented here. The format follows
   closes and the row goes. The question warns when the session is working
   or waiting for an answer, and nothing is closed when the pane ended or
   runs something else by then.
+- `d` in the Spaces tab closes a space after asking, with its tabs and
+  everything running in them. The question counts its Claude Code sessions,
+  warns when one is working or waiting for an answer, names the worktree
+  spaces that close with a repository's main checkout, and says when the
+  list closes too. The space's account choice is forgotten.
 
 ### Changed
 
+- A session moved with `m` keeps the model it ran on and the options it was
+  started with that are safe to give again (such as `--permission-mode`,
+  `--add-dir` and `--dangerously-skip-permissions`); the prompt and options
+  that pick a conversation or could replace the login are never given
+  again. The question names what carries over, and scrolls when it is
+  taller than the pane.
 - The Sessions tab is called Agents, the word Herdr's sidebar uses.
 
 ### Fixed
 
+- Closing the list while a session is being moved no longer stops the move
+  halfway and leaves the session ended without a word: the move runs in a
+  process of its own and finishes; a failure shows in the next list, or as
+  a Herdr popup (or notification) when no list is open. `q` now closes the
+  list during a move.
 - Questions wrap to narrow panes instead of being cut off at the edge.
+- Moving a session never ends without a word: `⏎` on the move question
+  moves it, turning it back says it was not moved, a refusal after yes
+  opens a dialog with the reason, and the footer and the session's row show
+  the move until it is done. On every question only `y`, `n` and `Esc`
+  answer (and `⏎` on the move question); other keys leave it open.
 - `o` in the sign-in dialog says when the browser opener could not be
   started, and opened links no longer leave an ended opener process behind
   while the list is open.
