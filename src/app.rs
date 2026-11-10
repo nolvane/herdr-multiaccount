@@ -282,8 +282,8 @@ pub struct App {
     pub confirm_scroll: u16,
     pub confirm_max: u16,
     pub confirm_of: String,
-    /// The question the quit bar (Ctrl+C) was asked over, back on "stay".
-    quit_over: Option<Confirm>,
+    /// The dialog the quit bar (Ctrl+C) was asked over, back on "stay".
+    quit_over: Option<Mode>,
     pub flash: Option<(String, Color, Instant)>,
     pub setup: setup::State,
     pub signin: Option<SignIn>,
@@ -863,8 +863,9 @@ impl App {
         let Some(now) = (self.pane_list)() else {
             self.move_refused(
                 &label,
-                "Herdr could not be asked whether it still waits for you. Try again in a moment."
-                    .into(),
+                format!(
+                    "Herdr could not be asked whether {label} is still there and waits for you. Try again in a moment."
+                ),
             );
             return;
         };
@@ -1767,20 +1768,17 @@ impl App {
         }
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         if ctrl && k.code == KeyCode::Char('c') {
-            if let Mode::Confirm(c) = &self.mode {
-                self.quit_over = Some(c.clone());
+            if self.mode != Mode::AskQuit {
+                self.quit_over = (self.mode != Mode::Normal).then(|| self.mode.clone());
             }
             self.mode = Mode::AskQuit;
             return;
         }
         match self.mode.clone() {
             Mode::AskQuit => {
-                // Staying goes back to the question it was asked over.
-                self.mode = self
-                    .quit_over
-                    .take()
-                    .map(Mode::Confirm)
-                    .unwrap_or(Mode::Normal);
+                // Staying goes back to the dialog it was asked over, so a
+                // question or a move's account list never vanishes unsaid.
+                self.mode = self.quit_over.take().unwrap_or(Mode::Normal);
                 if k.code == KeyCode::Char('y') {
                     // Quitting halfway would leave the session ended.
                     if let Some(m) = self.moving.clone() {
@@ -1809,6 +1807,10 @@ impl App {
             // move question, which follows the Enter that picked the
             // account (the owner's decision on #10). Any other key leaves
             // the question open: a stray key never answers.
+            // Ctrl+Y, Alt+N and the like are other keys too.
+            Mode::Confirm(_)
+                if k.modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => {}
             Mode::Confirm(c) => match k.code {
                 KeyCode::Up | KeyCode::Char('k') => self.scroll_confirm(-1, c),
                 KeyCode::Down | KeyCode::Char('j') => self.scroll_confirm(1, c),
@@ -1924,7 +1926,10 @@ impl App {
     fn normal_key(&mut self, k: KeyEvent) {
         let shift = k.modifiers.contains(KeyModifiers::SHIFT);
         match k.code {
-            KeyCode::Char('q') => self.mode = Mode::AskQuit,
+            KeyCode::Char('q') => {
+                self.quit_over = None;
+                self.mode = Mode::AskQuit
+            }
             KeyCode::Esc => {}
             KeyCode::Char('?') => {
                 self.help_scroll = 0;
@@ -3521,6 +3526,40 @@ mod tests {
         assert_eq!(confirm(&a), before);
         press(&mut a, KeyCode::Char('y'));
         assert!(a.moving.is_some(), "the question still answers");
+        // The move's account list comes back too.
+        let mut a = movable();
+        press(&mut a, KeyCode::Char('m'));
+        let before = picker(&a);
+        a.key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        press(&mut a, KeyCode::Char('n'));
+        assert_eq!(picker(&a), before);
+        // q from the list itself stays in the list.
+        let mut a = movable();
+        a.key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        press(&mut a, KeyCode::Char('n'));
+        press(&mut a, KeyCode::Char('m'));
+        press(&mut a, KeyCode::Esc);
+        press(&mut a, KeyCode::Char('q'));
+        press(&mut a, KeyCode::Char('n'));
+        assert_eq!(a.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn keys_with_ctrl_or_alt_never_answer() {
+        for mods in [KeyModifiers::CONTROL, KeyModifiers::ALT] {
+            for code in [KeyCode::Char('y'), KeyCode::Char('n'), KeyCode::Enter] {
+                let mut a = asked_to_move();
+                let before = confirm(&a);
+                a.key(KeyEvent::new(code, mods));
+                assert_eq!(confirm(&a), before, "{mods:?} {code:?}");
+                assert!(a.moving.is_none());
+                let mut a = agents();
+                press(&mut a, KeyCode::Char('d'));
+                a.key(KeyEvent::new(code, mods));
+                confirm(&a);
+                assert!(closed().is_empty(), "{mods:?} {code:?}");
+            }
+        }
     }
 
     #[test]
@@ -3762,6 +3801,20 @@ mod tests {
         assert!(rows[39].contains("moved w91:p1"), "{}", rows[39]);
         let screen = rows.join("\n");
         assert!(!screen.contains("oving to Work…"), "{screen}");
+    }
+
+    #[test]
+    fn a_long_session_name_leaves_the_footer_its_keys() {
+        let mut a = movable();
+        a.moving = Some(MoveRun {
+            pane: "w91:p1".into(),
+            label: "Refactor the whole billing module and write the migration notes".into(),
+            to: "Work".into(),
+        });
+        let rows = screen_of(&mut a, 100, 30);
+        assert!(rows[29].contains("m move"), "{}", rows[29]);
+        assert!(rows[29].contains("Moving Refactor"), "{}", rows[29]);
+        assert!(rows[29].contains("… to Work…"), "{}", rows[29]);
     }
 
     #[test]

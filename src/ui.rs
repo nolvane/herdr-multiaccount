@@ -630,6 +630,22 @@ fn draw_spaces(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
 // ---- sessions --------------------------------------------------------
 
 /// What an agent status looks like: colour and word.
+/// `text` cut to `width` columns, with "…" where it was cut.
+fn shorten(text: &str, width: usize) -> String {
+    if text.width() <= width {
+        return text.to_string();
+    }
+    let mut out = String::new();
+    for c in text.chars() {
+        if out.width() + c.to_string().width() + 1 > width {
+            break;
+        }
+        out.push(c);
+    }
+    out.push('…');
+    out
+}
+
 fn agent_status(status: Option<&str>) -> (ratatui::style::Color, &'static str) {
     match status {
         Some("working") => (GREEN, "working"),
@@ -817,9 +833,12 @@ fn draw_footer(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
     let right = if let Some((text, color, _)) = &app.flash {
         Span::styled(format!("{text} "), Style::new().fg(*color))
     } else if let Some(m) = &app.moving {
-        // For the whole move, not only a flash's 5 seconds.
+        // For the whole move, not only a flash's 5 seconds; a long session
+        // name is cut so the keys keep a third of the footer.
+        let rest = format!(" to {}… ", m.to);
+        let room = (area.width as usize * 2 / 3).saturating_sub("Moving ".len() + rest.width());
         Span::styled(
-            format!("Moving {} to {}… ", m.label, m.to),
+            format!("Moving {}{rest}", shorten(&m.label, room.max(8))),
             Style::new().fg(ACCENT),
         )
     } else if app.info_loading {
