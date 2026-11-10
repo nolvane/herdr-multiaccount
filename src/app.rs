@@ -1359,7 +1359,9 @@ impl App {
                 }
                 KeyCode::Char('o') if code.is_empty() => {
                     if let Some(url) = self.signin.as_ref().and_then(|s| s.url.clone()) {
-                        (self.opener)(OPENER, &url);
+                        if !(self.opener)(OPENER, &url) {
+                            self.flash(format!("Could not run {OPENER}"), crate::theme::RED);
+                        }
                     }
                 }
                 KeyCode::Char('y') if code.is_empty() => {
@@ -1611,15 +1613,25 @@ impl App {
     }
 }
 
-/// Starts `opener` (`open`, `xdg-open`) on `url`.
+/// Starts `opener` (`open`, `xdg-open`) on `url`. It is waited on in the
+/// background, so it leaves no ended process behind and the list never waits
+/// for an opener that keeps running.
 pub fn open_in_browser(opener: &str, url: &str) -> bool {
-    std::process::Command::new(opener)
+    let started = std::process::Command::new(opener)
         .arg(url)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .spawn()
-        .is_ok()
+        .spawn();
+    match started {
+        Ok(mut child) => {
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+            true
+        }
+        Err(_) => false,
+    }
 }
 
 /// Puts text on the clipboard (macOS, or Wayland / X11 tools when there).
@@ -2082,5 +2094,90 @@ mod tests {
                 "https://example.com/sign-in".to_string()
             )]
         );
+        assert!(a.flash.is_none(), "a started opener shows no message");
+        assert_eq!(
+            a.mode,
+            Mode::SignIn {
+                code: String::new()
+            }
+        );
+    }
+
+    #[test]
+    fn a_sign_in_link_that_cannot_open_is_named_and_the_dialog_goes_on() {
+        let mut a = app();
+        a.opener = cannot_open;
+        a.signin = Some(SignIn::showing("https://example.com/sign-in"));
+        a.mode = Mode::SignIn {
+            code: String::new(),
+        };
+        a.key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE));
+        assert_eq!(opened().len(), 1);
+        let opener = if cfg!(target_os = "macos") {
+            "open"
+        } else {
+            "xdg-open"
+        };
+        let flash = a.flash.as_ref().map(|f| (f.0.clone(), f.1));
+        assert_eq!(
+            flash,
+            Some((format!("Could not run {opener}"), crate::theme::RED))
+        );
+        // The dialog stays and still takes a code, sends it and cancels.
+        for c in "abc".chars() {
+            a.key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        assert_eq!(a.mode, Mode::SignIn { code: "abc".into() });
+        a.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(a.signin.as_ref().unwrap().code_sent, "the code was sent");
+        assert_eq!(
+            a.mode,
+            Mode::SignIn {
+                code: String::new()
+            }
+        );
+        a.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(a.signin.as_ref().unwrap().finished, Some(false));
+    }
+
+    /// The test process's children that have ended but were not waited on.
+    fn ended_children() -> usize {
+        let me = std::process::id().to_string();
+        let out = std::process::Command::new("ps")
+            .args(["-A", "-o", "pid=,ppid=,stat="])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter(|l| {
+                let f: Vec<&str> = l.split_whitespace().collect();
+                f.len() == 3 && f[1] == me && f[2].starts_with('Z')
+            })
+            .count()
+    }
+
+    #[test]
+    fn opened_links_leave_no_ended_opener_behind() {
+        for _ in 0..5 {
+            assert!(open_in_browser("true", "https://example.com"));
+        }
+        let until = Instant::now() + Duration::from_secs(5);
+        let mut left = ended_children();
+        while left > 0 && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(50));
+            left = ended_children();
+        }
+        assert_eq!(left, 0, "ended openers are waited on");
+    }
+
+    #[test]
+    fn opening_a_link_does_not_wait_for_the_opener() {
+        let start = Instant::now();
+        assert!(open_in_browser("sleep", "5"));
+        assert!(start.elapsed() < Duration::from_secs(1));
+        assert!(!open_in_browser(
+            "/nonexistent/opener",
+            "https://example.com"
+        ));
     }
 }

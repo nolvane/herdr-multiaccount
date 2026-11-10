@@ -5,6 +5,12 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- `o` in the sign-in dialog says when the browser opener could not be
+  started, and opened links no longer leave an ended opener process behind
+  while the list is open.
+
 ## [1.0.0] - 2026-11-09
 
 ### Added
