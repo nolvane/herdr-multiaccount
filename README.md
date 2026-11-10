@@ -301,6 +301,7 @@ Everything lives in the plugin's config directory
 | `usage/<account>.json` | Last usage reading and this month's sessions per account |
 | `homes/<account>/.claude/` | A subscription's Claude Code folder (links to `~/.claude`) |
 | `homes/<account>/` | Holds that folder; for an account from version 1.0.0 also its old folder, used until it signs in again |
+| `homes/<account>.new` | Notes that the account signed in in its new folder and never goes back to the old one |
 | `bin/herdr-multiaccount` | The copy the shell function and status line run |
 | `backups/` | Files replaced by setup or when a link was restored; only you can open it, and each copy keeps the original's permissions |
 | `probe/` | Where the limit checks run (empty) |

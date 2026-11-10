@@ -33,21 +33,38 @@ pub fn new_dir_of(id: &str) -> PathBuf {
 /// account into the folder's config. (Whether the login still works takes a
 /// second: `claude auth status`.)
 pub fn has_login(dir: &Path) -> bool {
-    std::fs::read_to_string(dir.join(".claude.json"))
-        .ok()
-        .and_then(|t| serde_json::from_str::<Value>(&t).ok())
-        .is_some_and(|v| v["oauthAccount"].is_object())
+    read_json(&dir.join(".claude.json")).is_some_and(|v| v["oauthAccount"].is_object())
+}
+
+/// The note that an account signed in in its new folder, `homes/<id>.new`:
+/// from then on it never goes back to its old folder, also when the new
+/// folder is signed out or its config is being rewritten.
+fn moved_file(home: &Path) -> PathBuf {
+    home.with_extension("new")
+}
+
+/// Notes that the account in `home` signed in in its new folder.
+pub fn mark_moved(home: &Path) {
+    if home.is_dir() {
+        let _ = std::fs::write(moved_file(home), "");
+    }
 }
 
 /// The folder sessions of the account in `home` run on: the new folder once
-/// it has a login; the old folder while only that one has a login (an
-/// account from version 1.0.0 that has not signed in again); otherwise the new
-/// folder, where every sign-in happens.
+/// it had a login; the old folder while only that one has a login (an
+/// account from version 1.0.0 that has not signed in again); otherwise the
+/// new folder, where every sign-in happens.
 pub fn folder_in(home: &Path) -> PathBuf {
     let new = home.join(NEW);
+    if moved_file(home).exists() {
+        return new;
+    }
     // An old link of that name leads into `~/.claude`: no login of its own.
-    let new_login = real_new_dir(home).is_some_and(|d| has_login(&d));
-    if !new_login && has_login(home) {
+    if real_new_dir(home).is_some_and(|d| has_login(&d)) {
+        mark_moved(home);
+        return new;
+    }
+    if has_login(home) {
         home.to_path_buf()
     } else {
         new
@@ -421,7 +438,7 @@ fn data_in(dir: &Path, prefix: &str) -> Vec<String> {
         .flatten()
         .filter(|e| e.file_type().is_ok_and(|t| !t.is_symlink()))
         .map(|e| e.file_name().to_string_lossy().to_string())
-        .filter(|n| !is_own(n) && n != NEW)
+        .filter(|n| !is_own(n) && !(prefix.is_empty() && n == NEW))
         .map(|n| format!("{prefix}{n}"))
         .collect()
 }
@@ -456,8 +473,6 @@ fn clear(dir: &Path, keep: &Path, prefix: &str) -> std::io::Result<Vec<String>> 
         let m = std::fs::symlink_metadata(&path)?;
         if m.file_type().is_symlink() {
             std::fs::remove_file(&path)?;
-        } else if name == NEW && m.is_dir() && prefix.is_empty() {
-            continue;
         } else if is_own(&name) {
             if m.is_dir() {
                 // Does not follow links inside it either.
@@ -501,6 +516,7 @@ fn remove_in(home: &Path, backups: &Path, id: &str) -> std::io::Result<Vec<Strin
     kept.extend(clear(home, &keep, "")?);
     std::fs::remove_dir(home)?;
     let _ = std::fs::remove_file(lock_file(home));
+    let _ = std::fs::remove_file(moved_file(home));
     Ok(kept)
 }
 
@@ -747,6 +763,11 @@ mod tests {
         std::fs::write(new.join(".claude.json"), SIGNED_IN).unwrap();
         assert_eq!(folder_in(&home), new);
         assert!(new.ends_with(".claude"), "the path names .claude");
+        // Signed out there later, or its config half written: it never goes
+        // back to the old login.
+        std::fs::write(new.join(".claude.json"), "{\"oauthAcc").unwrap();
+        assert_eq!(folder_in(&home), new);
+        std::fs::remove_file(moved_file(&home)).unwrap();
         // An old link of that name never counts as the account's login.
         let elsewhere = home.parent().unwrap().join("elsewhere");
         std::fs::create_dir_all(&elsewhere).unwrap();
@@ -890,6 +911,8 @@ mod tests {
         std::fs::write(new.join("plans").join("a.md"), "mine").unwrap();
         std::fs::create_dir_all(home.join("notes")).unwrap();
         std::fs::write(lock_file(&home), "").unwrap();
+        mark_moved(&home);
+        assert!(moved_file(&home).exists());
         let before = snapshot(&main);
         let mut data = own_data_in(&home);
         data.sort();
@@ -904,6 +927,7 @@ mod tests {
             "both folders are gone"
         );
         assert!(!lock_file(&home).exists());
+        assert!(!moved_file(&home).exists());
         assert_eq!(snapshot(&main), before, "nothing in ~/.claude changed");
         let saved = snapshot(&backups);
         assert!(

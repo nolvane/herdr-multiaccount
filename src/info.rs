@@ -177,6 +177,15 @@ pub fn read(account: &Account) -> Info {
         },
         Kind::Main | Kind::Subscription => {
             let home = (account.kind == Kind::Subscription).then(|| mirror::folder(&account.id));
+            // A new folder that is not there yet (or only an old link of
+            // that name) has no login: Claude Code is not asked about it.
+            if let Some(h) = &home {
+                if *h != mirror::home_of(&account.id)
+                    && mirror::real_new_dir(&mirror::home_of(&account.id)).is_none()
+                {
+                    return Info::default();
+                }
+            }
             let json = match &home {
                 Some(h) => h.join(".claude.json"),
                 None => paths::main_claude_json(),

@@ -283,15 +283,6 @@ fn status_line(app: &App, a: &Account) -> Line<'static> {
             spans.push(Span::styled(text, Style::new().fg(RED)));
             return Line::from(spans);
         }
-        // Signed in on the folder an older version made: Claude asks before
-        // every edit in ~/.claude until it signs in again in its new folder.
-        Some(i) if i.old_folder => {
-            spans.push(Span::styled(
-                OLD_FOLDER_NOTICE.to_string(),
-                Style::new().fg(YELLOW),
-            ));
-            return Line::from(spans);
-        }
         _ => {}
     }
     // Two entries with one login share one set of limits: say so, so the
@@ -316,6 +307,15 @@ fn status_line(app: &App, a: &Account) -> Line<'static> {
             format!("at its {} limit", l.window)
         };
         spans.push(Span::styled(text, Style::new().fg(YELLOW)));
+        return Line::from(spans);
+    }
+    // Signed in on the folder an older version made: Claude asks before
+    // every edit in ~/.claude until it signs in again in its new folder.
+    if info.is_some_and(|i| i.old_folder) {
+        spans.push(Span::styled(
+            OLD_FOLDER_NOTICE.to_string(),
+            Style::new().fg(YELLOW),
+        ));
         return Line::from(spans);
     }
     let mut parts: Vec<String> = Vec::new();

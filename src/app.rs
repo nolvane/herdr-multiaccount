@@ -1688,6 +1688,8 @@ impl App {
         let was_old = self.info.get(&s.id).is_some_and(|i| i.old_folder);
         let info = account.as_ref().map(info::read).unwrap_or_default();
         if ok && info.signed_in && !info.borrows_main {
+            // From now on the account stays on its new folder.
+            mirror::mark_moved(&mirror::home_of(&s.id));
             let who = info
                 .email
                 .clone()
@@ -2803,6 +2805,14 @@ mod tests {
         for (w, h) in [(100, 30), (60, 20)] {
             let mut a = app();
             a.mode = sign_out_failed(&[mirror::new_dir_of("ultra"), mirror::home_of("ultra")]);
+            // One command per folder still signed in.
+            let Mode::Message { lines, .. } = &a.mode else {
+                panic!("no message")
+            };
+            let commands: Vec<&String> =
+                lines.iter().filter(|l| l.contains("auth logout")).collect();
+            assert_eq!(commands.len(), 2);
+            assert!(commands[0].contains("ultra/.claude\""), "{}", commands[0]);
             let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
             t.draw(|f| ui::draw(f, &mut a)).unwrap();
             let buf = t.backend().buffer();
@@ -2815,11 +2825,6 @@ mod tests {
             let screen = rows.join("");
             assert!(screen.contains("Sign-out did not work"), "{screen}");
             assert!(screen.contains("auth logout"), "{screen}");
-            if w == 100 {
-                // One command per folder still signed in.
-                assert_eq!(screen.matches("auth logout").count(), 2, "{screen}");
-                assert!(screen.contains("ultra/.claude"), "{screen}");
-            }
         }
     }
 
@@ -2889,6 +2894,30 @@ mod tests {
             let screen = rows.join("\n");
             assert!(screen.contains("Team"), "Work shows its plan: {screen}");
         }
+    }
+
+    #[test]
+    fn a_limit_still_shows_on_an_account_on_its_old_folder() {
+        let mut a = app();
+        a.info.insert(
+            "personal".into(),
+            Info {
+                old_folder: true,
+                ..signed_in("Pro")
+            },
+        );
+        let now = a.now();
+        a.usage.insert("personal".into(), full_at(97.0, now));
+        let mut t = Terminal::new(TestBackend::new(160, 30)).unwrap();
+        t.draw(|f| ui::draw(f, &mut a)).unwrap();
+        let screen: String = t
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(screen.contains("at its 5-hour limit"), "{screen}");
     }
 
     #[test]

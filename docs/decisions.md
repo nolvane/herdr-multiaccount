@@ -609,7 +609,10 @@ when that holds one, else the new one (every sign-in goes there). The list
 row and each session started on the old folder say to press `l`. The new
 folder's `.claude.json` starts with the shared parts of the old one (MCP
 servers, per-project settings), never its account fields. Both folders share
-the lock `homes/<id>.lock`.
+the lock `homes/<id>.lock`. Once the new folder had a login (a sign-in in the
+list, or its config seen with one), the note `homes/<id>.new` keeps the
+account on it for good, so signing out there, or a config file caught
+halfway through a write, never sends sessions back to the old login.
 
 The old folder is not signed out or cleared automatically after the new
 sign-in: a session an older version started outside Herdr cannot be seen,
