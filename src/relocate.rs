@@ -50,7 +50,7 @@ pub trait Io {
     fn agent(&self, pane: &str) -> Option<String>;
     fn sleep(&self, d: Duration);
     /// Writes the hand-over for the launcher (`sessions::write_hand_over`).
-    fn hand_over(&self, pane: &str, session_id: &str, args: &[String]) -> bool;
+    fn hand_over(&self, pane: &str, session_id: &str, carry: &Moved) -> bool;
     fn drop_hand_over(&self, pane: &str);
 }
 
@@ -75,8 +75,8 @@ impl Io for Herdr {
     fn sleep(&self, d: Duration) {
         std::thread::sleep(d);
     }
-    fn hand_over(&self, pane: &str, session_id: &str, args: &[String]) -> bool {
-        crate::sessions::write_hand_over(pane, session_id, args)
+    fn hand_over(&self, pane: &str, session_id: &str, carry: &Moved) -> bool {
+        crate::sessions::write_hand_over(pane, session_id, &carry.args(), &carry.dropped)
     }
     fn drop_hand_over(&self, pane: &str) {
         crate::sessions::drop_hand_over(pane);
@@ -226,7 +226,7 @@ pub fn run_move(io: &dyn Io, plan: &Plan, bin: &str) -> Result<String, String> {
         .map_err(|e| format!("Nothing was changed: {e}. By hand: {by_hand}."))?;
     // Written before anything happens to the session, so a failure here
     // changes nothing.
-    if moved && !io.hand_over(&plan.pane, &plan.session_id, &plan.carry.args()) {
+    if moved && !io.hand_over(&plan.pane, &plan.session_id, &plan.carry) {
         return Err(format!(
             "Nothing was changed: its start options could not be saved for the move. By hand: {by_hand}."
         ));
@@ -410,10 +410,10 @@ mod tests {
         fn sleep(&self, d: Duration) {
             *self.slept.borrow_mut() += d;
         }
-        fn hand_over(&self, _: &str, session_id: &str, args: &[String]) -> bool {
+        fn hand_over(&self, _: &str, session_id: &str, carry: &Moved) -> bool {
             assert_eq!(*self.presses.borrow(), 0, "written before any Ctrl+C");
             self.log.borrow_mut().push("hand over".into());
-            *self.handed.borrow_mut() = Some((session_id.to_string(), args.to_vec()));
+            *self.handed.borrow_mut() = Some((session_id.to_string(), carry.args()));
             !self.no_hand_over
         }
         fn drop_hand_over(&self, _: &str) {

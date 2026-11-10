@@ -281,8 +281,24 @@ fn moves_dir() -> PathBuf {
 /// writing it.
 const HAND_OVER_FOR: i64 = 120;
 
-pub fn write_hand_over(pane: &str, session_id: &str, args: &[String]) -> bool {
-    write_hand_over_in(&moves_dir(), pane, session_id, args, crate::time::now())
+/// What the launcher gets from a hand-over: its arguments for Claude Code,
+/// and the names of the start options a move did not carry (so the next
+/// move names them again).
+#[derive(Debug, Clone, PartialEq)]
+pub struct HandedOver {
+    pub args: Vec<String>,
+    pub dropped: Vec<String>,
+}
+
+pub fn write_hand_over(pane: &str, session_id: &str, args: &[String], dropped: &[String]) -> bool {
+    write_hand_over_in(
+        &moves_dir(),
+        pane,
+        session_id,
+        args,
+        dropped,
+        crate::time::now(),
+    )
 }
 
 fn write_hand_over_in(
@@ -290,12 +306,13 @@ fn write_hand_over_in(
     pane: &str,
     session_id: &str,
     args: &[String],
+    dropped: &[String],
     now: i64,
 ) -> bool {
     if paths::private_dir(dir).is_err() {
         return false;
     }
-    let v = json!({"session_id": session_id, "args": args, "at": now});
+    let v = json!({"session_id": session_id, "args": args, "dropped": dropped, "at": now});
     paths::write_private(&conversation_file(dir, pane), format!("{v}\n").as_bytes()).is_ok()
 }
 
@@ -307,7 +324,7 @@ pub fn drop_hand_over(pane: &str) {
 /// then `args`, which must be exactly `--resume <id>` of the same
 /// conversation. The hand-over is removed in every case, and its options go
 /// through the list of carried options again. Err says why it was not used.
-pub fn take_hand_over(pane: &str, args: &[String]) -> Result<Vec<String>, &'static str> {
+pub fn take_hand_over(pane: &str, args: &[String]) -> Result<HandedOver, &'static str> {
     take_hand_over_in(&moves_dir(), pane, args, crate::time::now())
 }
 
@@ -316,7 +333,7 @@ fn take_hand_over_in(
     pane: &str,
     args: &[String],
     now: i64,
-) -> Result<Vec<String>, &'static str> {
+) -> Result<HandedOver, &'static str> {
     let path = conversation_file(dir, pane);
     let text = std::fs::read_to_string(&path).map_err(|_| "there was none");
     let _ = std::fs::remove_file(&path);
@@ -334,7 +351,10 @@ fn take_hand_over_in(
     let wanted = strings(&v["args"]).ok_or("it was unreadable")?;
     let mut out = crate::carry::carried(&wanted, None).options;
     out.extend(args.iter().cloned());
-    Ok(out)
+    Ok(HandedOver {
+        args: out,
+        dropped: strings(&v["dropped"]).unwrap_or_default(),
+    })
 }
 
 /// Whether a process name is a shell's (`-zsh` for a login shell).
@@ -599,7 +619,15 @@ mod tests {
             "--add-dir=/work/a b/[c]",
             "--model=claude-opus-4-5[1m]",
         ];
-        assert!(write_hand_over_in(&dir, "w1:p1", ID, &strs(&odd), now));
+        let dropped = strs(&["--worktree"]);
+        assert!(write_hand_over_in(
+            &dir,
+            "w1:p1",
+            ID,
+            &strs(&odd),
+            &dropped,
+            now
+        ));
         let path = conversation_file(&dir, "w1:p1");
         let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode(&path), 0o600);
@@ -608,7 +636,8 @@ mod tests {
         let got = take_hand_over_in(&dir, "w1:p1", &resume, now + 3).unwrap();
         let mut want = strs(&odd);
         want.extend(resume.clone());
-        assert_eq!(got, want);
+        assert_eq!(got.args, want);
+        assert_eq!(got.dropped, dropped, "named again on the next move");
         assert!(!path.exists(), "used once");
         assert!(take_hand_over_in(&dir, "w1:p1", &resume, now + 3).is_err());
         // Another conversation, other arguments, an old file: not used, and
@@ -620,7 +649,7 @@ mod tests {
             (strs(&["--continue"]), now),
             (resume.clone(), now - 600),
         ] {
-            assert!(write_hand_over_in(&dir, "w1:p1", ID, &strs(&odd), at));
+            assert!(write_hand_over_in(&dir, "w1:p1", ID, &strs(&odd), &[], at));
             assert!(
                 take_hand_over_in(&dir, "w1:p1", &args, now).is_err(),
                 "{args:?}"
@@ -633,10 +662,11 @@ mod tests {
             "w1:p1",
             ID,
             &strs(&["--settings=/tmp/s.json", "--bare", "--verbose", "hello"]),
+            &[],
             now
         ));
         assert_eq!(
-            take_hand_over_in(&dir, "w1:p1", &resume, now).unwrap(),
+            take_hand_over_in(&dir, "w1:p1", &resume, now).unwrap().args,
             strs(&["--verbose", "--resume", ID])
         );
         let _ = std::fs::remove_dir_all(&dir);
