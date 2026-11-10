@@ -842,14 +842,20 @@ impl App {
             }
         }
         if !(self.space_closer)(&first.id, group.len() > 1) {
-            if !kept.is_empty() {
-                self.update(move |s| {
+            let back = kept.is_empty()
+                || self.update(move |s| {
                     for (w, account) in &kept {
                         s.assign(&w.id, &w.label, Some(account));
                     }
                 });
-            }
-            self.flash(format!("Herdr could not close {label}"), crate::theme::RED);
+            self.flash(
+                if back {
+                    format!("Herdr could not close {label}")
+                } else {
+                    format!("Herdr could not close {label}, and its account choice is lost: choose it again with ⏎")
+                },
+                crate::theme::RED,
+            );
             return;
         }
         let gone: Vec<&str> = group.iter().map(|w| w.id.as_str()).collect();
@@ -2621,6 +2627,19 @@ mod tests {
         Err(std::io::Error::other("disk full"))
     }
 
+    thread_local! {
+        static STORE_BROKEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// `stores`, until a test breaks the disk.
+    fn stores_until_broken(change: Box<dyn FnOnce(&mut Store) + '_>) -> std::io::Result<Store> {
+        if STORE_BROKEN.with(|b| b.get()) {
+            cannot_store(change)
+        } else {
+            stores(change)
+        }
+    }
+
     fn stored() -> Store {
         STORED.with(|s| s.borrow().clone())
     }
@@ -3839,6 +3858,23 @@ mod tests {
         assert!(spaces_closed().is_empty());
         assert_eq!(a.flash.as_ref().map(|f| f.1), Some(crate::theme::RED));
         assert_eq!(a.workspaces.len(), 3);
+
+        // Herdr refuses and the choice cannot be put back: both are said.
+        let mut a = spaces();
+        a.space_sel = 2;
+        a.space_closer = |ws, group| {
+            STORE_BROKEN.with(|b| b.set(true));
+            cannot_close_space(ws, group)
+        };
+        a.store_update = stores_until_broken;
+        press(&mut a, KeyCode::Char('d'));
+        press(&mut a, KeyCode::Char('y'));
+        STORE_BROKEN.with(|b| b.set(false));
+        assert_eq!(spaces_closed(), vec![("w3".to_string(), false)]);
+        assert_eq!(
+            flash_text(&a),
+            "Herdr could not close notes, and its account choice is lost: choose it again with ⏎"
+        );
 
         // The account choice cannot be forgotten: nothing closes either.
         let mut a = spaces();
