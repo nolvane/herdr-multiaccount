@@ -507,18 +507,29 @@ same steps (`relocate::run_move`) and writes the result into the note.
   lines, so the plan stays in the note; `move` takes the pane id only.
 - **Who tells.** Every list reads the notes (twice a second): a running
   move shows as #10's moving state in any list, also one opened later or in
-  another tab, and `m` and `d` wait for it. A result is told once: the one
-  that removes (or, for a dialog, renames) the note tells it. A list keeps a
-  failure as `<pane>.held.<list pid>` until its dialog is on screen, and a
-  later list takes it back when that list is gone. The move process leaves
-  its result to a list for 3 s; then a success says nothing (the owner's
-  decision on #12) and a failure opens a popup (entrypoint `moved`, reusing
-  the reminder's dialog) that takes its text from `<pane>.report`. If the
-  popup cannot open or has not taken the text within 10 s, a notification
-  goes out instead; whoever removes the report shows it, so never both.
+  another tab, and `m` and `d` wait for it. A result is told once: whoever
+  removes the note tells it. The note names the list that started the move
+  (its pid); only that list takes the result while it runs, so a list in a
+  tab the user does not see never swallows it; once that list is gone, any
+  list may. A list takes a result only while no dialog of its own is open
+  and shows it at once, so a list that closes in between never holds one.
+  The move process leaves the result to a list for 3 s; then a success says
+  nothing (the owner's decision on #12) and a failure opens a popup
+  (entrypoint `moved`, reusing the reminder's dialog) that takes its text
+  from `<pane>.report`. If the popup cannot open or has not taken the text
+  within 10 s, a notification goes out instead; whoever removes the report
+  shows it, so never both. The text names the model and the option names to
+  add, never option values, so the notification's command line holds
+  nothing private.
 - **A move that stopped.** A note without result whose process is gone, or
-  that never noted its process within 10 s, or is older than 2 minutes (a
-  reused pid), is told as "The move of X stopped before it finished" with
-  the way to resume by hand.
+  that never noted its process within 30 s, or is older than 2 minutes (a
+  reused pid; a move takes about half a minute at most), is told as "The
+  move of X stopped before it finished" with the way to resume by hand. A
+  move process whose note was told that way writes no result.
+- **Known gaps, accepted.** Checking "a move runs" and writing the note are
+  two steps, so two lists answering yes in the same instant for different
+  sessions could start two moves; each still runs safely on its own pane.
+  The move process starts from the copy in `bin/` when there is one, since
+  on Linux the list's own file is gone after a rebuild.
 - **Quitting.** `q` / Ctrl+C then `y` close the list while a move runs (the
   owner's decision on #12), since the move goes on.

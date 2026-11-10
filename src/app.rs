@@ -84,7 +84,8 @@ pub struct Held {
     pub pid: u32,
     pub carry: Moved,
 }
-pub type Mover = fn(&std::path::Path, relocate::Plan) -> Result<(), String>;
+/// The folder of the notes, this list's id and the plan.
+pub type Mover = fn(&std::path::Path, u32, relocate::Plan) -> Result<(), String>;
 
 /// The program that opens links: `open` on macOS, `xdg-open` elsewhere.
 const OPENER: &str = if cfg!(target_os = "macos") {
@@ -131,6 +132,16 @@ pub struct MoveRun {
     pub pane: String,
     pub label: String,
     pub to: String,
+}
+
+impl MoveRun {
+    fn of(p: &relocate::Plan) -> MoveRun {
+        MoveRun {
+            pane: p.pane.clone(),
+            label: p.label.clone(),
+            to: p.account_name.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -303,9 +314,8 @@ pub struct App {
     /// Where the notes of moves are (`<config>/moving`).
     pub moves_dir: PathBuf,
     next_moves: Instant,
-    /// A failed move's message and the note it keeps (`relocate::hold`),
-    /// kept until no other dialog is open.
-    move_failed: Option<(String, String, PathBuf)>,
+    /// This list, in the notes of the moves it starts (its process id).
+    pub me: u32,
     pub cwd: Option<String>,
     pub read_at: Instant,
     next_files: Instant,
@@ -323,7 +333,7 @@ impl App {
         let store = Store::load();
         let twins = crate::login::twins(&store, &crate::login::all(&store));
         let usage = launch::load_usage_with(&store, &twins);
-        let moves_dir = dir.join("moving");
+        let moves_dir = dir.join(relocate::MOVING);
         App {
             config,
             dir,
@@ -362,7 +372,7 @@ impl App {
             moving: None,
             moves_dir,
             next_moves: Instant::now(),
-            move_failed: None,
+            me: std::process::id(),
             cwd: std::env::current_dir()
                 .ok()
                 .map(|p| p.to_string_lossy().to_string()),
@@ -902,7 +912,6 @@ impl App {
             );
             return;
         }
-        let plan_pane = s.pane.clone();
         let plan = relocate::Plan {
             pane: s.pane,
             label: label.clone(),
@@ -923,17 +932,13 @@ impl App {
             );
             return;
         }
-        let to_name = self.store.name_of(to);
-        if let Err(e) = (self.mover)(&self.moves_dir, plan) {
+        let run = MoveRun::of(&plan);
+        if let Err(e) = (self.mover)(&self.moves_dir, self.me, plan) {
             self.move_refused(&label, e);
             return;
         }
         // The footer shows it until the result arrives (`ui::draw_footer`).
-        self.moving = Some(MoveRun {
-            pane: plan_pane,
-            label,
-            to: to_name,
-        });
+        self.moving = Some(run);
         self.next_moves = Instant::now();
     }
 
@@ -941,79 +946,56 @@ impl App {
     fn running_move(&self) -> Option<MoveRun> {
         let now = crate::time::now();
         relocate::notes(&self.moves_dir)
-            .into_iter()
+            .iter()
             .find(|n| relocate::state(n, now, &crate::sessions::alive) == relocate::State::Running)
-            .map(|n| MoveRun {
-                pane: n.plan.pane,
-                label: n.plan.label,
-                to: n.plan.account_name,
-            })
-    }
-
-    /// Shows a failed move kept for when no other dialog is open; its note
-    /// goes once the dialog is on screen.
-    fn show_move_failed(&mut self) {
-        if self.mode != Mode::Normal {
-            return;
-        }
-        if let Some((title, line, held)) = self.move_failed.take() {
-            self.mode = Mode::Message {
-                title,
-                lines: vec![line],
-                good: false,
-            };
-            let _ = std::fs::remove_file(held);
-        }
+            .map(|n| MoveRun::of(&n.plan))
     }
 
     /// Reads the notes of moves (every half second): which one runs, and
-    /// the results of finished ones, from this list or another. Each result
-    /// is told by one list only.
+    /// the results this list tells (`relocate::tells`). A result is taken
+    /// only while no other dialog is open, so it is never held by a list
+    /// that may close before showing it; the move process tells it
+    /// otherwise.
     pub fn receive_move(&mut self) {
-        self.show_move_failed();
         if Instant::now() < self.next_moves {
             return;
         }
         self.next_moves = Instant::now() + Duration::from_millis(500);
         let dir = self.moves_dir.clone();
-        relocate::recover_held(&dir, &crate::sessions::alive);
         let now = crate::time::now();
-        let me = std::process::id();
+        let alive = crate::sessions::alive;
         let mut running = None;
         let mut finished = false;
         for note in relocate::notes(&dir) {
             let p = &note.plan;
-            let failed = match relocate::state(&note, now, &crate::sessions::alive) {
-                relocate::State::Running => {
-                    running.get_or_insert(MoveRun {
-                        pane: p.pane.clone(),
-                        label: p.label.clone(),
-                        to: p.account_name.clone(),
-                    });
-                    continue;
-                }
+            let state = relocate::state(&note, now, &alive);
+            if state == relocate::State::Running {
+                running.get_or_insert_with(|| MoveRun::of(p));
+                continue;
+            }
+            if self.mode != Mode::Normal
+                || !relocate::tells(&note, &state, self.me, &alive)
+                || !relocate::take(&dir, &p.pane)
+            {
+                continue;
+            }
+            finished = true;
+            let (title, line) = match state {
                 relocate::State::Done(Ok(msg)) => {
-                    if relocate::take(&dir, &p.pane) {
-                        self.flash(msg, crate::theme::GREEN);
-                        finished = true;
-                    }
+                    self.flash(msg, crate::theme::GREEN);
                     continue;
                 }
                 relocate::State::Done(Err(e)) => (format!("{} was not moved", p.label), e),
-                relocate::State::Stopped => relocate::stopped_text(p),
+                _ => relocate::stopped_text(p),
             };
-            // One failure at a time; the next waits in its note.
-            if self.move_failed.is_some() {
-                continue;
-            }
-            if let Some(held) = relocate::hold(&dir, &p.pane, me) {
-                self.move_failed = Some((failed.0, failed.1, held));
-                finished = true;
-            }
+            self.mode = Mode::Message {
+                title,
+                lines: vec![line],
+                good: false,
+            };
         }
         self.moving = running;
         if finished {
-            self.show_move_failed();
             // The pane's new label and note show on the next read.
             self.herdr_rx = None;
             self.next_herdr = Instant::now() + Duration::from_secs(1);
@@ -3269,12 +3251,18 @@ mod tests {
 
     /// Notes a move as its process would once done (this test process
     /// stands in for it), without Herdr.
-    fn noted(dir: &std::path::Path, p: relocate::Plan, result: Option<Result<String, String>>) {
+    fn noted(
+        dir: &std::path::Path,
+        list: u32,
+        p: relocate::Plan,
+        result: Option<Result<String, String>>,
+    ) {
         assert!(relocate::write_note(
             dir,
             &relocate::Note {
                 plan: p,
                 at: crate::time::now(),
+                list: Some(list),
                 mover: Some(std::process::id()),
                 result,
             }
@@ -3282,7 +3270,7 @@ mod tests {
     }
 
     /// Hands back what it was asked to do.
-    fn moves(dir: &std::path::Path, p: relocate::Plan) -> Result<(), String> {
+    fn moves(dir: &std::path::Path, list: u32, p: relocate::Plan) -> Result<(), String> {
         let text = format!(
             "moved {} {} {} {} to {} with {}",
             p.pane,
@@ -3292,25 +3280,25 @@ mod tests {
             p.account_id,
             p.carry.args().len()
         );
-        noted(dir, p, Some(Ok(text)));
+        noted(dir, list, p, Some(Ok(text)));
         Ok(())
     }
 
     const FAILED: &str = "Claude Code did not end in it, so nothing was started. By hand: type /exit in it, then HERDR_MULTIACCOUNT_USE=work claude --resume x.";
 
-    fn fails(dir: &std::path::Path, p: relocate::Plan) -> Result<(), String> {
-        noted(dir, p, Some(Err(FAILED.into())));
+    fn fails(dir: &std::path::Path, list: u32, p: relocate::Plan) -> Result<(), String> {
+        noted(dir, list, p, Some(Err(FAILED.into())));
         Ok(())
     }
 
     /// A move whose process runs (this test process stands in for it).
-    fn runs(dir: &std::path::Path, p: relocate::Plan) -> Result<(), String> {
-        noted(dir, p, None);
+    fn runs(dir: &std::path::Path, list: u32, p: relocate::Plan) -> Result<(), String> {
+        noted(dir, list, p, None);
         Ok(())
     }
 
     /// A move whose process could not be started.
-    fn cannot_start(_: &std::path::Path, _: relocate::Plan) -> Result<(), String> {
+    fn cannot_start(_: &std::path::Path, _: u32, _: relocate::Plan) -> Result<(), String> {
         Err("Nothing was changed: the move could not be started. By hand: type /exit in it.".into())
     }
 
@@ -3729,7 +3717,7 @@ mod tests {
         assert!(a.moving.is_none(), "the move finished");
         assert_eq!(a.mode, Mode::Help, "the overlay stays");
         a.mode = Mode::Normal;
-        a.receive_move();
+        poll(&mut a);
         match &a.mode {
             Mode::Message { title, .. } => assert_eq!(title, "Fix the login bug was not moved"),
             m => panic!("{m:?}"),
@@ -3887,47 +3875,46 @@ mod tests {
 
     #[test]
     fn a_move_started_by_a_closed_list_reports_in_the_next_one() {
-        // Success: the next list says so once.
         let mut a = movable();
         a.mover = runs;
+        // Its process is gone once the list closed.
+        a.me = dead_pid();
         press(&mut a, KeyCode::Char('m'));
         press(&mut a, KeyCode::Enter);
         press(&mut a, KeyCode::Char('y'));
         let dir = a.moves_dir.clone();
-        let plan = relocate::read_note(&dir, "w91:p1").unwrap().plan;
+        let note = relocate::read_note(&dir, "w91:p1").unwrap();
+        assert_eq!(note.list, Some(a.me));
         drop(a);
         // The move process finishes after the list closed.
-        noted(
-            &dir,
-            plan.clone(),
-            Some(Ok("Moved Fix the login bug to Work".into())),
-        );
+        let ok = relocate::Note {
+            result: Some(Ok("Moved Fix the login bug to Work".into())),
+            ..note.clone()
+        };
+        assert!(relocate::write_note(&dir, &ok));
         let mut b = movable();
         b.moves_dir = dir.clone();
         poll(&mut b);
         assert_eq!(flash_text(&b), "Moved Fix the login bug to Work");
         assert!(b.moving.is_none());
         assert!(relocate::notes(&dir).is_empty(), "told once, then gone");
-        // A failure while the list was in a dialog, and the list closed
-        // before showing it: the next list shows it.
-        noted(&dir, plan, Some(Err(FAILED.into())));
+        // A failure while the next list is in a dialog stays in its note
+        // (the move process's popup tells it if the list closes), and
+        // shows once the dialog is closed.
+        let failed = relocate::Note {
+            result: Some(Err(FAILED.into())),
+            ..note
+        };
+        assert!(relocate::write_note(&dir, &failed));
         let mut c = movable();
         c.moves_dir = dir.clone();
         c.mode = Mode::Help;
         poll(&mut c);
         assert_eq!(c.mode, Mode::Help);
-        // Kept by c's process, which still runs in this test: give it to a
-        // list whose process is gone, as when c closes.
-        let held = c.move_failed.as_ref().unwrap().2.clone();
-        drop(c);
-        let gone = std::fs::read_dir(&dir).unwrap().count();
-        assert_eq!(gone, 1);
-        let dead = dead_pid();
-        std::fs::rename(&held, dir.join(format!("w91_p1.held.{dead}"))).unwrap();
-        let mut d = movable();
-        d.moves_dir = dir.clone();
-        poll(&mut d);
-        match &d.mode {
+        assert_eq!(relocate::notes(&dir).len(), 1, "left in its note");
+        c.mode = Mode::Normal;
+        poll(&mut c);
+        match &c.mode {
             Mode::Message { title, lines, good } => {
                 assert_eq!(title, "Fix the login bug was not moved");
                 assert!(lines.join(" ").contains("/exit"));
@@ -3940,8 +3927,23 @@ mod tests {
             0,
             "gone once shown"
         );
-        poll(&mut d);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_list_leaves_the_result_of_another_open_list_to_it() {
+        let mut a = asked_to_move();
+        a.mover = fails;
+        let mut b = movable();
+        b.moves_dir = a.moves_dir.clone();
+        // Another list, whose process (pid 1) runs.
+        b.me = 1;
+        press(&mut a, KeyCode::Char('y'));
+        poll(&mut b);
+        assert_eq!(b.mode, Mode::Normal, "not in a tab the user may not see");
+        poll(&mut a);
+        refused(&a, "did not end");
+        let _ = std::fs::remove_dir_all(&a.moves_dir);
     }
 
     /// A pid no process has: one that just ended.
@@ -3956,6 +3958,8 @@ mod tests {
     fn a_list_opened_during_a_move_shows_it_and_refuses_m_and_d() {
         let mut a = asked_to_move();
         a.mover = runs;
+        // The list that started it has closed.
+        a.me = dead_pid();
         press(&mut a, KeyCode::Char('y'));
         let mut b = movable();
         b.moves_dir = a.moves_dir.clone();
@@ -3979,10 +3983,11 @@ mod tests {
             );
         }
         // The result shows there when the move ends.
-        let plan = relocate::read_note(&b.moves_dir, "w91:p1").unwrap().plan;
+        let n = relocate::read_note(&b.moves_dir, "w91:p1").unwrap();
         noted(
             &b.moves_dir,
-            plan,
+            n.list.unwrap(),
+            n.plan,
             Some(Ok("Moved Fix the login bug to Work".into())),
         );
         poll(&mut b);
@@ -4035,12 +4040,13 @@ mod tests {
         };
         // Killed halfway, and one that never noted itself.
         let now = crate::time::now();
-        for (mover, at) in [(Some(dead_pid()), now), (None, now - 60)] {
+        for (mover, at) in [(Some(dead_pid()), now), (None, now - 31)] {
             assert!(relocate::write_note(
                 &dir,
                 &relocate::Note {
                     plan: plan.clone(),
                     at,
+                    list: Some(std::process::id()),
                     mover,
                     result: None,
                 }

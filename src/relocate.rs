@@ -90,9 +90,8 @@ impl Io for Herdr {
         crate::sessions::drop_hand_over(pane);
     }
     fn popup(&self, pane: &str, body: &str) -> bool {
-        let width = crate::remind::WIDTH;
-        let lines = crate::ui::wrap(body, (width - 4) as usize).len() as u16;
-        herdr::open_popup("moved", width, lines + 6, &[(ENV_MOVED, pane)])
+        let (width, height) = crate::remind::popup_size(body);
+        herdr::open_popup("moved", width, height, &[(ENV_MOVED, pane)])
     }
     fn notify(&self, title: &str, body: &str) {
         herdr::notify(title, body);
@@ -336,8 +335,10 @@ fn end(io: &dyn Io, plan: &Plan, by_hand: &str, resume: &str) -> Result<(), Stri
 /// read: the plan holds the start option values. Not #9's hand-over
 /// (`moves/`), which the launcher takes.
 pub fn moving_dir() -> PathBuf {
-    crate::paths::config_dir().join("moving")
+    crate::paths::config_dir().join(MOVING)
 }
+
+pub const MOVING: &str = "moving";
 
 /// A move as noted for the move process and the lists.
 #[derive(Debug, Clone, PartialEq)]
@@ -345,6 +346,8 @@ pub struct Note {
     pub plan: Plan,
     /// When the list wrote it (unix seconds).
     pub at: i64,
+    /// The list that started it (its process id).
+    pub list: Option<u32>,
     /// The move process, once it runs.
     pub mover: Option<u32>,
     pub result: Option<Result<String, String>>,
@@ -362,7 +365,7 @@ pub enum State {
 /// How long the move process may take to note itself, and how long a move
 /// runs at most (presses, both waits and the hand-over to a list or popup
 /// are well under it), so a reused pid never holds a move open.
-const START_GRACE: i64 = 10;
+const START_GRACE: i64 = 30;
 const MOVE_AT_MOST: i64 = 120;
 /// How long the move process leaves a result to a list, and a failure to
 /// its popup.
@@ -392,6 +395,9 @@ fn note_json(n: &Note) -> String {
         "model": p.carry.model,
         "at": n.at,
     });
+    if let Some(l) = n.list {
+        v["list"] = json!(l);
+    }
     if let Some(m) = n.mover {
         v["mover"] = json!(m);
     }
@@ -427,6 +433,7 @@ fn note_from(v: &Value) -> Option<Note> {
             },
         },
         at: v["at"].as_i64()?,
+        list: pid("list"),
         mover: pid("mover"),
         result: s("ok").map(Ok).or_else(|| s("err").map(Err)),
     })
@@ -499,42 +506,19 @@ pub fn take(dir: &Path, pane: &str) -> bool {
     std::fs::remove_file(note_file(dir, pane)).is_ok()
 }
 
-/// Takes a note a list will show in a dialog, keeping it (as
-/// `<pane>.held.<list pid>`) until the dialog is on screen, so a list closed
-/// in between leaves it to the next one. `None` when another took it.
-pub fn hold(dir: &Path, pane: &str, holder: u32) -> Option<PathBuf> {
-    let held = dir.join(format!(
-        "{}.held.{holder}",
-        crate::sessions::safe_name(pane)
-    ));
-    std::fs::rename(note_file(dir, pane), &held).ok()?;
-    Some(held)
-}
-
-/// Gives the notes held by lists that are gone back to the next list.
-pub fn recover_held(dir: &Path, alive: &dyn Fn(u32) -> bool) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for path in entries.flatten().map(|e| e.path()) {
-        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-            continue;
-        };
-        let Some((stem, holder)) = name.split_once(".held.") else {
-            continue;
-        };
-        let Ok(holder) = holder.parse::<u32>() else {
-            continue;
-        };
-        if alive(holder) {
-            continue;
-        }
-        let back = dir.join(format!("{stem}.json"));
-        if back.exists() {
-            // A newer move of that pane: the old result is stale.
-            let _ = std::fs::remove_file(&path);
-        } else {
-            let _ = std::fs::rename(&path, back);
+/// Whether a list (`me`) tells a move that is no longer running: one it
+/// started; one whose list is gone (a list opened later shows it); one
+/// whose move process is gone. Never a move another open list started,
+/// which may sit in a tab the user does not see; its own list or the move
+/// process's popup tells it.
+pub fn tells(n: &Note, state: &State, me: u32, alive: &dyn Fn(u32) -> bool) -> bool {
+    match state {
+        State::Running => false,
+        State::Stopped => true,
+        State::Done(_) => {
+            n.list == Some(me)
+                || n.list.is_none_or(|l| !alive(l))
+                || n.mover.is_none_or(|m| !alive(m))
         }
     }
 }
@@ -561,6 +545,7 @@ pub fn move_args(pane: &str) -> Vec<String> {
 pub fn start(
     dir: &Path,
     plan: Plan,
+    list: u32,
     now: i64,
     spawn: &dyn Fn(&[String]) -> bool,
 ) -> Result<(), String> {
@@ -569,6 +554,7 @@ pub fn start(
     let note = Note {
         plan,
         at: now,
+        list: Some(list),
         mover: None,
         result: None,
     };
@@ -622,10 +608,17 @@ pub fn spawn_detached(program: &Path, args: &[String]) -> bool {
     }
 }
 
-/// The list's `Mover`: notes the move and starts its process.
-pub fn perform(dir: &Path, plan: Plan) -> Result<(), String> {
-    let exe = std::env::current_exe().ok();
-    start(dir, plan, crate::time::now(), &|args| {
+/// The list's `Mover`: notes the move and starts its process, from the
+/// copy in `<config>/bin/` when there is one: on Linux the list's own file
+/// is gone once the plugin was rebuilt while the list stayed open.
+pub fn perform(dir: &Path, list: u32, plan: Plan) -> Result<(), String> {
+    let installed = crate::paths::installed_bin();
+    let exe = if installed.is_file() {
+        Some(installed)
+    } else {
+        std::env::current_exe().ok()
+    };
+    start(dir, plan, list, crate::time::now(), &|args| {
         exe.as_deref().is_some_and(|e| spawn_detached(e, args))
     })
 }
@@ -886,7 +879,7 @@ mod tests {
 
     /// A list noted this move and started the process.
     fn listed(dir: &Path, p: Plan) {
-        assert!(start(dir, p, crate::time::now(), &|_| true).is_ok());
+        assert!(start(dir, p, 1, crate::time::now(), &|_| true).is_ok());
     }
 
     fn mode(p: &Path) -> u32 {
@@ -904,7 +897,7 @@ mod tests {
         assert_eq!(mode(&dir), 0o700);
         let n = read_note(&dir, "w91:p1").unwrap();
         assert_eq!(n.plan, carrying());
-        assert_eq!((n.mover, n.result.clone()), (None, None));
+        assert_eq!((n.list, n.mover, n.result.clone()), (Some(1), None, None));
         let done = Note {
             mover: Some(77),
             result: Some(Err("x".into())),
@@ -920,7 +913,7 @@ mod tests {
         listed(&dir, p.clone());
         assert_eq!(read_note(&dir, "w91:p2").unwrap().plan, p);
         // One move per pane.
-        assert!(start(&dir, plan(), 0, &|_| true).is_err());
+        assert!(start(&dir, plan(), 1, 0, &|_| true).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -929,7 +922,7 @@ mod tests {
         let dir = scratch("args");
         let seen = RefCell::new(vec![]);
         let p = carrying();
-        assert!(start(&dir, p.clone(), 0, &|a| {
+        assert!(start(&dir, p.clone(), 1, 0, &|a| {
             *seen.borrow_mut() = a.to_vec();
             true
         })
@@ -949,7 +942,7 @@ mod tests {
     #[test]
     fn a_failed_spawn_leaves_no_note_and_presses_nothing() {
         let dir = scratch("spawn");
-        let e = start(&dir, plan(), 0, &|_| false).unwrap_err();
+        let e = start(&dir, plan(), 1, 0, &|_| false).unwrap_err();
         assert!(e.starts_with("Nothing was changed"), "{e}");
         assert!(e.contains("/exit"), "{e}");
         assert!(notes(&dir).is_empty());
@@ -1066,13 +1059,14 @@ mod tests {
         let n = Note {
             plan: plan(),
             at: 1000,
+            list: Some(1),
             mover: None,
             result: None,
         };
         let yes = |_| true;
         let no = |_| false;
         assert_eq!(state(&n, 1005, &no), State::Running, "starting");
-        assert_eq!(state(&n, 1011, &yes), State::Stopped, "never started");
+        assert_eq!(state(&n, 1031, &yes), State::Stopped, "never started");
         let n = Note {
             mover: Some(5),
             ..n
@@ -1088,18 +1082,24 @@ mod tests {
     }
 
     #[test]
-    fn a_held_result_goes_back_once_its_list_is_gone() {
-        let dir = scratch("held");
-        listed(&dir, plan());
-        let held = hold(&dir, "w91:p1", 9).unwrap();
-        assert!(hold(&dir, "w91:p1", 10).is_none(), "taken once");
-        assert!(notes(&dir).is_empty());
-        recover_held(&dir, &|_| true);
-        assert!(notes(&dir).is_empty(), "its list still runs");
-        recover_held(&dir, &|_| false);
-        assert_eq!(notes(&dir).len(), 1);
-        assert!(!held.exists());
-        let _ = std::fs::remove_dir_all(&dir);
+    fn a_result_is_told_by_its_list_or_once_that_is_gone() {
+        let n = Note {
+            plan: plan(),
+            at: 1000,
+            list: Some(7),
+            mover: Some(8),
+            result: Some(Err("x".into())),
+        };
+        let done = State::Done(Err("x".into()));
+        let all = |_| true;
+        let only_list = |p| p == 7;
+        let only_mover = |p| p == 8;
+        assert!(tells(&n, &done, 7, &all), "its own list");
+        assert!(!tells(&n, &done, 9, &all), "not another open list");
+        assert!(tells(&n, &done, 9, &only_mover), "its list is gone");
+        assert!(tells(&n, &done, 9, &only_list), "the move process is gone");
+        assert!(!tells(&n, &State::Running, 7, &all));
+        assert!(tells(&n, &State::Stopped, 9, &all));
     }
 
     #[test]

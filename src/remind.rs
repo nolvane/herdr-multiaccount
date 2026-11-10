@@ -87,7 +87,14 @@ pub fn texts(session: &str, back: &str, now_on: &str) -> (String, String) {
 const ENV: &str = "HERDR_MULTIACCOUNT_REMIND";
 
 /// Popup width in cells, border included.
-pub const WIDTH: u16 = 64;
+const WIDTH: u16 = 64;
+
+/// The size of a popup with [`dialog`] for `body`: border, title, a gap,
+/// the text, a gap, the buttons, border.
+pub fn popup_size(body: &str) -> (u16, u16) {
+    let lines = crate::ui::wrap(body, (WIDTH - 4) as usize).len() as u16;
+    (WIDTH, lines + 6)
+}
 
 /// `herdr-multiaccount remind <pane> <back> <now on>`: opens the reminder
 /// as a Herdr popup over whatever is in front; a Herdr notification when
@@ -97,9 +104,8 @@ pub fn show(pane: &str, back: &str, now_on: &str) -> i32 {
     let label = herdr::pane_label(pane).unwrap_or_else(|| pane.to_string());
     let (title, body) = texts(&label, &store.name_of(back), &store.name_of(now_on));
     let value = format!("{pane}\t{back}\t{now_on}");
-    // Border, title, a gap, the text, a gap, the buttons, border.
-    let lines = crate::ui::wrap(&body, (WIDTH - 4) as usize).len() as u16;
-    if herdr::open_popup("remind", WIDTH, lines + 6, &[(ENV, &value)]) {
+    let (width, height) = popup_size(&body);
+    if herdr::open_popup("remind", width, height, &[(ENV, &value)]) {
         return 0;
     }
     herdr::notify(&title, &body);
