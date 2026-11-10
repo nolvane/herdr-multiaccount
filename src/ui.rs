@@ -1062,18 +1062,21 @@ fn draw_confirm(frame: &mut Frame, app: &mut App, c: &crate::app::Confirm) {
     // Taller than the pane: the text scrolls, with a line that says so.
     let room = inner.height.saturating_sub(rest);
     let lines = wrapped.len() as u16;
-    let visible = if lines > room {
-        room.saturating_sub(1)
-    } else {
-        room
-    };
+    // The hint needs a line of its own and at least one line of text.
+    let hint = lines > room && room >= 2;
+    let visible = if hint { room - 1 } else { room };
+    let asked = format!("{}\n{}", c.question, c.lines.join("\n"));
+    if app.confirm_of != asked {
+        app.confirm_of = asked;
+        app.confirm_scroll = 0;
+    }
     app.confirm_max = lines.saturating_sub(visible);
     app.confirm_scroll = app.confirm_scroll.min(app.confirm_max);
     frame.render_widget(
         Paragraph::new(Text::from(wrapped)).scroll((app.confirm_scroll, 0)),
         Rect::new(inner.x, inner.y + top, inner.width, visible),
     );
-    if app.confirm_max > 0 {
+    if hint {
         let left = app.confirm_max - app.confirm_scroll;
         let hint = if left == 0 {
             "↑ ↓ scroll · end".to_string()

@@ -76,7 +76,8 @@ impl Io for Herdr {
         std::thread::sleep(d);
     }
     fn hand_over(&self, pane: &str, session_id: &str, carry: &Moved) -> bool {
-        crate::sessions::write_hand_over(pane, session_id, &carry.args(), &carry.dropped)
+        let dropped = carry.options.as_ref().map(|_| carry.dropped.as_slice());
+        crate::sessions::write_hand_over(pane, session_id, &carry.args(), dropped)
     }
     fn drop_hand_over(&self, pane: &str) {
         crate::sessions::drop_hand_over(pane);

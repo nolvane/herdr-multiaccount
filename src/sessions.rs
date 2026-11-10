@@ -59,21 +59,33 @@ fn file(pane: &str) -> PathBuf {
 
 /// Notes the session the launcher starts in a pane. Only its owner can
 /// read the note: start options can hold private text or tokens.
-pub fn record(pane: &str, account: &str, wanted: Option<&str>, pid: u32, carried: &Carried) {
+/// `carried` is `None` when the start options are not known (a move whose
+/// hand-over was missing, or that did not know them either).
+pub fn record(
+    pane: &str,
+    account: &str,
+    wanted: Option<&str>,
+    pid: u32,
+    carried: Option<&Carried>,
+) {
     let _ = paths::write_private(
         &file(pane),
         note(pane, account, wanted, pid, carried).as_bytes(),
     );
 }
 
-fn note(pane: &str, account: &str, wanted: Option<&str>, pid: u32, carried: &Carried) -> String {
-    let mut v = json!({
-        "pane": pane,
-        "account": account,
-        "pid": pid,
-        "options": carried.options,
-        "dropped": carried.dropped,
-    });
+fn note(
+    pane: &str,
+    account: &str,
+    wanted: Option<&str>,
+    pid: u32,
+    carried: Option<&Carried>,
+) -> String {
+    let mut v = json!({"pane": pane, "account": account, "pid": pid});
+    if let Some(c) = carried {
+        v["options"] = json!(c.options);
+        v["dropped"] = json!(c.dropped);
+    }
     if let Some(w) = wanted {
         v["wanted"] = json!(w);
     }
@@ -282,15 +294,23 @@ fn moves_dir() -> PathBuf {
 const HAND_OVER_FOR: i64 = 120;
 
 /// What the launcher gets from a hand-over: its arguments for Claude Code,
-/// and the names of the start options a move did not carry (so the next
-/// move names them again).
+/// and what the moved session's note says of its start options: `None`
+/// when the list did not know them (only the model was handed over), else
+/// the names the first start dropped, so the next move names them again.
 #[derive(Debug, Clone, PartialEq)]
 pub struct HandedOver {
     pub args: Vec<String>,
-    pub dropped: Vec<String>,
+    pub dropped: Option<Vec<String>>,
 }
 
-pub fn write_hand_over(pane: &str, session_id: &str, args: &[String], dropped: &[String]) -> bool {
+/// What a move hands over: the options for Claude Code, and the names of
+/// the dropped ones, `None` when the start options are not known.
+pub fn write_hand_over(
+    pane: &str,
+    session_id: &str,
+    args: &[String],
+    dropped: Option<&[String]>,
+) -> bool {
     write_hand_over_in(
         &moves_dir(),
         pane,
@@ -306,14 +326,38 @@ fn write_hand_over_in(
     pane: &str,
     session_id: &str,
     args: &[String],
-    dropped: &[String],
+    dropped: Option<&[String]>,
     now: i64,
 ) -> bool {
     if paths::private_dir(dir).is_err() {
         return false;
     }
-    let v = json!({"session_id": session_id, "args": args, "dropped": dropped, "at": now});
+    prune_hand_overs(dir, std::time::SystemTime::now());
+    let mut v = json!({"session_id": session_id, "args": args, "at": now});
+    if let Some(d) = dropped {
+        v["dropped"] = json!(d);
+    }
     paths::write_private(&conversation_file(dir, pane), format!("{v}\n").as_bytes()).is_ok()
+}
+
+/// Removes hand-overs no launcher took in time (a list that stopped
+/// between writing and typing): they may hold option values.
+fn prune_hand_overs(dir: &std::path::Path, now: std::time::SystemTime) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let limit = std::time::Duration::from_secs(HAND_OVER_FOR as u64);
+    for e in entries.flatten() {
+        let stale = e
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|m| now.duration_since(m).ok())
+            .is_some_and(|age| age > limit);
+        if stale {
+            let _ = std::fs::remove_file(e.path());
+        }
+    }
 }
 
 pub fn drop_hand_over(pane: &str) {
@@ -337,6 +381,7 @@ fn take_hand_over_in(
     let path = conversation_file(dir, pane);
     let text = std::fs::read_to_string(&path).map_err(|_| "there was none");
     let _ = std::fs::remove_file(&path);
+    prune_hand_overs(dir, std::time::SystemTime::now());
     let v: serde_json::Value = serde_json::from_str(&text?).map_err(|_| "it was unreadable")?;
     let [flag, id] = args else {
         return Err("it is only for --resume <id>");
@@ -353,7 +398,7 @@ fn take_hand_over_in(
     out.extend(args.iter().cloned());
     Ok(HandedOver {
         args: out,
-        dropped: strings(&v["dropped"]).unwrap_or_default(),
+        dropped: strings(&v["dropped"]),
     })
 }
 
@@ -581,13 +626,17 @@ mod tests {
             dropped: vec!["--worktree".into()],
         };
         let v: serde_json::Value =
-            serde_json::from_str(&note("w1:p1", "work", None, 42, &carried)).unwrap();
+            serde_json::from_str(&note("w1:p1", "work", None, 42, Some(&carried))).unwrap();
         let e = entry(&v).unwrap();
         assert_eq!(e.options, Some(carried.options.clone()));
         assert_eq!(e.dropped, carried.dropped);
         let old = entry(&json!({"account": "work", "pid": 42})).unwrap();
         assert_eq!(old.options, None);
         assert!(old.dropped.is_empty());
+        // A moved session whose options were not known stays unknown.
+        let v: serde_json::Value =
+            serde_json::from_str(&note("w1:p1", "work", None, 42, None)).unwrap();
+        assert_eq!(entry(&v).unwrap().options, None);
     }
 
     #[test]
@@ -599,7 +648,11 @@ mod tests {
             options: vec!["--mcp-config={\"token\":\"dummy\"}".into()],
             dropped: vec![],
         };
-        paths::write_private(&path, note("w1:p1", "work", None, 42, &carried).as_bytes()).unwrap();
+        paths::write_private(
+            &path,
+            note("w1:p1", "work", None, 42, Some(&carried)).as_bytes(),
+        )
+        .unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
         let _ = std::fs::remove_dir_all(&dir);
@@ -625,7 +678,7 @@ mod tests {
             "w1:p1",
             ID,
             &strs(&odd),
-            &dropped,
+            Some(&dropped),
             now
         ));
         let path = conversation_file(&dir, "w1:p1");
@@ -637,7 +690,7 @@ mod tests {
         let mut want = strs(&odd);
         want.extend(resume.clone());
         assert_eq!(got.args, want);
-        assert_eq!(got.dropped, dropped, "named again on the next move");
+        assert_eq!(got.dropped, Some(dropped), "named again on the next move");
         assert!(!path.exists(), "used once");
         assert!(take_hand_over_in(&dir, "w1:p1", &resume, now + 3).is_err());
         // Another conversation, other arguments, an old file: not used, and
@@ -649,7 +702,14 @@ mod tests {
             (strs(&["--continue"]), now),
             (resume.clone(), now - 600),
         ] {
-            assert!(write_hand_over_in(&dir, "w1:p1", ID, &strs(&odd), &[], at));
+            assert!(write_hand_over_in(
+                &dir,
+                "w1:p1",
+                ID,
+                &strs(&odd),
+                Some(&[]),
+                at
+            ));
             assert!(
                 take_hand_over_in(&dir, "w1:p1", &args, now).is_err(),
                 "{args:?}"
@@ -662,12 +722,50 @@ mod tests {
             "w1:p1",
             ID,
             &strs(&["--settings=/tmp/s.json", "--bare", "--verbose", "hello"]),
-            &[],
+            None,
             now
         ));
         assert_eq!(
             take_hand_over_in(&dir, "w1:p1", &resume, now).unwrap().args,
             strs(&["--verbose", "--resume", ID])
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unknown_start_options_stay_unknown_through_a_hand_over() {
+        let dir = temp().join("unknown");
+        let now = 1_794_225_600;
+        let resume = strs(&["--resume", ID]);
+        assert!(write_hand_over_in(
+            &dir,
+            "w1:p1",
+            ID,
+            &strs(&["--model=opus"]),
+            None,
+            now
+        ));
+        let got = take_hand_over_in(&dir, "w1:p1", &resume, now).unwrap();
+        assert_eq!(got.dropped, None);
+        assert_eq!(got.args, strs(&["--model=opus", "--resume", ID]));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hand_overs_nobody_took_are_removed() {
+        let dir = temp().join("stale");
+        paths::private_dir(&dir).unwrap();
+        let old = conversation_file(&dir, "w9:p9");
+        std::fs::write(&old, "{}").unwrap();
+        let f = std::fs::File::options().write(true).open(&old).unwrap();
+        f.set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(600))
+            .unwrap();
+        drop(f);
+        assert!(write_hand_over_in(&dir, "w1:p1", ID, &[], Some(&[]), 0));
+        assert!(!old.exists(), "a stale hand-over is gone");
+        assert!(
+            conversation_file(&dir, "w1:p1").exists(),
+            "the new one stays"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

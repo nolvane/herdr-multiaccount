@@ -206,7 +206,11 @@ pub fn carried(args: &[String], cwd: Option<&Path>) -> Carried {
             }
         };
         if carry == Never {
-            drop_name(&mut out, &format!("--{name}"));
+            // The move resumes the conversation itself, so these are no
+            // loss worth naming.
+            if !matches!(name.as_str(), "resume" | "continue") {
+                drop_name(&mut out, &format!("--{name}"));
+            }
             continue;
         }
         match takes {
@@ -338,9 +342,15 @@ impl Moved {
 
     /// The lines of the move's question.
     pub fn lines(&self) -> Vec<String> {
-        let model = self.model().filter(|m| valid_model(m));
+        let model = self.model();
         let mut lines = vec![];
-        let mut carries: Vec<String> = model.iter().map(|m| format!("model {m}")).collect();
+        // A started model id with odd characters is passed on, but named
+        // only as the option.
+        let mut carries: Vec<String> = match &model {
+            Some(m) if valid_model(m) => vec![format!("model {m}")],
+            Some(_) => vec!["--model".to_string()],
+            None => vec![],
+        };
         carries.extend(self.names());
         match &self.options {
             Some(_) => {
@@ -355,7 +365,7 @@ impl Moved {
                     lines.push("Its model is not known; it starts on the account's default.".into());
                 }
             }
-            None => lines.push(match model {
+            None => lines.push(match model.filter(|m| valid_model(m)) {
                 Some(m) => format!(
                     "Carries over: model {m}. Its start options are not known, so it starts without them."
                 ),
@@ -374,11 +384,14 @@ impl Moved {
             .filter(|m| valid_model(m))
             .map(|m| format!(" --model '{m}'"))
             .unwrap_or_default();
-        let names = self
+        let mut names: Vec<String> = self
             .names()
             .into_iter()
             .map(|n| n.split(' ').next().unwrap_or_default().to_string())
             .collect();
+        if model.is_empty() && self.model().is_some() {
+            names.insert(0, "--model".into());
+        }
         (model, names)
     }
 }
@@ -550,8 +563,6 @@ mod tests {
         );
         assert_eq!(c.options, args(&["--model=opus"]), "{c:?}");
         for name in [
-            "--continue",
-            "--resume",
             "--session-id",
             "--fork-session",
             "--print",
@@ -573,10 +584,15 @@ mod tests {
             assert!(c.dropped.iter().any(|d| d == name), "{name}: {c:?}");
         }
         assert_eq!(
-            c.dropped.iter().filter(|d| *d == "--continue").count(),
+            c.dropped.iter().filter(|d| *d == "--worktree").count(),
             1,
             "each name once"
         );
+        // The move resumes the conversation itself: not named as lost.
+        assert!(!c
+            .dropped
+            .iter()
+            .any(|d| d == "--resume" || d == "--continue"));
         // No dropped value leaks into the kept options.
         assert!(!c
             .options
@@ -589,10 +605,7 @@ mod tests {
         // `-cp`: two flags; `-nfoo`: a name; `-rabc`: resume abc.
         let c = carried(&args(&["-cp", "-nfoo", "-rabc", "-d"]), None);
         assert_eq!(c.options, args(&["--name=foo"]));
-        assert_eq!(
-            c.dropped,
-            args(&["--continue", "--print", "--resume", "--debug"])
-        );
+        assert_eq!(c.dropped, args(&["--print", "--debug"]));
         // `-r` takes the next word unless it is an option.
         let c = carried(&args(&["-r", "--verbose"]), None);
         assert_eq!(c.options, args(&["--verbose"]));
@@ -707,11 +720,15 @@ mod tests {
                 "--dangerously-skip-permissions"
             ])
         );
-        // A model id a shell would misread is left out of the way by hand.
+        // A model id a shell would misread is left out of the way by hand,
+        // and named only as the option it is passed with.
         let odd = Moved {
-            model: Some("x';rm -rf ~'".into()),
-            ..Moved::default()
+            options: Some(vec!["--model=my model".into()]),
+            dropped: vec![],
+            model: None,
         };
-        assert_eq!(odd.by_hand().0, "");
+        assert_eq!(odd.by_hand(), (String::new(), args(&["--model"])));
+        assert_eq!(odd.args(), args(&["--model=my model"]));
+        assert_eq!(odd.lines(), args(&["Carries over: --model."]));
     }
 }

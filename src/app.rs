@@ -260,9 +260,11 @@ pub struct App {
     /// drawn).
     pub help_scroll: u16,
     pub help_max: u16,
-    /// The same for a question taller than the pane (set when drawn).
+    /// The same for a question taller than the pane (set when drawn), and
+    /// the question it belongs to, so a new one starts at the top.
     pub confirm_scroll: u16,
     pub confirm_max: u16,
+    pub confirm_of: String,
     pub flash: Option<(String, Color, Instant)>,
     pub setup: setup::State,
     pub signin: Option<SignIn>,
@@ -319,6 +321,7 @@ impl App {
             help_max: 0,
             confirm_scroll: 0,
             confirm_max: 0,
+            confirm_of: String::new(),
             flash: None,
             setup: setup::state(),
             signin: None,
@@ -854,9 +857,9 @@ impl App {
             );
             return;
         };
-        // The question named what carries over; a /model since then would
-        // move it on something else.
-        if held.carry != s.carry {
+        // The question named the model; a /model since then would move it
+        // on another. A model noted only since is the one it runs on.
+        if s.carry.model.is_some() && held.carry.model != s.carry.model {
             self.flash(
                 format!("{label}'s model changed since; nothing was moved. Press m again"),
                 crate::theme::YELLOW,
@@ -870,7 +873,7 @@ impl App {
             pid: s.pid,
             account_id: to.to_string(),
             account_name: self.store.name_of(to),
-            carry: s.carry,
+            carry: held.carry,
         };
         let (tx, rx) = channel();
         let mover = self.mover;
@@ -1769,11 +1772,11 @@ impl App {
                     self.scroll_confirm(1, c)
                 }
                 KeyCode::Char('y') => {
-                    self.confirm_scroll = 0;
+                    self.confirm_of.clear();
                     self.confirmed(c)
                 }
                 _ => {
-                    self.confirm_scroll = 0;
+                    self.confirm_of.clear();
                     self.mode = Mode::Normal
                 }
             },
@@ -3659,8 +3662,18 @@ mod tests {
                 seen.push_str(&screen_of(&mut a, w, h).join("\n"));
             }
             let screen = seen;
-            // The text without borders and spaces: a word longer than the
-            // line is split across lines, never cut off.
+            let shown: Vec<&str> = screen
+                .split(|c: char| c.is_whitespace() || c == '│')
+                .collect();
+            // The width the question's text wraps to: its box less 6
+            // (`ui::draw_confirm`).
+            let width = screen
+                .lines()
+                .find(|l| l.contains('╭'))
+                .map(|l| l.trim().chars().count().saturating_sub(6))
+                .unwrap_or(0);
+            // Only a word longer than the line is split, across lines in a
+            // row; the text without borders and spaces holds it whole.
             let flat: String = screen
                 .chars()
                 .filter(|c| !c.is_whitespace() && *c != '│')
@@ -3671,7 +3684,12 @@ mod tests {
             let to = if full { "Main login's" } else { "Work's" };
             assert!(c.lines.join(" ").contains(to), "{w}x{h}");
             for word in c.lines.iter().flat_map(|l| l.split_whitespace()) {
-                assert!(flat.contains(word), "{w}x{h}: {word} cut off\n{screen}");
+                let whole = if word.chars().count() > width {
+                    flat.contains(word)
+                } else {
+                    shown.contains(&word)
+                };
+                assert!(whole, "{w}x{h}: {word} cut off\n{screen}");
             }
         }
     }
