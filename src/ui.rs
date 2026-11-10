@@ -250,6 +250,10 @@ fn window_cell(w: Option<Window>, usage: &Usage, kind: Kind, now: i64) -> Text<'
     }
 }
 
+/// The row of an account that still runs on the folder an older version
+/// made.
+pub const OLD_FOLDER_NOTICE: &str = "l signs in again to stop edit prompts";
+
 /// The second line under an account's name: where it stands.
 fn status_line(app: &App, a: &Account) -> Line<'static> {
     let mut spans: Vec<Span<'static>> = Vec::new();
@@ -303,6 +307,15 @@ fn status_line(app: &App, a: &Account) -> Line<'static> {
             format!("at its {} limit", l.window)
         };
         spans.push(Span::styled(text, Style::new().fg(YELLOW)));
+        return Line::from(spans);
+    }
+    // Signed in on the folder an older version made: Claude asks before
+    // every edit in ~/.claude until it signs in again in its new folder.
+    if info.is_some_and(|i| i.old_folder) {
+        spans.push(Span::styled(
+            OLD_FOLDER_NOTICE.to_string(),
+            Style::new().fg(YELLOW),
+        ));
         return Line::from(spans);
     }
     let mut parts: Vec<String> = Vec::new();

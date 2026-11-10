@@ -168,12 +168,7 @@ pub fn usable(store: &Store, id: &str) -> bool {
         Some(Kind::ApiKey) => secret::exists(id),
         // Signed in at least once: Claude Code wrote the account into the
         // folder's config. (Whether the login still works takes a second.)
-        Some(Kind::Subscription) => {
-            std::fs::read_to_string(mirror::home_of(id).join(".claude.json"))
-                .ok()
-                .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
-                .is_some_and(|v| v["oauthAccount"].is_object())
-        }
+        Some(Kind::Subscription) => mirror::has_login(&mirror::folder(id)),
         Some(Kind::Main) => true,
         None => false,
     }
@@ -218,6 +213,14 @@ pub fn clean_env(cmd: &mut Command) {
     cmd.env_remove(ENV_SET);
 }
 
+/// The line a session on `dir` prints when that is the old folder `home`
+/// an older version made: Claude asks before every edit in ~/.claude there.
+pub fn start_note(dir: &std::path::Path, home: &std::path::Path, name: &str) -> Option<String> {
+    (dir == home).then(|| format!(
+        "{name} still uses the folder an older version made, so Claude asks before every edit in ~/.claude. Open the accounts list (Herdr: the Multiaccount action) and press l on {name} to sign in again."
+    ))
+}
+
 /// Variables to set and variables to remove for a session.
 pub type SessionEnv = (Vec<(String, String)>, Vec<&'static str>);
 
@@ -230,7 +233,7 @@ pub fn session_env(store: &Store, id: &str) -> Result<SessionEnv, String> {
     match account.kind {
         Kind::Main => {}
         Kind::Subscription => {
-            let report =
+            let (dir, report) =
                 mirror::sync(id).map_err(|e| format!("could not prepare its folder: {e}"))?;
             for name in &report.separate {
                 eprintln!(
@@ -242,7 +245,7 @@ pub fn session_env(store: &Store, id: &str) -> Result<SessionEnv, String> {
             // main login (or ask to sign in, where the browser may pick the
             // wrong account): stop with a clear message instead. When Claude
             // Code cannot be asked, start anyway.
-            if let Some(text) = info::status_text(Some(&mirror::home_of(id))) {
+            if let Some(text) = info::status_text(Some(&dir)) {
                 let i = info::parse_status(&text);
                 if !i.signed_in || i.borrows_main {
                     return Err(format!(
@@ -251,9 +254,12 @@ pub fn session_env(store: &Store, id: &str) -> Result<SessionEnv, String> {
                     ));
                 }
             }
+            if let Some(note) = start_note(&dir, &mirror::home_of(id), &account.name) {
+                eprintln!("herdr-multiaccount: {note}");
+            }
             set.push((
                 "CLAUDE_CONFIG_DIR".into(),
-                mirror::home_of(id).to_string_lossy().to_string(),
+                dir.to_string_lossy().to_string(),
             ));
             remove.extend(OVERRIDING);
         }
@@ -544,5 +550,17 @@ mod tests {
         );
         assert_eq!(c.id, "a");
         assert!(c.moved.is_none());
+    }
+
+    #[test]
+    fn a_session_on_the_old_folder_says_to_sign_in_again() {
+        let home = std::path::Path::new("/x/homes/work");
+        let note = start_note(home, home, "Work").unwrap();
+        assert!(note.contains("press l on Work to sign in again"), "{note}");
+        assert!(
+            note.contains("asks before every edit in ~/.claude"),
+            "{note}"
+        );
+        assert_eq!(start_note(&home.join(".claude"), home, "Work"), None);
     }
 }

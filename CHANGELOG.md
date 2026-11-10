@@ -29,6 +29,12 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- In a session on a subscription account, Claude no longer asks before every
+  edit in `~/.claude` (skills, `CLAUDE.md`, settings): each account's folder
+  is now `homes/<account>/.claude/`, so auto mode checks these edits as on
+  the main login. Accounts added with 1.0.0 have to sign in once more (`l`);
+  their row and their sessions say so, and they keep working on their old
+  folder until then. Nothing in `~/.claude` changes.
 - Closing the list while a session is being moved no longer stops the move
   halfway and leaves the session ended without a word: the move runs in a
   process of its own and finishes; a failure shows in the next list, or as

@@ -6,7 +6,9 @@
 //! <config>/config.toml       settings (optional, by hand)
 //! <config>/accounts.json     accounts, active account, spaces
 //! <config>/usage/<id>.json   last usage reading per account
-//! <config>/homes/<id>/       an account's Claude Code folder (links to ~/.claude)
+//! <config>/homes/<id>/.claude/ an account's Claude Code folder (links to ~/.claude)
+//! <config>/homes/<id>/       its old folder from version 1.0.0, until it signs in again
+//! <config>/homes/<id>.new    the account signed in in its new folder
 //! <config>/bin/herdr-multiaccount a copy of the binary for the shell function
 //! <config>/backups/          files replaced while setting up or healing links
 //! ```

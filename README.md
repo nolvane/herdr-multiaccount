@@ -148,8 +148,10 @@ Claude Code supports several accounts through
 [`CLAUDE_CONFIG_DIR`](https://code.claude.com/docs/en/authentication#log-in-with-multiple-accounts):
 a folder per account, each with its own login. Separate folders would mean
 separate settings and history, so the plugin keeps each account's folder in
-`~/.config/herdr/plugins/config/multiaccount/homes/<account>/` and fills it with
-links to the entries of `~/.claude`. Only what belongs to the login stays in
+`~/.config/herdr/plugins/config/multiaccount/homes/<account>/.claude/` and fills
+it with links to the entries of `~/.claude`. The folder is named `.claude`, so
+Claude Code treats edits through its links like edits in `~/.claude` on the
+main login: in auto mode they go to its check instead of asking every time. Only what belongs to the login stays in
 the folder: Claude Code's global config with the signed-in account, the
 organisation's policy files, the background-session daemon. Your MCP servers
 and per-project trust are copied into it from `~/.claude.json` whenever a
@@ -159,6 +161,12 @@ session starts.
   login`, run by the list in a dialog you can cancel with `Esc`), and Claude
   Code keeps the login itself (on macOS in the Keychain, one entry per
   folder). The plugin never sees a token.
+- **Accounts from version 1.0.0** were kept in `homes/<account>/` itself.
+  Claude Code ties a login to its folder's path, so these accounts sign in
+  once more after the update: their row says `l signs in again to stop edit
+  prompts`, and sessions started on them say the same. Until then they keep
+  working on their old folder, where Claude asks before every edit in
+  `~/.claude`. Removing the account signs out and deletes both folders.
 - **API keys** go into the system keychain (macOS Keychain, or the Secret
   Service through `secret-tool` on Linux). You paste the key into a field
   that shows dots; the plugin reads it only to start Claude Code with
@@ -291,7 +299,9 @@ Everything lives in the plugin's config directory
 |---|---|
 | `accounts.json` | The accounts, the active one, the spaces |
 | `usage/<account>.json` | Last usage reading and this month's sessions per account |
-| `homes/<account>/` | A subscription's Claude Code folder (links to `~/.claude`) |
+| `homes/<account>/.claude/` | A subscription's Claude Code folder (links to `~/.claude`) |
+| `homes/<account>/` | Holds that folder; for an account from version 1.0.0 also its old folder, used until it signs in again |
+| `homes/<account>.new` | Notes that the account signed in in its new folder and never goes back to the old one |
 | `bin/herdr-multiaccount` | The copy the shell function and status line run |
 | `backups/` | Files replaced by setup or when a link was restored; only you can open it, and each copy keeps the original's permissions |
 | `probe/` | Where the limit checks run (empty) |

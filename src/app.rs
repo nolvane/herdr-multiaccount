@@ -517,7 +517,7 @@ impl App {
                 }
             })
             .map(|a| {
-                let home = a.kind.has_home().then(|| mirror::home_of(&a.id));
+                let home = a.kind.has_home().then(|| mirror::folder(&a.id));
                 (a.id.clone(), home)
             })
             .collect()
@@ -1659,8 +1659,8 @@ impl App {
     /// folder is signed out first, and its id is never used again.
     fn drop_new_account(&mut self, id: &str) {
         let failed = match self.store.account(id).cloned() {
-            Some(a) if a.kind == Kind::Subscription => !sign_out(&a),
-            _ => false,
+            Some(a) if a.kind == Kind::Subscription => sign_out(&a),
+            _ => vec![],
         };
         let _ = mirror::remove(id);
         self.update(|s| {
@@ -1669,8 +1669,8 @@ impl App {
                 s.retired.push(id.to_string());
             }
         });
-        if failed {
-            self.mode = sign_out_failed(id);
+        if !failed.is_empty() {
+            self.mode = sign_out_failed(&failed);
         }
     }
 
@@ -1685,8 +1685,11 @@ impl App {
         };
         let s = self.signin.take().expect("checked above");
         let account = self.store.account(&s.id).cloned();
+        let was_old = self.info.get(&s.id).is_some_and(|i| i.old_folder);
         let info = account.as_ref().map(info::read).unwrap_or_default();
         if ok && info.signed_in && !info.borrows_main {
+            // From now on the account stays on its new folder.
+            mirror::mark_moved(&mirror::home_of(&s.id));
             let who = info
                 .email
                 .clone()
@@ -1715,6 +1718,11 @@ impl App {
                     "That is the same login as {}. If you meant another account, sign out in the browser (or use a private window) and press l to sign in again.",
                     same.join(", ")
                 ));
+            }
+            if was_old && !info.old_folder {
+                lines.push(
+                    "New sessions on it use its new folder, where Claude no longer asks before every edit in ~/.claude. Sessions already running keep their old folder until they end.".into(),
+                );
             }
             self.info.insert(s.id.clone(), info);
             self.mode = Mode::Message {
@@ -1811,7 +1819,7 @@ impl App {
         let Some(a) = self.store.account(id).cloned() else {
             return;
         };
-        let mut signed_out = true;
+        let mut still_signed_in = vec![];
         match a.kind {
             Kind::Main => return,
             Kind::ApiKey => {
@@ -1831,7 +1839,7 @@ impl App {
                 }
             }
             Kind::Subscription => {
-                signed_out = sign_out(&a);
+                still_signed_in = sign_out(&a);
                 match mirror::remove(id) {
                     Ok(kept) if !kept.is_empty() => {
                         self.flash(
@@ -1867,11 +1875,11 @@ impl App {
         }
         let _ = std::fs::remove_file(paths::usage_dir().join(format!("{id}.json")));
         self.info.remove(id);
-        if !signed_out {
+        if !still_signed_in.is_empty() {
             // Removed anyway: its id is never used again, so no new account
             // can find the login. Saying so keeps the login from being
             // forgotten.
-            self.mode = sign_out_failed(id);
+            self.mode = sign_out_failed(&still_signed_in);
         } else if self.flash.is_none() {
             self.flash(format!("Removed {}", a.name), crate::theme::ACCENT);
         }
@@ -2603,13 +2611,34 @@ fn copy(text: &str) -> bool {
     false
 }
 
-/// Signs an account's folder out of its own claude.ai login, and checks
-/// that it worked. A folder without a login of its own (or one that only
-/// borrows the main login, which must not be signed out) needs nothing.
-/// False when a login is still there afterwards.
-fn sign_out(a: &Account) -> bool {
-    let own_login = |i: &crate::info::Info| i.signed_in && !i.borrows_main;
-    if !own_login(&info::read(a)) {
+/// The folders of an account that may hold a login: its folder, and the
+/// old folder an older version signed in (it has a config file of its own).
+fn login_folders(home: &std::path::Path) -> Vec<PathBuf> {
+    // A real folder only: an old link of that name leads into ~/.claude.
+    let mut out: Vec<PathBuf> = mirror::real_new_dir(home).into_iter().collect();
+    if home.join(".claude.json").exists() || home.join(".credentials.json").exists() {
+        out.push(home.to_path_buf());
+    }
+    out
+}
+
+/// Signs every folder of an account out of its own claude.ai login, and
+/// checks that it worked. A folder without a login of its own (or one that
+/// only borrows the main login, which must not be signed out) needs
+/// nothing. Returns the folders that still have a login afterwards.
+fn sign_out(a: &Account) -> Vec<PathBuf> {
+    login_folders(&mirror::home_of(&a.id))
+        .into_iter()
+        .filter(|dir| !sign_out_folder(dir))
+        .collect()
+}
+
+fn sign_out_folder(dir: &std::path::Path) -> bool {
+    let own_login = |dir: &std::path::Path| {
+        let i = info::parse_status(&info::status_text(Some(dir)).unwrap_or_default());
+        i.signed_in && !i.borrows_main
+    };
+    if !own_login(dir) {
         return true;
     }
     let Some(claude) = launch::find_claude() else {
@@ -2620,27 +2649,30 @@ fn sign_out(a: &Account) -> bool {
     // login would be signed out.
     launch::clean_env(&mut cmd);
     cmd.args(["auth", "logout"])
-        .env("CLAUDE_CONFIG_DIR", mirror::home_of(&a.id))
+        .env("CLAUDE_CONFIG_DIR", dir)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
     let _ = cmd.status();
-    !own_login(&info::read(a))
+    !own_login(dir)
 }
 
 /// The notice when a removed account's login could not be signed out, with
-/// the command that does it by hand.
-fn sign_out_failed(id: &str) -> Mode {
+/// the command that does it by hand for each folder still signed in.
+fn sign_out_failed(dirs: &[PathBuf]) -> Mode {
+    let mut lines = vec![
+        "Claude Code may still keep this account's login. The plugin never reuses its folder, so no other account gets it.".into(),
+        "To remove the login, run in a terminal:".into(),
+    ];
+    for dir in dirs {
+        lines.push(format!(
+            "CLAUDE_CONFIG_DIR=\"{}\" command claude auth logout",
+            dir.display()
+        ));
+    }
     Mode::Message {
         title: "Sign-out did not work".into(),
-        lines: vec![
-            "Claude Code may still keep this account's login. The plugin never reuses its folder, so no other account gets it.".into(),
-            "To remove the login, run in a terminal:".into(),
-            format!(
-                "CLAUDE_CONFIG_DIR=\"{}\" command claude auth logout",
-                mirror::home_of(id).display()
-            ),
-        ],
+        lines,
         good: false,
     }
 }
@@ -2772,7 +2804,15 @@ mod tests {
     fn sign_out_failure_names_the_command() {
         for (w, h) in [(100, 30), (60, 20)] {
             let mut a = app();
-            a.mode = sign_out_failed("ultra");
+            a.mode = sign_out_failed(&[mirror::new_dir_of("ultra"), mirror::home_of("ultra")]);
+            // One command per folder still signed in.
+            let Mode::Message { lines, .. } = &a.mode else {
+                panic!("no message")
+            };
+            let commands: Vec<&String> =
+                lines.iter().filter(|l| l.contains("auth logout")).collect();
+            assert_eq!(commands.len(), 2);
+            assert!(commands[0].contains("ultra/.claude\""), "{}", commands[0]);
             let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
             t.draw(|f| ui::draw(f, &mut a)).unwrap();
             let buf = t.backend().buffer();
@@ -2786,6 +2826,116 @@ mod tests {
             assert!(screen.contains("Sign-out did not work"), "{screen}");
             assert!(screen.contains("auth logout"), "{screen}");
         }
+    }
+
+    #[test]
+    fn sign_out_never_runs_through_a_link_named_claude() {
+        let root = std::env::temp_dir().join(format!("hm-login-folders-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let home = root.join("homes").join("work");
+        let elsewhere = root.join("dot-claude").join(".claude");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, home.join(mirror::NEW)).unwrap();
+        assert!(
+            login_folders(&home).is_empty(),
+            "the link is no folder of the account"
+        );
+        std::fs::write(home.join(".claude.json"), "{}").unwrap();
+        assert_eq!(login_folders(&home), vec![home.clone()]);
+        std::fs::remove_file(home.join(mirror::NEW)).unwrap();
+        std::fs::create_dir_all(home.join(mirror::NEW)).unwrap();
+        assert_eq!(
+            login_folders(&home),
+            vec![home.join(mirror::NEW), home.clone()]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_account_on_its_old_folder_says_to_sign_in_again() {
+        for w in [160, 100] {
+            let mut a = app();
+            a.info.insert(MAIN_ID.into(), signed_in("Max"));
+            a.info.insert(
+                "personal".into(),
+                Info {
+                    old_folder: true,
+                    ..signed_in("Pro")
+                },
+            );
+            a.store.accounts.push(Account {
+                id: "work".into(),
+                name: "Work".into(),
+                kind: Kind::Subscription,
+                sso: false,
+                fallback: true,
+            });
+            a.info.insert("work".into(), signed_in("Team"));
+            let mut t = Terminal::new(TestBackend::new(w, 30)).unwrap();
+            t.draw(|f| ui::draw(f, &mut a)).unwrap();
+            let buf = t.backend().buffer();
+            let rows: Vec<String> = (0..30)
+                .map(|y| (0..w).map(|x| buf[(x, y)].symbol().to_string()).collect())
+                .collect();
+            if std::env::var("SHOW_SCREEN").is_ok() {
+                println!("{}", rows.join("\n"));
+            }
+            let with: Vec<&String> = rows
+                .iter()
+                .filter(|r| r.contains("l signs in again"))
+                .collect();
+            assert_eq!(with.len(), 1, "only Personal's row: {}", rows.join("\n"));
+            assert!(
+                with[0].contains(ui::OLD_FOLDER_NOTICE),
+                "whole notice: {}",
+                with[0]
+            );
+            let screen = rows.join("\n");
+            assert!(screen.contains("Team"), "Work shows its plan: {screen}");
+        }
+    }
+
+    #[test]
+    fn a_limit_still_shows_on_an_account_on_its_old_folder() {
+        let mut a = app();
+        a.info.insert(
+            "personal".into(),
+            Info {
+                old_folder: true,
+                ..signed_in("Pro")
+            },
+        );
+        let now = a.now();
+        a.usage.insert("personal".into(), full_at(97.0, now));
+        let mut t = Terminal::new(TestBackend::new(160, 30)).unwrap();
+        t.draw(|f| ui::draw(f, &mut a)).unwrap();
+        let screen: String = t
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(screen.contains("at its 5-hour limit"), "{screen}");
+    }
+
+    #[test]
+    fn a_never_signed_in_account_shows_the_usual_text() {
+        let mut a = app();
+        // Not signed in anywhere: no sign-in-again notice.
+        a.info.insert("personal".into(), Info::default());
+        let mut t = Terminal::new(TestBackend::new(160, 30)).unwrap();
+        t.draw(|f| ui::draw(f, &mut a)).unwrap();
+        let screen: String = t
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(screen.contains("not signed in · l signs in"), "{screen}");
+        assert!(!screen.contains("signs in again"), "{screen}");
     }
 
     #[test]
