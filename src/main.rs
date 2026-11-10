@@ -5,12 +5,14 @@
 //!
 //! - `list` (default): the list, in the current terminal.
 //! - `open [overlay|split|tab]`: the plugin action; opens or closes the list.
-//! - `run -- <args>`: what the `claude` shell function calls.
+//! - `run -- <args>`: what the `claude` shell function calls; `run --moved --
+//!   --resume <id>` is what a move types (`relocate.rs`).
 //! - `statusline`: Claude Code's status line command after setup.
 //! - `setup [--undo]`, `status`, `use <account>`: for the command line.
 //! - `startup`, `pane-event`, `install-bin`: Herdr hooks and the build.
 
 mod app;
+mod carry;
 mod config;
 mod herdr;
 mod info;
@@ -238,6 +240,17 @@ fn use_account(name: Option<String>) -> i32 {
     }
 }
 
+/// `run [--moved] -- <claude args>`: whether the list moved the session
+/// here, and Claude Code's arguments. Only the first `--` separates; later
+/// ones are Claude Code's. `--moved` counts only right before that `--`.
+fn run_args(args: &[String]) -> (bool, Vec<String>) {
+    match args {
+        [m, sep, rest @ ..] if m == "--moved" && sep == "--" => (true, rest.to_vec()),
+        [sep, rest @ ..] if sep == "--" => (false, rest.to_vec()),
+        rest => (false, rest.to_vec()),
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let command = args.first().cloned().unwrap_or_else(|| "list".into());
@@ -269,13 +282,8 @@ fn main() {
             }
         }
         "run" => {
-            // Only the first `--` separates; later ones are Claude Code's.
-            let skip = if args.get(1).map(String::as_str) == Some("--") {
-                2
-            } else {
-                1
-            };
-            launch::run(args[skip.min(args.len())..].to_vec())
+            let (moved, rest) = run_args(&args[1..]);
+            launch::run(rest, moved)
         }
         "statusline" => statusline::run(),
         "startup" => startup(),
@@ -334,5 +342,23 @@ mod tests {
         let v = serde_json::json!({"event": "pane.agent_status_changed", "data": {"pane": {"pane_id": "w1:p2"}}});
         assert_eq!(find_pane_id(&v).as_deref(), Some("w1:p2"));
         assert_eq!(find_pane_id(&serde_json::json!({"x": 1})), None);
+    }
+
+    #[test]
+    fn run_reads_moved_only_before_the_separator() {
+        let s = |l: &[&str]| l.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            run_args(&s(&["--moved", "--", "--resume", "x"])),
+            (true, s(&["--resume", "x"]))
+        );
+        assert_eq!(
+            run_args(&s(&["--", "--moved", "--", "a"])),
+            (false, s(&["--moved", "--", "a"]))
+        );
+        assert_eq!(run_args(&s(&["--moved"])), (false, s(&["--moved"])));
+        assert_eq!(
+            run_args(&s(&["--model", "x"])),
+            (false, s(&["--model", "x"]))
+        );
     }
 }

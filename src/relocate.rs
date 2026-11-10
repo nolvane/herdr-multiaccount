@@ -11,11 +11,16 @@
 //! 2. Wait until it has left the pane and the pane's shell is back in front.
 //! 3. Type `HERDR_MULTIACCOUNT_USE=<account> "<binary>" run -- --resume <id>`
 //!    into the shell. The launcher labels the pane and notes the account.
+//!    When the session has start options or a model to carry over
+//!    (`carry.rs`), the list writes them to a one-time hand-over file before
+//!    step 1, and types `run --moved -- --resume <id>`: the launcher adds
+//!    them, so no option value is ever typed into the shell.
 //! 4. Wait until Herdr sees Claude Code in the pane again.
 //!
 //! The list checks before that the session is idle and which conversation
 //! it holds (`sessions::Conversation`, noted by the status line).
 
+use crate::carry::Moved;
 use crate::herdr::{self, Processes};
 use crate::launch;
 use std::time::{Duration, Instant};
@@ -31,6 +36,8 @@ pub struct Plan {
     pub pid: u32,
     pub account_id: String,
     pub account_name: String,
+    /// The start options and model it carries over.
+    pub carry: Moved,
 }
 
 /// What the move needs from Herdr; a fake in tests.
@@ -42,6 +49,9 @@ pub trait Io {
     fn run(&self, pane: &str, command: &str) -> bool;
     fn agent(&self, pane: &str) -> Option<String>;
     fn sleep(&self, d: Duration);
+    /// Writes the hand-over for the launcher (`sessions::write_hand_over`).
+    fn hand_over(&self, pane: &str, session_id: &str, args: &[String]) -> bool;
+    fn drop_hand_over(&self, pane: &str);
 }
 
 struct Herdr;
@@ -64,6 +74,12 @@ impl Io for Herdr {
     }
     fn sleep(&self, d: Duration) {
         std::thread::sleep(d);
+    }
+    fn hand_over(&self, pane: &str, session_id: &str, args: &[String]) -> bool {
+        crate::sessions::write_hand_over(pane, session_id, args)
+    }
+    fn drop_hand_over(&self, pane: &str) {
+        crate::sessions::drop_hand_over(pane);
     }
 }
 
@@ -89,8 +105,14 @@ fn safe_account_id(id: &str) -> bool {
 /// The command that starts the conversation again on the account. `bin` is
 /// the plugin's binary as the `claude` shell function names it (inside
 /// double quotes, `$HOME` allowed), so the move also works in a shell
-/// started before setup.
-pub fn command(account_id: &str, session_id: &str, bin: &str) -> Result<String, String> {
+/// started before setup. `moved`: the launcher takes the start options from
+/// the hand-over.
+pub fn command(
+    account_id: &str,
+    session_id: &str,
+    bin: &str,
+    moved: bool,
+) -> Result<String, String> {
     if !safe_account_id(account_id) {
         return Err("the account id has characters a shell would misread".into());
     }
@@ -101,25 +123,35 @@ pub fn command(account_id: &str, session_id: &str, bin: &str) -> Result<String, 
     if bin.is_empty() || crate::setup::quotable(std::path::Path::new(rest)).is_err() {
         return Err("the plugin's path has characters a shell would misread".into());
     }
+    let flag = if moved { " --moved" } else { "" };
     Ok(format!(
-        "{}={account_id} \"{bin}\" run -- --resume {session_id}",
+        "{}={account_id} \"{bin}\" run{flag} -- --resume {session_id}",
         launch::ENV_USE
     ))
 }
 
-/// Starting the conversation by hand, once Claude Code has ended.
-fn resume_by_hand(account_id: &str, session_id: &str) -> String {
-    format!(
-        "{}={account_id} claude --resume {session_id}",
+/// Starting the conversation by hand, once Claude Code has ended: with the
+/// model, and naming the start options to add.
+fn resume_by_hand(account_id: &str, session_id: &str, carry: &Moved) -> String {
+    let (model, names) = carry.by_hand();
+    let mut text = format!(
+        "{}={account_id} claude --resume {session_id}{model}",
         launch::ENV_USE
-    )
+    );
+    if !names.is_empty() {
+        text.push_str(&format!(
+            ", adding the options it was started with ({})",
+            names.join(", ")
+        ));
+    }
+    text
 }
 
 /// The same move by hand, for the error messages.
-pub fn manual(account_id: &str, session_id: &str) -> String {
+pub fn manual(account_id: &str, session_id: &str, carry: &Moved) -> String {
     format!(
         "type /exit in it, then {}",
-        resume_by_hand(account_id, session_id)
+        resume_by_hand(account_id, session_id, carry)
     )
 }
 
@@ -187,10 +219,46 @@ fn wait(io: &dyn Io, limit: Duration, done: &dyn Fn() -> bool) -> bool {
 
 /// Runs a move: Ok with what to tell, or Err naming the way by hand.
 pub fn run_move(io: &dyn Io, plan: &Plan, bin: &str) -> Result<String, String> {
-    let by_hand = manual(&plan.account_id, &plan.session_id);
-    let resume = resume_by_hand(&plan.account_id, &plan.session_id);
-    let cmd = command(&plan.account_id, &plan.session_id, bin)
+    let by_hand = manual(&plan.account_id, &plan.session_id, &plan.carry);
+    let resume = resume_by_hand(&plan.account_id, &plan.session_id, &plan.carry);
+    let moved = !plan.carry.is_empty();
+    let cmd = command(&plan.account_id, &plan.session_id, bin, moved)
         .map_err(|e| format!("Nothing was changed: {e}. By hand: {by_hand}."))?;
+    // Written before anything happens to the session, so a failure here
+    // changes nothing.
+    if moved && !io.hand_over(&plan.pane, &plan.session_id, &plan.carry.args()) {
+        return Err(format!(
+            "Nothing was changed: its start options could not be saved for the move. By hand: {by_hand}."
+        ));
+    }
+    // Until the command is typed, a stop takes the hand-over back; after
+    // that the launcher may still read it, and it expires by itself.
+    let ended = end(io, plan, &by_hand, &resume);
+    let typed = ended.and_then(|()| {
+        if io.run(&plan.pane, &cmd) {
+            Ok(())
+        } else {
+            Err(format!(
+                "Claude Code ended, but Herdr could not start it again. By hand: {resume}."
+            ))
+        }
+    });
+    if let Err(e) = typed {
+        if moved {
+            io.drop_hand_over(&plan.pane);
+        }
+        return Err(e);
+    }
+    if !wait(io, START_WAIT, &|| started(io, &plan.pane, plan.pid)) {
+        return Err(format!(
+            "Claude Code did not start again in it; look at the pane for why. By hand: {resume}."
+        ));
+    }
+    Ok(format!("Moved {} to {}", plan.label, plan.account_name))
+}
+
+/// Ends Claude Code in the pane (steps 1 and 2), or says why not.
+fn end(io: &dyn Io, plan: &Plan, by_hand: &str, resume: &str) -> Result<(), String> {
     for n in 0..PRESSES {
         match front(io, &plan.pane, plan.pid) {
             Front::Ended => break,
@@ -233,17 +301,7 @@ pub fn run_move(io: &dyn Io, plan: &Plan, bin: &str) -> Result<String, String> {
             ),
         });
     }
-    if !io.run(&plan.pane, &cmd) {
-        return Err(format!(
-            "Claude Code ended, but Herdr could not start it again. By hand: {resume}."
-        ));
-    }
-    if !wait(io, START_WAIT, &|| started(io, &plan.pane, plan.pid)) {
-        return Err(format!(
-            "Claude Code did not start again in it; look at the pane for why. By hand: {resume}."
-        ));
-    }
-    Ok(format!("Moved {} to {}", plan.label, plan.account_name))
+    Ok(())
 }
 
 /// The move against the real Herdr (on the list's background thread).
@@ -275,6 +333,11 @@ mod tests {
         /// Herdr says `working` from this many presses on.
         busy_after: Option<usize>,
         presses: RefCell<usize>,
+        /// The hand-over as written, and whether it was taken back.
+        handed: RefCell<Option<(String, Vec<String>)>>,
+        dropped: RefCell<bool>,
+        /// Writing the hand-over fails.
+        no_hand_over: bool,
         ran: RefCell<Vec<String>>,
         log: RefCell<Vec<String>>,
         slept: RefCell<Duration>,
@@ -290,6 +353,9 @@ mod tests {
                 launcher_stays: false,
                 busy_after: None,
                 presses: RefCell::new(0),
+                handed: RefCell::new(None),
+                dropped: RefCell::new(false),
+                no_hand_over: false,
                 ran: RefCell::new(vec![]),
                 log: RefCell::new(vec![]),
                 slept: RefCell::new(Duration::ZERO),
@@ -344,6 +410,15 @@ mod tests {
         fn sleep(&self, d: Duration) {
             *self.slept.borrow_mut() += d;
         }
+        fn hand_over(&self, _: &str, session_id: &str, args: &[String]) -> bool {
+            assert_eq!(*self.presses.borrow(), 0, "written before any Ctrl+C");
+            self.log.borrow_mut().push("hand over".into());
+            *self.handed.borrow_mut() = Some((session_id.to_string(), args.to_vec()));
+            !self.no_hand_over
+        }
+        fn drop_hand_over(&self, _: &str) {
+            *self.dropped.borrow_mut() = true;
+        }
     }
 
     fn plan() -> Plan {
@@ -354,23 +429,109 @@ mod tests {
             pid: 400,
             account_id: "work".into(),
             account_name: "Work".into(),
+            carry: Moved::default(),
         }
+    }
+
+    /// A session started with options, now on another model.
+    fn carrying() -> Plan {
+        Plan {
+            carry: Moved {
+                options: Some(vec![
+                    "--model=sonnet".into(),
+                    "--add-dir=/work/lib".into(),
+                    "--append-system-prompt=it's $(x) `y`; z\n[1m]".into(),
+                ]),
+                dropped: vec!["--worktree".into()],
+                model: Some("claude-opus-4-5[1m]".into()),
+            },
+            ..plan()
+        }
+    }
+
+    #[test]
+    fn options_go_through_the_hand_over_never_through_the_shell() {
+        let io = Fake::new(Some(2), true);
+        let p = carrying();
+        assert!(run_move(&io, &p, BIN).is_ok());
+        let typed = io.ran.borrow()[0].clone();
+        assert_eq!(
+            typed,
+            format!("HERDR_MULTIACCOUNT_USE=work \"{BIN}\" run --moved -- --resume {ID}")
+        );
+        let (id, args) = io.handed.borrow().clone().unwrap();
+        assert_eq!(id, ID);
+        assert_eq!(args, p.carry.args());
+        for a in &args {
+            let value = a.split_once('=').map(|(_, v)| v).unwrap_or("");
+            assert!(value.is_empty() || !typed.contains(value), "{a} typed");
+        }
+        assert_eq!(io.log.borrow()[0], "hand over", "before the first Ctrl+C");
+        assert!(!*io.dropped.borrow(), "left for the launcher");
+    }
+
+    #[test]
+    fn a_move_that_stops_before_typing_takes_the_hand_over_back() {
+        let mut p = carrying();
+        // Does not end.
+        let io = Fake::new(None, true);
+        assert!(run_move(&io, &p, BIN).is_err());
+        assert!(*io.dropped.borrow());
+        // Starts working.
+        let mut io = Fake::new(Some(3), true);
+        io.busy_after = Some(1);
+        assert!(run_move(&io, &p, BIN).is_err());
+        assert!(*io.dropped.borrow());
+        // The hand-over cannot be written: nothing is pressed.
+        let mut io = Fake::new(Some(2), true);
+        io.no_hand_over = true;
+        let e = run_move(&io, &p, BIN).unwrap_err();
+        assert!(e.starts_with("Nothing was changed"), "{e}");
+        assert_eq!(*io.presses.borrow(), 0);
+        // Nothing to carry: no hand-over, the command as before.
+        p.carry = Moved::default();
+        let io = Fake::new(Some(2), true);
+        assert!(run_move(&io, &p, BIN).is_ok());
+        assert!(io.handed.borrow().is_none());
+        assert!(!io.ran.borrow()[0].contains("--moved"));
+    }
+
+    #[test]
+    fn the_way_by_hand_names_the_model_and_the_options() {
+        let io = Fake::new(None, true);
+        let e = run_move(&io, &carrying(), BIN).unwrap_err();
+        assert!(
+            e.contains(&format!(
+                "HERDR_MULTIACCOUNT_USE=work claude --resume {ID} --model 'claude-opus-4-5[1m]', adding the options it was started with (--add-dir, --append-system-prompt)"
+            )),
+            "{e}"
+        );
+        assert!(!e.contains("$(x)"), "no values: {e}");
+        // A started --model is named when the current one is not known.
+        let mut p = carrying();
+        p.carry.model = None;
+        let io = Fake::new(None, true);
+        let e = run_move(&io, &p, BIN).unwrap_err();
+        assert!(
+            e.contains(&format!("--resume {ID} --model 'sonnet'")),
+            "{e}"
+        );
     }
 
     #[test]
     fn the_command_resumes_that_conversation_on_that_account() {
         assert_eq!(
-            command("work", ID, BIN).unwrap(),
+            command("work", ID, BIN, false).unwrap(),
             format!("HERDR_MULTIACCOUNT_USE=work \"{BIN}\" run -- --resume {ID}")
         );
-        assert!(command("main", ID, "/opt/hm/bin/herdr-multiaccount").is_ok());
+        assert!(command("main", ID, "/opt/hm/bin/herdr-multiaccount", false).is_ok());
         for bad in ["", "work; rm -rf ~", "a b", "$(x)", "wörk"] {
-            assert!(command(bad, ID, BIN).is_err(), "{bad}");
+            assert!(command(bad, ID, BIN, false).is_err(), "{bad}");
         }
-        assert!(command("work", "not-a-uuid", BIN).is_err());
-        assert!(command("work", &format!("{ID};ls"), BIN).is_err());
+        assert!(command("work", "not-a-uuid", BIN, false).is_err());
+        assert!(command("work", &format!("{ID};ls"), BIN, false).is_err());
         for bad in ["", "$HOME/a\"b", "/a/$(x)", "/a/`x`", "$HOME/$HOME/x"] {
-            assert!(command("work", ID, bad).is_err(), "{bad}");
+            assert!(command("work", ID, bad, false).is_err(), "{bad}");
         }
     }
 

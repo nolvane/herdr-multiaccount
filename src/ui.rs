@@ -1059,15 +1059,32 @@ fn draw_confirm(frame: &mut Frame, app: &mut App, c: &crate::app::Confirm) {
     } else {
         (1, 3)
     };
+    // Taller than the pane: the text scrolls, with a line that says so.
+    let room = inner.height.saturating_sub(rest);
+    let lines = wrapped.len() as u16;
+    let visible = if lines > room {
+        room.saturating_sub(1)
+    } else {
+        room
+    };
+    app.confirm_max = lines.saturating_sub(visible);
+    app.confirm_scroll = app.confirm_scroll.min(app.confirm_max);
     frame.render_widget(
-        Paragraph::new(Text::from(wrapped)),
-        Rect::new(
-            inner.x,
-            inner.y + top,
-            inner.width,
-            inner.height.saturating_sub(rest),
-        ),
+        Paragraph::new(Text::from(wrapped)).scroll((app.confirm_scroll, 0)),
+        Rect::new(inner.x, inner.y + top, inner.width, visible),
     );
+    if app.confirm_max > 0 {
+        let left = app.confirm_max - app.confirm_scroll;
+        let hint = if left == 0 {
+            "↑ ↓ scroll · end".to_string()
+        } else {
+            format!("↑ ↓ scroll · {left} more lines")
+        };
+        frame.render_widget(
+            Paragraph::new(Span::styled(hint, Style::new().fg(FAINT))),
+            Rect::new(inner.x, inner.y + top + visible, inner.width, 1),
+        );
+    }
     let y = inner.y + inner.height.saturating_sub(1);
     let yes = " y yes ";
     let no = " n no ";

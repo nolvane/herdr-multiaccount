@@ -14,6 +14,12 @@ All notable changes to this project are documented here. The format follows
 
 ### Changed
 
+- A session moved with `m` keeps the model it ran on and the options it was
+  started with that are safe to give again (such as `--permission-mode`,
+  `--add-dir` and `--dangerously-skip-permissions`); the prompt and options
+  that pick a conversation or could replace the login are never given
+  again. The question names what carries over, and scrolls when it is
+  taller than the pane.
 - The Sessions tab is called Agents, the word Herdr's sidebar uses.
 
 ### Fixed

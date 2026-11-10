@@ -62,9 +62,25 @@ to the next account when one is at its limit.
   one at its limit hands over to the next account with room, as at any
   start, and the question says where the session goes. The first answer
   afterwards is slower and counts more against the new account's limit,
-  because Claude Code's cache of the conversation stays with the old login;
-  text typed but not sent is lost, and options it was started with (such as
-  `--model`) are not carried over. A session that is working or waiting for
+  because Claude Code's cache of the conversation stays with the old login,
+  and text typed but not sent is lost. The session keeps the model it runs
+  on right before the move (also one picked with `/model`) and the options
+  it was started with that are safe to give again: `--model`,
+  `--permission-mode`, `--dangerously-skip-permissions`,
+  `--allow-dangerously-skip-permissions`, `--add-dir`, `--mcp-config`,
+  `--strict-mcp-config`, `--agent`, `--agents`, `--allowedTools`,
+  `--disallowedTools`, `--tools`, `--effort`, `--fallback-model`,
+  `--plugin-dir`, `--append-system-prompt`, `--system-prompt`, `--chrome`,
+  `--no-chrome`, `--ide`, `--verbose`, `--name`, `--restricted`,
+  `--safe-mode` and `--disable-slash-commands`. The prompt it was started
+  with is never sent again, and options that pick, fork or end a
+  conversation or start it elsewhere (`--continue`, `--resume`,
+  `--session-id`, `--fork-session`, `--print`, `--worktree`, `--bg` and the
+  like) or could replace the account's login (`--settings`,
+  `--setting-sources`, `--bare`) are never given again; the question names
+  what carries over and what does not. Sessions started before this version
+  or without the plugin's `claude` function keep only their model, when
+  their status line has noted it. A session that is working or waiting for
   an answer is not moved. Sessions started without the plugin count as the
   main login.
 - **Pane labels.** Each Claude Code pane carries the account it runs on, for

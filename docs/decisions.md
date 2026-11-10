@@ -373,8 +373,9 @@ no work in progress is cut off.
   note without a `wanted` account, so the reminder of an earlier fallback no
   longer fires. The list waits up to 20 s until Herdr sees Claude Code again;
   the launcher itself in front does not count, as it may still stop before
-  Claude Code starts (a missing key). Only `--resume <id>` is passed: options
-  the session was started with (such as `--model`) are not carried over.
+  Claude Code starts (a missing key). Its start options and current model
+  are carried over since #9 (see "A move keeps the start options and the
+  model").
 - **Which accounts.** Every account signed in with a login or key of its
   own, except the session's own and those with the same login. Sessions
   started without the plugin count as the main login. An account at its
@@ -388,3 +389,64 @@ no work in progress is cut off.
 - While a move runs (up to about half a minute), quitting the list, `d` and
   another `m` wait, since quitting halfway would leave the session ended.
 
+## 2026-11-10: A move keeps the start options and the model
+
+A session moved with `m` (#9) starts again with the options it was started
+with that are safe to give again, and on the model it ran on right before
+the move.
+
+- **Which options.** `carry.rs` reads `claude`'s arguments the way Claude
+  Code's parser (commander) does, from a table of every option in `claude
+  --help` (2.1.311) with the kind of value it takes: one value (also one
+  starting with `-`), an optional value (not one starting with `-`), lists
+  (`--add-dir a b`; `--add-dir=a b` takes only `a`), combined short flags
+  (`-cp`), options after the prompt, and `--`. Kept: `--model`,
+  `--permission-mode`, `--dangerously-skip-permissions`,
+  `--allow-dangerously-skip-permissions`, `--add-dir`, `--mcp-config`,
+  `--strict-mcp-config`, `--agent`, `--agents`, `--allowedTools`,
+  `--disallowedTools`, `--tools`, `--effort`, `--fallback-model`,
+  `--plugin-dir`, `--append-system-prompt`, `--system-prompt`, `--chrome`,
+  `--no-chrome`, `--ide`, `--verbose`, `--name`, and `--restricted`,
+  `--safe-mode` and `--disable-slash-commands`, because dropping those three
+  would let the moved session do more than before. Never: the prompt,
+  options that pick, fork or end a conversation or start it elsewhere
+  (`--continue`, `--resume`, `--session-id`, `--fork-session`, `--print` and
+  its options, `--from-pr`, `--teleport`, `--cloud`, `--desktop`, `--bg`,
+  `--worktree`, `--tmux`, `--remote-control`), options that can set or
+  force a credential and so undo the account switch (`--settings` can set
+  `apiKeyHelper`, `--setting-sources`, `--bare` reads only
+  `ANTHROPIC_API_KEY`), and anything not in the table (an option of a newer
+  Claude Code is dropped until the table knows it). Kept options are written
+  back as `--name=value`, one per value, so a value can never be read as an
+  option; folders (`--add-dir`, `--plugin-dir`, `--mcp-config` and `--agents`
+  files) are made absolute, so they point to the same place after the move.
+  The system prompt options are passed again, but Claude Code keeps the
+  system prompt it recorded for the conversation anyway
+  (`--system-prompt-snapshot`), so nothing is promised about them.
+- **Where they are kept.** The launcher stores the kept options and the
+  names of the dropped ones in its pane note, which is now readable only by
+  its owner (values such as `--mcp-config` JSON may hold tokens). They count
+  only while that note's process is the conversation's Claude Code. The
+  status line notes `model.id` with the conversation; model ids are checked
+  against letters, digits and `._:/@[]-`.
+- **How they get there.** Option values are never typed into the pane:
+  they would land in the shell's history, zsh reads a model id like
+  `…[1m]` as a pattern, and a multi-line value breaks the typed line.
+  Before the first Ctrl+C the list writes a one-time hand-over,
+  `moves/<pane>.json` (file 0600, folder 0700): the conversation id, the
+  options with the current model in place of a started `--model`, and the
+  time. It types `… run --moved -- --resume <id>`. The launcher uses the
+  hand-over only when its arguments are exactly `--resume <id>` of the same
+  conversation and the hand-over is under 2 minutes old, deletes it in every
+  case, filters it through the same table again (so a file put there by
+  something else cannot add other options), and records the options again
+  for the next move. Without a usable hand-over it starts as before and
+  says so in one line. The list deletes the hand-over when the move stops
+  before the command is typed; after that the launcher may still read it,
+  and it expires by itself.
+- **The question.** It names the model and the carried options (values only
+  for short single words, so a long `--append-system-prompt` never stretches
+  it) and the dropped ones, or says the start options are not known. If the
+  model changed between the question and `y`, nothing is moved. A question
+  taller than the pane scrolls with ↑ ↓, as the keys overlay does. The way
+  by hand adds `--model '<id>'` and names the options to add.

@@ -1,5 +1,6 @@
 //! The list's state and what the keys and the mouse do.
 
+use crate::carry::Moved;
 use crate::config::{self, Config};
 use crate::herdr::{self, Pane, Workspace};
 use crate::info::{self, Info};
@@ -72,7 +73,16 @@ pub type PaneCloser = fn(&str) -> bool;
 /// The conversation a pane holds now and its Claude Code process
 /// (`real_conversation`), and the move itself (`relocate::perform`); fields
 /// so tests never reach Herdr.
-pub type ConversationOf = fn(&str) -> Option<(String, u32)>;
+pub type ConversationOf = fn(&str) -> Option<Held>;
+
+/// The conversation a pane holds, its Claude Code process, and what a move
+/// carries over.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Held {
+    pub session_id: String,
+    pub pid: u32,
+    pub carry: Moved,
+}
 pub type Mover = fn(relocate::Plan) -> Result<String, String>;
 
 /// The program that opens links: `open` on macOS, `xdg-open` elsewhere.
@@ -109,6 +119,8 @@ pub struct Moving {
     pub pid: u32,
     /// The account it runs on now (the main login when unknown).
     pub from: String,
+    /// The start options and model the move carries over.
+    pub carry: Moved,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -248,6 +260,9 @@ pub struct App {
     /// drawn).
     pub help_scroll: u16,
     pub help_max: u16,
+    /// The same for a question taller than the pane (set when drawn).
+    pub confirm_scroll: u16,
+    pub confirm_max: u16,
     pub flash: Option<(String, Color, Instant)>,
     pub setup: setup::State,
     pub signin: Option<SignIn>,
@@ -302,6 +317,8 @@ impl App {
             mode: Mode::Normal,
             help_scroll: 0,
             help_max: 0,
+            confirm_scroll: 0,
+            confirm_max: 0,
             flash: None,
             setup: setup::state(),
             signin: None,
@@ -671,7 +688,7 @@ impl App {
             return;
         }
         let from = self.session_account_id(&p);
-        let Some((session_id, pid)) = (self.conversation_of)(&p.id) else {
+        let Some(held) = (self.conversation_of)(&p.id) else {
             self.mode = Mode::Message {
                 title: format!("Which conversation {label} holds is not known"),
                 lines: vec![
@@ -733,9 +750,10 @@ impl App {
             purpose: PickFor::MoveSession(Moving {
                 pane: p.id,
                 label,
-                session_id,
-                pid,
+                session_id: held.session_id,
+                pid: held.pid,
                 from,
+                carry: held.carry,
             }),
         });
     }
@@ -784,6 +802,7 @@ impl App {
         lines.push(
             "It restarts there and its conversation carries on; unsent text in it is lost.".into(),
         );
+        lines.extend(session.carry.lines());
         // The conversation's cache stays with the old login.
         let api_key = self
             .store
@@ -826,9 +845,20 @@ impl App {
             self.flash(format!("{why}; nothing was moved"), crate::theme::YELLOW);
             return;
         }
-        if (self.conversation_of)(&s.pane) != Some((s.session_id.clone(), s.pid)) {
+        let Some(held) = (self.conversation_of)(&s.pane)
+            .filter(|h| h.session_id == s.session_id && h.pid == s.pid)
+        else {
             self.flash(
                 format!("{label} holds another conversation now; nothing was moved"),
+                crate::theme::YELLOW,
+            );
+            return;
+        };
+        // The question named what carries over; a /model since then would
+        // move it on something else.
+        if held.carry != s.carry {
+            self.flash(
+                format!("{label}'s model changed since; nothing was moved. Press m again"),
                 crate::theme::YELLOW,
             );
             return;
@@ -840,6 +870,7 @@ impl App {
             pid: s.pid,
             account_id: to.to_string(),
             account_name: self.store.name_of(to),
+            carry: s.carry,
         };
         let (tx, rx) = channel();
         let mover = self.mover;
@@ -1729,8 +1760,22 @@ impl App {
                 _ => {}
             },
             Mode::Confirm(c) => match k.code {
-                KeyCode::Char('y') => self.confirmed(c),
-                _ => self.mode = Mode::Normal,
+                // Only a question taller than the pane scrolls; otherwise
+                // these keys answer no, as any other.
+                KeyCode::Up | KeyCode::Char('k') if self.confirm_max > 0 => {
+                    self.scroll_confirm(-1, c)
+                }
+                KeyCode::Down | KeyCode::Char('j') if self.confirm_max > 0 => {
+                    self.scroll_confirm(1, c)
+                }
+                KeyCode::Char('y') => {
+                    self.confirm_scroll = 0;
+                    self.confirmed(c)
+                }
+                _ => {
+                    self.confirm_scroll = 0;
+                    self.mode = Mode::Normal
+                }
             },
             Mode::Pick(mut p) => match k.code {
                 KeyCode::Esc | KeyCode::Char('q') => self.mode = Mode::Normal,
@@ -1989,6 +2034,18 @@ impl App {
                 MouseEventKind::Down(MouseButton::Left) => self.click(m.column, m.row),
                 MouseEventKind::ScrollDown if self.mode == Mode::Help => self.scroll_help(2),
                 MouseEventKind::ScrollUp if self.mode == Mode::Help => self.scroll_help(-2),
+                MouseEventKind::ScrollDown | MouseEventKind::ScrollUp
+                    if matches!(self.mode, Mode::Confirm(_)) =>
+                {
+                    if let Mode::Confirm(c) = self.mode.clone() {
+                        let by = if m.kind == MouseEventKind::ScrollDown {
+                            1
+                        } else {
+                            -1
+                        };
+                        self.scroll_confirm(by, c);
+                    }
+                }
                 MouseEventKind::ScrollDown => {
                     if let Mode::Pick(mut p) = self.mode.clone() {
                         p.sel = (p.sel + 1).min(p.items.len().saturating_sub(1));
@@ -2009,6 +2066,13 @@ impl App {
             },
             _ => {}
         }
+    }
+
+    /// Scrolls a question taller than the pane; it stays open.
+    fn scroll_confirm(&mut self, by: i32, c: Confirm) {
+        self.confirm_scroll =
+            (self.confirm_scroll as i32 + by).clamp(0, self.confirm_max as i32) as u16;
+        self.mode = Mode::Confirm(c);
     }
 
     fn scroll_help(&mut self, by: i32) {
@@ -2068,10 +2132,30 @@ impl App {
 
 /// The conversation the status line noted for a pane, while its Claude
 /// Code still runs in front there: its session id and process.
-pub fn real_conversation(pane: &str) -> Option<(String, u32)> {
+pub fn real_conversation(pane: &str) -> Option<Held> {
     let note = crate::sessions::conversation(pane)?;
     let pid = crate::sessions::front_process(&note, &herdr::process_info(pane)?)?;
-    Some((note.session_id, pid))
+    Some(held_from(note, pid, crate::sessions::get(pane)))
+}
+
+/// What a move carries: the model from the status line's note, the start
+/// options from the launcher's note, which counts only for the same Claude
+/// Code process (the launcher execs, so the pid stays).
+fn held_from(
+    note: crate::sessions::Conversation,
+    pid: u32,
+    launcher: Option<crate::sessions::Entry>,
+) -> Held {
+    let launcher = launcher.filter(|e| e.pid == pid);
+    Held {
+        session_id: note.session_id,
+        pid,
+        carry: Moved {
+            options: launcher.as_ref().and_then(|e| e.options.clone()),
+            dropped: launcher.map(|e| e.dropped).unwrap_or_default(),
+            model: note.model,
+        },
+    }
 }
 
 /// Starts `opener` (`open`, `xdg-open`) on `url`. It is waited on in the
@@ -2960,23 +3044,67 @@ mod tests {
 
     const CONV: &str = "0b7f3c2e-1d4a-4c6b-9e8f-a1b2c3d4e5f6";
 
-    fn knows(_: &str) -> Option<(String, u32)> {
-        Some((CONV.into(), 4242))
+    fn held(session_id: &str, pid: u32, carry: Moved) -> Option<Held> {
+        Some(Held {
+            session_id: session_id.into(),
+            pid,
+            carry,
+        })
     }
 
-    fn knows_nothing(_: &str) -> Option<(String, u32)> {
+    /// A session started with options, on a model changed since.
+    fn started_with_options() -> Moved {
+        Moved {
+            options: Some(vec![
+                "--model=sonnet".into(),
+                "--add-dir=/work/lib".into(),
+                "--permission-mode=plan".into(),
+                format!("--append-system-prompt={}", "Be very careful. ".repeat(40)),
+            ]),
+            dropped: vec!["--worktree".into()],
+            model: Some("claude-opus-4-5[1m]".into()),
+        }
+    }
+
+    fn knows(_: &str) -> Option<Held> {
+        held(CONV, 4242, started_with_options())
+    }
+
+    fn knows_nothing(_: &str) -> Option<Held> {
         None
     }
 
-    fn knows_another(_: &str) -> Option<(String, u32)> {
-        Some(("11111111-2222-4333-8444-555555555555".into(), 4243))
+    fn knows_another(_: &str) -> Option<Held> {
+        held(
+            "11111111-2222-4333-8444-555555555555",
+            4243,
+            Moved::default(),
+        )
+    }
+
+    /// The same conversation, after a /model since the question.
+    fn knows_other_model(_: &str) -> Option<Held> {
+        let mut c = started_with_options();
+        c.model = Some("claude-haiku-4-5".into());
+        held(CONV, 4242, c)
+    }
+
+    /// A session started before this version, whose status line noted no
+    /// model either.
+    fn knows_only_the_conversation(_: &str) -> Option<Held> {
+        held(CONV, 4242, Moved::default())
     }
 
     /// Hands back what it was asked to do, without Herdr.
     fn moves(p: relocate::Plan) -> Result<String, String> {
         Ok(format!(
-            "moved {} {} {} {} to {}",
-            p.pane, p.label, p.session_id, p.pid, p.account_id
+            "moved {} {} {} {} to {} with {}",
+            p.pane,
+            p.label,
+            p.session_id,
+            p.pid,
+            p.account_id,
+            p.carry.args().len()
         ))
     }
 
@@ -3117,7 +3245,7 @@ mod tests {
         finish(&mut a);
         assert_eq!(
             flash_text(&a),
-            format!("moved w91:p1 Fix the login bug {CONV} 4242 to work")
+            format!("moved w91:p1 Fix the login bug {CONV} 4242 to work with 4")
         );
         assert_eq!(a.mode, Mode::Normal);
     }
@@ -3189,6 +3317,16 @@ mod tests {
             press(&mut a, key);
             assert_eq!(a.mode, Mode::Normal);
             assert!(a.moving.is_none(), "{key:?}");
+        }
+        // Up and Down answer no as well when the question fits.
+        for key in [KeyCode::Down, KeyCode::Char('k')] {
+            let mut a = movable();
+            press(&mut a, KeyCode::Char('m'));
+            press(&mut a, KeyCode::Enter);
+            screen_of(&mut a, 160, 40);
+            assert_eq!(a.confirm_max, 0);
+            press(&mut a, key);
+            assert_eq!(a.mode, Mode::Normal, "{key:?}");
         }
         // Esc in the picker too.
         let mut a = movable();
@@ -3312,7 +3450,11 @@ mod tests {
         );
         press(&mut a, KeyCode::Char('y'));
         finish(&mut a);
-        assert!(flash_text(&a).ends_with("to spare"), "{}", flash_text(&a));
+        assert!(
+            flash_text(&a).ends_with("to spare with 4"),
+            "{}",
+            flash_text(&a)
+        );
     }
 
     #[test]
@@ -3369,6 +3511,8 @@ mod tests {
             pid: 1,
             wanted: (c.id != c.wanted).then(|| c.wanted.clone()),
             told: false,
+            options: None,
+            dropped: vec![],
         };
         assert_eq!(
             crate::remind::due(&note, "work", &a.store, &Usage::default(), 95.0, a.now()),
@@ -3411,6 +3555,78 @@ mod tests {
     }
 
     #[test]
+    fn the_question_names_what_carries_over_and_what_not() {
+        let mut a = movable();
+        press(&mut a, KeyCode::Char('m'));
+        press(&mut a, KeyCode::Char('2'));
+        let c = confirm(&a);
+        let text = c.lines.join("\n");
+        assert!(
+            text.contains("Carries over: model claude-opus-4-5[1m], --add-dir, --permission-mode plan, --append-system-prompt."),
+            "{text}"
+        );
+        assert!(text.contains("Not carried: --worktree."), "{text}");
+        assert!(!text.contains("Be very careful"), "no long values: {text}");
+        // Old sessions: says the options are not known.
+        let mut a = movable();
+        a.conversation_of = knows_only_the_conversation;
+        press(&mut a, KeyCode::Char('m'));
+        press(&mut a, KeyCode::Char('2'));
+        let text = confirm(&a).lines.join(" ");
+        assert!(
+            text.contains("start options and model are not known"),
+            "{text}"
+        );
+        press(&mut a, KeyCode::Char('y'));
+        finish(&mut a);
+        assert!(flash_text(&a).ends_with("with 0"), "{}", flash_text(&a));
+    }
+
+    #[test]
+    fn a_model_changed_after_the_question_stops_the_move() {
+        let mut a = movable();
+        press(&mut a, KeyCode::Char('m'));
+        press(&mut a, KeyCode::Char('2'));
+        a.conversation_of = knows_other_model;
+        press(&mut a, KeyCode::Char('y'));
+        assert!(a.moving.is_none(), "nothing started");
+        assert!(
+            flash_text(&a).contains("model changed"),
+            "{}",
+            flash_text(&a)
+        );
+    }
+
+    #[test]
+    fn start_options_count_only_for_the_process_that_was_started_with_them() {
+        let note = crate::sessions::Conversation {
+            session_id: CONV.into(),
+            pids: vec![4242],
+            model: Some("opus".into()),
+        };
+        let launcher = |pid| crate::sessions::Entry {
+            account: "work".into(),
+            pid,
+            wanted: None,
+            told: false,
+            options: Some(vec!["--verbose".into()]),
+            dropped: vec!["--worktree".into()],
+        };
+        let h = held_from(note.clone(), 4242, Some(launcher(4242)));
+        assert_eq!(h.carry.options, Some(vec!["--verbose".to_string()]));
+        assert_eq!(h.carry.dropped, vec!["--worktree".to_string()]);
+        assert_eq!(h.carry.model.as_deref(), Some("opus"));
+        // An older Claude Code's note in the same pane: options unknown,
+        // the current model still kept.
+        let h = held_from(note.clone(), 4242, Some(launcher(1111)));
+        assert_eq!(h.carry.options, None);
+        assert!(h.carry.dropped.is_empty());
+        assert_eq!(h.carry.model.as_deref(), Some("opus"));
+        let h = held_from(note, 4242, None);
+        assert_eq!(h.carry.options, None);
+    }
+
+    #[test]
     fn the_picker_and_the_question_draw_at_many_sizes() {
         for (w, h, full) in [
             (160, 40, false),
@@ -3433,14 +3649,29 @@ mod tests {
             press(&mut a, KeyCode::Char('2'));
             let screen = screen_of(&mut a, w, h).join("\n");
             assert!(screen.contains("y yes"), "{w}x{h}: {screen}");
-            let shown: Vec<&str> = screen.split_whitespace().collect();
+            // A question taller than the pane scrolls: every word shows on
+            // the way down.
+            let mut seen = screen.clone();
+            for _ in 0..a.confirm_max {
+                assert!(seen.contains("scroll"), "{w}x{h}: says it scrolls");
+                press(&mut a, KeyCode::Down);
+                seen.push('\n');
+                seen.push_str(&screen_of(&mut a, w, h).join("\n"));
+            }
+            let screen = seen;
+            // The text without borders and spaces: a word longer than the
+            // line is split across lines, never cut off.
+            let flat: String = screen
+                .chars()
+                .filter(|c| !c.is_whitespace() && *c != '│')
+                .collect();
             let c = confirm(&a);
             // The title may be cut on a narrow pane; the text names where
             // the session goes.
             let to = if full { "Main login's" } else { "Work's" };
             assert!(c.lines.join(" ").contains(to), "{w}x{h}");
             for word in c.lines.iter().flat_map(|l| l.split_whitespace()) {
-                assert!(shown.contains(&word), "{w}x{h}: {word} cut off\n{screen}");
+                assert!(flat.contains(word), "{w}x{h}: {word} cut off\n{screen}");
             }
         }
     }

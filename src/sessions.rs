@@ -5,6 +5,7 @@
 //! process (the launcher execs, so the pid stays). A note whose process has
 //! ended counts for nothing and is removed.
 
+use crate::carry::Carried;
 use crate::paths;
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
@@ -18,6 +19,18 @@ pub struct Entry {
     pub wanted: Option<String>,
     /// The reminder that `wanted` has room again was shown.
     pub told: bool,
+    /// The start options a move carries over (`carry::carried`); `None` in
+    /// notes written before they were kept.
+    pub options: Option<Vec<String>>,
+    /// The names of the start options a move does not carry over.
+    pub dropped: Vec<String>,
+}
+
+fn strings(v: &serde_json::Value) -> Option<Vec<String>> {
+    v.as_array()?
+        .iter()
+        .map(|s| s.as_str().map(str::to_string))
+        .collect()
 }
 
 fn entry(v: &serde_json::Value) -> Option<Entry> {
@@ -26,6 +39,8 @@ fn entry(v: &serde_json::Value) -> Option<Entry> {
         pid: u32::try_from(v["pid"].as_u64()?).ok()?,
         wanted: v["wanted"].as_str().map(str::to_string),
         told: v["told"].as_bool().unwrap_or(false),
+        options: strings(&v["options"]),
+        dropped: strings(&v["dropped"]).unwrap_or_default(),
     })
 }
 
@@ -42,12 +57,27 @@ fn file(pane: &str) -> PathBuf {
     dir().join(format!("{safe}.json"))
 }
 
-pub fn record(pane: &str, account: &str, wanted: Option<&str>, pid: u32) {
-    let mut v = json!({"pane": pane, "account": account, "pid": pid});
+/// Notes the session the launcher starts in a pane. Only its owner can
+/// read the note: start options can hold private text or tokens.
+pub fn record(pane: &str, account: &str, wanted: Option<&str>, pid: u32, carried: &Carried) {
+    let _ = paths::write_private(
+        &file(pane),
+        note(pane, account, wanted, pid, carried).as_bytes(),
+    );
+}
+
+fn note(pane: &str, account: &str, wanted: Option<&str>, pid: u32, carried: &Carried) -> String {
+    let mut v = json!({
+        "pane": pane,
+        "account": account,
+        "pid": pid,
+        "options": carried.options,
+        "dropped": carried.dropped,
+    });
     if let Some(w) = wanted {
         v["wanted"] = json!(w);
     }
-    let _ = paths::write_atomic(&file(pane), format!("{v}\n").as_bytes());
+    format!("{v}\n")
 }
 
 pub fn get(pane: &str) -> Option<Entry> {
@@ -138,6 +168,8 @@ pub fn live() -> HashMap<String, Entry> {
 pub struct Conversation {
     pub session_id: String,
     pub pids: Vec<u32>,
+    /// The model it runs on now (`model.id`); `None` when not noted.
+    pub model: Option<String>,
 }
 
 /// Whether `id` looks exactly like Claude Code's session ids (a UUID): only
@@ -171,7 +203,15 @@ fn read_conversation(path: &std::path::Path) -> Option<Conversation> {
         .iter()
         .filter_map(|p| u32::try_from(p.as_u64()?).ok())
         .collect();
-    Some(Conversation { session_id, pids })
+    let model = v["model"]
+        .as_str()
+        .filter(|m| crate::carry::valid_model(m))
+        .map(str::to_string);
+    Some(Conversation {
+        session_id,
+        pids,
+        model,
+    })
 }
 
 /// The conversation the status line last noted for a pane. Whether its
@@ -202,7 +242,10 @@ fn record_conversation_in(
         Some(_) => {}
         None => prune(dir, now),
     }
-    let v = json!({"pane": pane, "session_id": c.session_id, "pids": c.pids});
+    let mut v = json!({"pane": pane, "session_id": c.session_id, "pids": c.pids});
+    if let Some(m) = c.model.as_deref().filter(|m| crate::carry::valid_model(m)) {
+        v["model"] = json!(m);
+    }
     let _ = std::fs::create_dir_all(dir);
     let _ = paths::write_atomic(&path, format!("{v}\n").as_bytes());
 }
@@ -223,6 +266,75 @@ fn prune(dir: &std::path::Path, now: std::time::SystemTime) {
             let _ = std::fs::remove_file(e.path());
         }
     }
+}
+
+/// The one-time hand-over of a move (`relocate.rs`): the options for the
+/// conversation the list starts again in a pane,
+/// `<config>/moves/<pane>.json`, only its owner can read. The command typed
+/// into the pane names no option, so none lands in the shell's history or is
+/// read by the shell.
+fn moves_dir() -> PathBuf {
+    paths::config_dir().join("moves")
+}
+
+/// How long a hand-over counts: the move types its command seconds after
+/// writing it.
+const HAND_OVER_FOR: i64 = 120;
+
+pub fn write_hand_over(pane: &str, session_id: &str, args: &[String]) -> bool {
+    write_hand_over_in(&moves_dir(), pane, session_id, args, crate::time::now())
+}
+
+fn write_hand_over_in(
+    dir: &std::path::Path,
+    pane: &str,
+    session_id: &str,
+    args: &[String],
+    now: i64,
+) -> bool {
+    if paths::private_dir(dir).is_err() {
+        return false;
+    }
+    let v = json!({"session_id": session_id, "args": args, "at": now});
+    paths::write_private(&conversation_file(dir, pane), format!("{v}\n").as_bytes()).is_ok()
+}
+
+pub fn drop_hand_over(pane: &str) {
+    let _ = std::fs::remove_file(conversation_file(&moves_dir(), pane));
+}
+
+/// The launcher's arguments for a moved session: the hand-over's options,
+/// then `args`, which must be exactly `--resume <id>` of the same
+/// conversation. The hand-over is removed in every case, and its options go
+/// through the list of carried options again. Err says why it was not used.
+pub fn take_hand_over(pane: &str, args: &[String]) -> Result<Vec<String>, &'static str> {
+    take_hand_over_in(&moves_dir(), pane, args, crate::time::now())
+}
+
+fn take_hand_over_in(
+    dir: &std::path::Path,
+    pane: &str,
+    args: &[String],
+    now: i64,
+) -> Result<Vec<String>, &'static str> {
+    let path = conversation_file(dir, pane);
+    let text = std::fs::read_to_string(&path).map_err(|_| "there was none");
+    let _ = std::fs::remove_file(&path);
+    let v: serde_json::Value = serde_json::from_str(&text?).map_err(|_| "it was unreadable")?;
+    let [flag, id] = args else {
+        return Err("it is only for --resume <id>");
+    };
+    if flag != "--resume" || v["session_id"].as_str() != Some(id.as_str()) {
+        return Err("it was for another conversation");
+    }
+    let at = v["at"].as_i64().ok_or("it was unreadable")?;
+    if !(now - HAND_OVER_FOR..=now + 5).contains(&at) {
+        return Err("it was too old");
+    }
+    let wanted = strings(&v["args"]).ok_or("it was unreadable")?;
+    let mut out = crate::carry::carried(&wanted, None).options;
+    out.extend(args.iter().cloned());
+    Ok(out)
 }
 
 /// Whether a process name is a shell's (`-zsh` for a login shell).
@@ -336,6 +448,7 @@ mod tests {
         let c = Conversation {
             session_id: ID.into(),
             pids: vec![4242, 17],
+            model: None,
         };
         record_conversation_in(&dir, "w3:p1", &c, now);
         let path = conversation_file(&dir, "w3:p1");
@@ -345,6 +458,7 @@ mod tests {
         let bad = Conversation {
             session_id: "x; rm -rf ~".into(),
             pids: vec![1],
+            model: None,
         };
         record_conversation_in(&dir, "w3:p2", &bad, now);
         assert!(!conversation_file(&dir, "w3:p2").exists());
@@ -381,6 +495,7 @@ mod tests {
         let c = Conversation {
             session_id: ID.into(),
             pids: vec![400, 200],
+            model: None,
         };
         let running = Processes {
             shell: Some(300),
@@ -409,5 +524,121 @@ mod tests {
             front: vec![(400, "bash".into())],
         };
         assert_eq!(front_process(&c, &nested), None);
+    }
+
+    #[test]
+    fn the_model_is_noted_with_the_conversation_and_old_notes_have_none() {
+        let dir = temp().join("model");
+        let now = std::time::SystemTime::now();
+        let mut c = Conversation {
+            session_id: ID.into(),
+            pids: vec![4242],
+            model: Some("claude-opus-4-5[1m]".into()),
+        };
+        record_conversation_in(&dir, "w3:p1", &c, now);
+        let path = conversation_file(&dir, "w3:p1");
+        assert_eq!(read_conversation(&path), Some(c.clone()));
+        // A /model change is noted again.
+        c.model = Some("claude-sonnet-4-5".into());
+        record_conversation_in(&dir, "w3:p1", &c, now);
+        assert_eq!(read_conversation(&path).unwrap().model, c.model);
+        // A note from before this version, or with an odd model, has none.
+        std::fs::write(&path, format!(r#"{{"session_id": "{ID}", "pids": [1]}}"#)).unwrap();
+        assert_eq!(read_conversation(&path).unwrap().model, None);
+        std::fs::write(
+            &path,
+            format!(r#"{{"session_id": "{ID}", "pids": [1], "model": "$(x)"}}"#),
+        )
+        .unwrap();
+        assert_eq!(read_conversation(&path).unwrap().model, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn launcher_notes_keep_the_options_and_old_ones_read_as_unknown() {
+        let carried = Carried {
+            options: vec!["--model=sonnet".into(), "--add-dir=/a".into()],
+            dropped: vec!["--worktree".into()],
+        };
+        let v: serde_json::Value =
+            serde_json::from_str(&note("w1:p1", "work", None, 42, &carried)).unwrap();
+        let e = entry(&v).unwrap();
+        assert_eq!(e.options, Some(carried.options.clone()));
+        assert_eq!(e.dropped, carried.dropped);
+        let old = entry(&json!({"account": "work", "pid": 42})).unwrap();
+        assert_eq!(old.options, None);
+        assert!(old.dropped.is_empty());
+    }
+
+    #[test]
+    fn launcher_notes_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp().join("private");
+        let path = dir.join("w1_p1.json");
+        let carried = Carried {
+            options: vec!["--mcp-config={\"token\":\"dummy\"}".into()],
+            dropped: vec![],
+        };
+        paths::write_private(&path, note("w1:p1", "work", None, 42, &carried).as_bytes()).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn strs(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn a_hand_over_arrives_unchanged_once_and_only_for_its_conversation() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp().join("moves");
+        let now = 1_794_225_600;
+        let odd = [
+            "--append-system-prompt=it's \"quoted\" $(touch /tmp/x) `id`; rm -rf ~\nline two",
+            "--add-dir=/work/a b/[c]",
+            "--model=claude-opus-4-5[1m]",
+        ];
+        assert!(write_hand_over_in(&dir, "w1:p1", ID, &strs(&odd), now));
+        let path = conversation_file(&dir, "w1:p1");
+        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&path), 0o600);
+        assert_eq!(mode(&dir), 0o700);
+        let resume = strs(&["--resume", ID]);
+        let got = take_hand_over_in(&dir, "w1:p1", &resume, now + 3).unwrap();
+        let mut want = strs(&odd);
+        want.extend(resume.clone());
+        assert_eq!(got, want);
+        assert!(!path.exists(), "used once");
+        assert!(take_hand_over_in(&dir, "w1:p1", &resume, now + 3).is_err());
+        // Another conversation, other arguments, an old file: not used, and
+        // gone all the same.
+        let other = strs(&["--resume", "11111111-2222-4333-8444-555555555555"]);
+        for (args, at) in [
+            (other, now),
+            (strs(&["--resume", ID, "--verbose"]), now),
+            (strs(&["--continue"]), now),
+            (resume.clone(), now - 600),
+        ] {
+            assert!(write_hand_over_in(&dir, "w1:p1", ID, &strs(&odd), at));
+            assert!(
+                take_hand_over_in(&dir, "w1:p1", &args, now).is_err(),
+                "{args:?}"
+            );
+            assert!(!path.exists());
+        }
+        // A planted file cannot add options that are never carried.
+        assert!(write_hand_over_in(
+            &dir,
+            "w1:p1",
+            ID,
+            &strs(&["--settings=/tmp/s.json", "--bare", "--verbose", "hello"]),
+            now
+        ));
+        assert_eq!(
+            take_hand_over_in(&dir, "w1:p1", &resume, now).unwrap(),
+            strs(&["--verbose", "--resume", ID])
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -106,8 +106,18 @@ fn note_conversation(input: &Value) {
         &crate::sessions::Conversation {
             session_id: id.to_string(),
             pids,
+            model: model_of(input),
         },
     );
+}
+
+/// The model the session runs on now, when Claude Code names one that is
+/// safe to pass on (`carry::valid_model`).
+fn model_of(input: &Value) -> Option<String> {
+    input["model"]["id"]
+        .as_str()
+        .filter(|m| crate::carry::valid_model(m))
+        .map(str::to_string)
 }
 
 /// Tells once per full window when new sessions move to another account.
@@ -208,5 +218,16 @@ mod tests {
         );
         assert!(line.contains("5h 23%"));
         assert!(line.ends_with("Opus"));
+    }
+
+    #[test]
+    fn the_current_model_is_taken_from_the_input() {
+        assert_eq!(
+            model_of(&json!({"model": {"id": "claude-opus-4-5[1m]", "display_name": "Opus"}}))
+                .as_deref(),
+            Some("claude-opus-4-5[1m]")
+        );
+        assert_eq!(model_of(&json!({"model": {"display_name": "Opus"}})), None);
+        assert_eq!(model_of(&json!({"model": {"id": "x; rm -rf ~"}})), None);
     }
 }

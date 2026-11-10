@@ -277,7 +277,30 @@ pub fn session_env(store: &Store, id: &str) -> Result<SessionEnv, String> {
     Ok((set, remove))
 }
 
-pub fn run(args: Vec<String>) -> i32 {
+/// The launcher's arguments for a session the list moved here (`run
+/// --moved`): the start options and model from the move's hand-over, when
+/// it is there for this conversation; otherwise as given, with a note.
+fn moved_args(args: Vec<String>) -> Vec<String> {
+    let pane = std::env::var("HERDR_PANE_ID")
+        .ok()
+        .filter(|_| herdr::inside());
+    let result = match &pane {
+        Some(pane) => crate::sessions::take_hand_over(pane, &args),
+        None => Err("it runs outside Herdr"),
+    };
+    match result {
+        Ok(full) => full,
+        Err(why) => {
+            eprintln!(
+                "herdr-multiaccount: the session's start options and model were not carried over ({why}); it starts without them."
+            );
+            args
+        }
+    }
+}
+
+pub fn run(args: Vec<String>, moved: bool) -> i32 {
+    let args = if moved { moved_args(args) } else { args };
     let Some(claude) = find_claude() else {
         eprintln!("herdr-multiaccount: claude was not found on PATH");
         return 127;
@@ -334,7 +357,10 @@ pub fn run(args: Vec<String>) -> i32 {
             );
             // Herdr does not hand labels back, so the list reads this.
             let wanted = (choice.id != choice.wanted).then_some(choice.wanted.as_str());
-            crate::sessions::record(&pane, &choice.id, wanted, std::process::id());
+            // What a move of this session carries over (`carry.rs`).
+            let cwd = std::env::current_dir().ok();
+            let carried = crate::carry::carried(&args, cwd.as_deref());
+            crate::sessions::record(&pane, &choice.id, wanted, std::process::id(), &carried);
         }
     }
 

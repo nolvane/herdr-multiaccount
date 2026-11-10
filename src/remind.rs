@@ -248,6 +248,8 @@ mod tests {
             pid: 1,
             wanted: Some("max".into()),
             told,
+            options: None,
+            dropped: vec![],
         }
     }
 
