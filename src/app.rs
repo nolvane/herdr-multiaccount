@@ -846,8 +846,6 @@ impl App {
         });
     }
 
-    /// Starts the move after checking with Herdr once more that the session
-    /// is still there, idle, and holds the same conversation.
     /// The user answered yes and waits for an outcome: a refusal gets the
     /// dialog a failed move gets, not a note in the footer.
     fn move_refused(&mut self, label: &str, why: String) {
@@ -858,6 +856,8 @@ impl App {
         };
     }
 
+    /// Starts the move after checking with Herdr once more that the session
+    /// is still there, idle, and holds the same conversation.
     fn move_session(&mut self, s: Moving, to: &str) {
         let label = s.label.clone();
         let Some(now) = (self.pane_list)() else {

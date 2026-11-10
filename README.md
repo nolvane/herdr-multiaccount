@@ -84,9 +84,9 @@ to the next account when one is at its limit.
   an answer is not moved. Sessions started without the plugin count as the
   main login.
   While a move runs, the footer and the session's row say so; then the list
-  says it was moved, or why not and how to do it by hand. Turning the move
-  back (`n` or `Esc` on the question, `Esc` in the account list) says the
-  session was not moved.
+  says it was moved, or why not (with the way by hand when it failed
+  halfway). Turning the move back (`n` or `Esc` on the question, `Esc` or
+  `q` in the account list) says the session was not moved.
 - **Questions.** `y` answers yes, `n` or `Esc` no, and any other key leaves
   the question open. `⏎` answers yes only on the move question, which
   follows the `⏎` that picked the account; on the questions that end a
