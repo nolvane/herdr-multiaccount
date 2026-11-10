@@ -2113,15 +2113,10 @@ mod tests {
         };
         a.key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE));
         assert_eq!(opened().len(), 1);
-        let opener = if cfg!(target_os = "macos") {
-            "open"
-        } else {
-            "xdg-open"
-        };
         let flash = a.flash.as_ref().map(|f| (f.0.clone(), f.1));
         assert_eq!(
             flash,
-            Some((format!("Could not run {opener}"), crate::theme::RED))
+            Some((format!("Could not run {OPENER}"), crate::theme::RED))
         );
         // The dialog stays and still takes a code, sends it and cancels.
         for c in "abc".chars() {
@@ -2173,7 +2168,8 @@ mod tests {
     #[test]
     fn opening_a_link_does_not_wait_for_the_opener() {
         let start = Instant::now();
-        assert!(open_in_browser("sleep", "5"));
+        // Still running when it returns; ends soon after the test.
+        assert!(open_in_browser("sleep", "2"));
         assert!(start.elapsed() < Duration::from_secs(1));
         assert!(!open_in_browser(
             "/nonexistent/opener",
