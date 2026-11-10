@@ -356,16 +356,25 @@ no work in progress is cut off.
   the id goes into a command typed into a shell; account ids are checked to
   be letters, digits, `-` and `_` for the same reason.
 - **Ending it.** The list presses Ctrl+C (Herdr `pane send-keys`), at most
-  three times: the first clears text typed but not sent, the next one ends
-  Claude Code. Nothing is typed into Claude Code; typing `/exit` would send
-  unsent text along with it as a message. The command is typed only once the
-  process has left the pane and the shell is in front again (up to 8 s); if
-  it does not end, nothing starts and the list names the way by hand.
+  four times: the first clears text typed but not sent, then two in a row
+  end Claude Code (the first of them only shows "Press Ctrl-C again to
+  exit"), and one is spare. Nothing is typed into Claude Code; typing
+  `/exit` would send unsent text along with it as a message. Before each
+  press it asks Herdr again, and stops when the session started working in
+  the meantime, so no turn is cut off. The command is typed only once the
+  process has left the pane and the pane's own shell is in front again (up
+  to 8 s, by the clock as well, so slow Herdr calls cannot stretch it). If
+  it does not end, or a nested shell or another program is in front
+  instead, nothing starts and the list says which and names the way by
+  hand.
 - **Starting it again.** The command calls the plugin's binary by the path
   the `claude` function uses, so it also works in a shell opened before
   setup. It goes through the launcher, which labels the pane and writes its
   note without a `wanted` account, so the reminder of an earlier fallback no
-  longer fires. The list waits up to 20 s until Herdr sees Claude Code again.
+  longer fires. The list waits up to 20 s until Herdr sees Claude Code again;
+  the launcher itself in front does not count, as it may still stop before
+  Claude Code starts (a missing key). Only `--resume <id>` is passed: options
+  the session was started with (such as `--model`) are not carried over.
 - **Which accounts.** Every account signed in with a login or key of its
   own, except the session's own and those with the same login. Sessions
   started without the plugin count as the main login. An account at its

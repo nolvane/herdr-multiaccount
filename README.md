@@ -63,7 +63,8 @@ to the next account when one is at its limit.
   start, and the question says where the session goes. The first answer
   afterwards is slower and counts more against the new account's limit,
   because Claude Code's cache of the conversation stays with the old login;
-  text typed but not sent is lost. A session that is working or waiting for
+  text typed but not sent is lost, and options it was started with (such as
+  `--model`) are not carried over. A session that is working or waiting for
   an answer is not moved. Sessions started without the plugin count as the
   main login.
 - **Pane labels.** Each Claude Code pane carries the account it runs on, for

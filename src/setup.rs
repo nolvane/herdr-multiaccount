@@ -67,7 +67,7 @@ pub(crate) fn bin_for_shell() -> String {
 
 /// Paths go into a shell file and a shell command inside double quotes:
 /// refuse the characters that would break out of them.
-fn quotable(path: &Path) -> Result<(), String> {
+pub(crate) fn quotable(path: &Path) -> Result<(), String> {
     let p = path.to_string_lossy();
     if p.contains(['"', '$', '`', '\\', '\n']) {
         Err(format!(

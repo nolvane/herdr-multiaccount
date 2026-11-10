@@ -334,6 +334,11 @@ pub fn pane_agent(pane: &str) -> Option<String> {
     pane_field(pane, "agent")
 }
 
+/// What the agent in a pane does now (`idle`, `working`, ...), if known.
+pub fn pane_status(pane: &str) -> Option<String> {
+    pane_field(pane, "agent_status").filter(|s| s != "unknown")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -263,6 +263,8 @@ pub struct App {
     /// A move that runs: its session's name, and where its result arrives.
     pub moving: Option<String>,
     move_rx: Option<Receiver<Result<String, String>>>,
+    /// A failed move's message, kept until no other dialog is open.
+    move_failed: Option<(String, String)>,
     pub cwd: Option<String>,
     pub read_at: Instant,
     next_files: Instant,
@@ -313,6 +315,7 @@ impl App {
             in_herdr: herdr::inside(),
             moving: None,
             move_rx: None,
+            move_failed: None,
             cwd: std::env::current_dir()
                 .ok()
                 .map(|p| p.to_string_lossy().to_string()),
@@ -534,11 +537,7 @@ impl App {
         let Some(p) = self.sessions().get(self.session_sel).cloned() else {
             return;
         };
-        let label = if p.label.is_empty() {
-            p.id.clone()
-        } else {
-            p.label.clone()
-        };
+        let label = Self::pane_name(&p);
         let space = self.space_label(&p.workspace);
         let account = self.session_account(&p);
         let mut lines = vec![if space.is_empty() {
@@ -857,6 +856,15 @@ impl App {
 
     /// Takes the result of a move once it is done.
     pub fn receive_move(&mut self) {
+        if self.mode == Mode::Normal {
+            if let Some((title, line)) = self.move_failed.take() {
+                self.mode = Mode::Message {
+                    title,
+                    lines: vec![line],
+                    good: false,
+                };
+            }
+        }
         let Some(rx) = &self.move_rx else {
             return;
         };
@@ -872,11 +880,9 @@ impl App {
         match result {
             Ok(msg) => self.flash(msg, crate::theme::GREEN),
             Err(e) => {
-                self.mode = Mode::Message {
-                    title: format!("{label} was not moved"),
-                    lines: vec![e],
-                    good: false,
-                };
+                // Shown now, or once the dialog the user is in has closed.
+                self.move_failed = Some((format!("{label} was not moved"), e));
+                self.receive_move();
             }
         }
         // The pane's new label and note show on the next read.
@@ -3236,6 +3242,32 @@ mod tests {
                 assert!(lines.join(" ").contains("/exit"));
                 assert!(!good);
             }
+            m => panic!("{m:?}"),
+        }
+    }
+
+    #[test]
+    fn a_failed_move_waits_for_the_dialog_the_user_is_in() {
+        let mut a = movable();
+        a.mover = fails;
+        press(&mut a, KeyCode::Char('m'));
+        press(&mut a, KeyCode::Enter);
+        press(&mut a, KeyCode::Char('y'));
+        // The user opened the keys overlay meanwhile.
+        a.mode = Mode::Help;
+        for _ in 0..200 {
+            a.receive_move();
+            if a.moving.is_none() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(a.moving.is_none(), "the move finished");
+        assert_eq!(a.mode, Mode::Help, "the overlay stays");
+        a.mode = Mode::Normal;
+        a.receive_move();
+        match &a.mode {
+            Mode::Message { title, .. } => assert_eq!(title, "Fix the login bug was not moved"),
             m => panic!("{m:?}"),
         }
     }
