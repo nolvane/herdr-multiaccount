@@ -89,8 +89,9 @@ to the next account when one is at its limit.
   `q`, the open-or-close action or Herdr) does not stop it: a list opened
   later shows it, and when no list is open a failure opens a Herdr popup
   (a notification when the popup cannot open) with the way to resume the
-  conversation by hand; a move that worked says nothing more. Turning the move back (`n` or `Esc` on the question, `Esc` or
-  `q` in the account list) says the session was not moved.
+  conversation by hand; a move that worked says nothing more. Turning the
+  move back (`n` or `Esc` on the question, `Esc` or `q` in the account
+  list) says the session was not moved.
 - **Questions.** `y` answers yes, `n` or `Esc` no, and any other key leaves
   the question open. `⏎` answers yes only on the move question, which
   follows the `⏎` that picked the account; on the questions that end a
