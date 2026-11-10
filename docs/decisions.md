@@ -467,8 +467,9 @@ because it follows the `Enter` that picked the account; on the questions
 that end a session, remove an account or change setup it does nothing, so a
 stray `Enter` never loses work (the owner's decision on #10). The buttons
 name these keys, and fall back to `y yes` / `n no` where the pane is too
-narrow for the longer ones. Ctrl+C over a question shows the quit bar, and
-staying brings the question back.
+narrow for the longer ones. Keys held with Ctrl or Alt never answer. Ctrl+C
+over a dialog (a question, the move's account list) shows the quit bar, and
+staying brings the dialog back.
 
 A move says how it ended in every case: turning it back (`n`/`Esc` on the
 question, `Esc`/`q` in the account list) says "<session> was not moved" in
