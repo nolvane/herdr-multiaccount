@@ -2612,11 +2612,8 @@ fn copy(text: &str) -> bool {
 /// The folders of an account that may hold a login: its folder, and the
 /// old folder an older version signed in (it has a config file of its own).
 fn login_folders(home: &std::path::Path) -> Vec<PathBuf> {
-    let mut out = vec![];
-    let new = home.join(mirror::NEW);
-    if new.is_dir() {
-        out.push(new);
-    }
+    // A real folder only: an old link of that name leads into ~/.claude.
+    let mut out: Vec<PathBuf> = mirror::real_new_dir(home).into_iter().collect();
     if home.join(".claude.json").exists() || home.join(".credentials.json").exists() {
         out.push(home.to_path_buf());
     }
@@ -2824,6 +2821,30 @@ mod tests {
                 assert!(screen.contains("ultra/.claude"), "{screen}");
             }
         }
+    }
+
+    #[test]
+    fn sign_out_never_runs_through_a_link_named_claude() {
+        let root = std::env::temp_dir().join(format!("hm-login-folders-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let home = root.join("homes").join("work");
+        let elsewhere = root.join("dot-claude").join(".claude");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, home.join(mirror::NEW)).unwrap();
+        assert!(
+            login_folders(&home).is_empty(),
+            "the link is no folder of the account"
+        );
+        std::fs::write(home.join(".claude.json"), "{}").unwrap();
+        assert_eq!(login_folders(&home), vec![home.clone()]);
+        std::fs::remove_file(home.join(mirror::NEW)).unwrap();
+        std::fs::create_dir_all(home.join(mirror::NEW)).unwrap();
+        assert_eq!(
+            login_folders(&home),
+            vec![home.join(mirror::NEW), home.clone()]
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

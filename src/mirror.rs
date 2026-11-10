@@ -45,7 +45,9 @@ pub fn has_login(dir: &Path) -> bool {
 /// folder, where every sign-in happens.
 pub fn folder_in(home: &Path) -> PathBuf {
     let new = home.join(NEW);
-    if !has_login(&new) && has_login(home) {
+    // An old link of that name leads into `~/.claude`: no login of its own.
+    let new_login = real_new_dir(home).is_some_and(|d| has_login(&d));
+    if !new_login && has_login(home) {
         home.to_path_buf()
     } else {
         new
@@ -398,7 +400,7 @@ fn sync_claude_json(main: &Path, own: &Path, seed: Option<&Path>) -> std::io::Re
 
 /// The new folder inside `home`, when it is a real folder (never a link,
 /// which would lead somewhere else).
-fn real_new_dir(home: &Path) -> Option<PathBuf> {
+pub fn real_new_dir(home: &Path) -> Option<PathBuf> {
     let new = home.join(NEW);
     std::fs::symlink_metadata(&new)
         .is_ok_and(|m| m.is_dir())
@@ -740,6 +742,13 @@ mod tests {
         std::fs::write(new.join(".claude.json"), SIGNED_IN).unwrap();
         assert_eq!(folder_in(&home), new);
         assert!(new.ends_with(".claude"), "the path names .claude");
+        // An old link of that name never counts as the account's login.
+        let elsewhere = home.parent().unwrap().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::write(elsewhere.join(".claude.json"), SIGNED_IN).unwrap();
+        std::fs::remove_dir_all(&new).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &new).unwrap();
+        assert_eq!(folder_in(&home), home);
         let _ = std::fs::remove_dir_all(home.parent().unwrap().parent().unwrap());
     }
 
