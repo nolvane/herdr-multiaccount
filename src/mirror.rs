@@ -269,6 +269,14 @@ fn sync_folder(
     id: &str,
     backups: &Path,
 ) -> std::io::Result<Report> {
+    if dir != home {
+        // Version 1.0.0 linked an entry `.claude` of `~/.claude` here, if
+        // there was one: the new folder must never be made through it.
+        let _lock = lock(home)?;
+        if std::fs::symlink_metadata(dir).is_ok_and(|m| m.file_type().is_symlink()) {
+            std::fs::remove_file(dir)?;
+        }
+    }
     let report = sync_dirs(main, dir, id, backups)?;
     let _lock = lock(dir)?;
     // A new folder starts with what the old one had of the shared parts.
@@ -943,6 +951,35 @@ mod tests {
             .is_empty());
         assert!(std::fs::symlink_metadata(&home).is_err());
         assert_eq!(snapshot(&main), before);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_old_link_named_claude_is_never_followed_by_the_new_folder() {
+        let root = scratch("oldlink");
+        let main = root.join("main");
+        let main_json = root.join("main.json");
+        let home = root.join("homes").join("work");
+        std::fs::create_dir_all(main.join(NEW)).unwrap();
+        std::fs::write(&main_json, "{}").unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        std::os::unix::fs::symlink(main.join(NEW), home.join(NEW)).unwrap();
+        let before = snapshot(&main);
+        sync_folder(
+            &main,
+            &main_json,
+            &home,
+            &home.join(NEW),
+            "work",
+            &root.join("backups"),
+        )
+        .unwrap();
+        assert!(!is_link(&home.join(NEW)), "a real folder now");
+        assert_eq!(
+            snapshot(&main),
+            before,
+            "nothing was written into ~/.claude"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 }
