@@ -222,7 +222,9 @@ fn wait(io: &dyn Io, limit: Duration, done: &dyn Fn() -> bool) -> bool {
 pub fn run_move(io: &dyn Io, plan: &Plan, bin: &str) -> Result<String, String> {
     let by_hand = manual(&plan.account_id, &plan.session_id, &plan.carry);
     let resume = resume_by_hand(&plan.account_id, &plan.session_id, &plan.carry);
-    let moved = !plan.carry.is_empty();
+    // Unknown start options go through a hand-over too, so the moved
+    // session's note keeps them unknown.
+    let moved = plan.carry.options.is_none() || !plan.carry.is_empty();
     let cmd = command(&plan.account_id, &plan.session_id, bin, moved)
         .map_err(|e| format!("Nothing was changed: {e}. By hand: {by_hand}."))?;
     // Written before anything happens to the session, so a failure here
@@ -430,7 +432,11 @@ mod tests {
             pid: 400,
             account_id: "work".into(),
             account_name: "Work".into(),
-            carry: Moved::default(),
+            // Started without options, model not noted: as before #9.
+            carry: Moved {
+                options: Some(vec![]),
+                ..Moved::default()
+            },
         }
     }
 
@@ -490,11 +496,20 @@ mod tests {
         assert!(e.starts_with("Nothing was changed"), "{e}");
         assert_eq!(*io.presses.borrow(), 0);
         // Nothing to carry: no hand-over, the command as before.
-        p.carry = Moved::default();
+        p.carry = Moved {
+            options: Some(vec![]),
+            ..Moved::default()
+        };
         let io = Fake::new(Some(2), true);
         assert!(run_move(&io, &p, BIN).is_ok());
         assert!(io.handed.borrow().is_none());
         assert!(!io.ran.borrow()[0].contains("--moved"));
+        // Options not known: handed over as such, so they stay unknown.
+        p.carry = Moved::default();
+        let io = Fake::new(Some(2), true);
+        assert!(run_move(&io, &p, BIN).is_ok());
+        assert!(io.ran.borrow()[0].contains("run --moved --"));
+        assert_eq!(io.handed.borrow().as_ref().map(|h| h.1.len()), Some(0));
     }
 
     #[test]

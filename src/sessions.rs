@@ -68,10 +68,12 @@ pub fn record(
     pid: u32,
     carried: Option<&Carried>,
 ) {
-    let _ = paths::write_private(
-        &file(pane),
-        note(pane, account, wanted, pid, carried).as_bytes(),
-    );
+    let path = file(pane);
+    let _ = record_at(&path, note(pane, account, wanted, pid, carried));
+}
+
+fn record_at(path: &std::path::Path, note: String) -> std::io::Result<()> {
+    paths::write_private(path, note.as_bytes())
 }
 
 fn note(
@@ -648,11 +650,11 @@ mod tests {
             options: vec!["--mcp-config={\"token\":\"dummy\"}".into()],
             dropped: vec![],
         };
-        paths::write_private(
-            &path,
-            note("w1:p1", "work", None, 42, Some(&carried)).as_bytes(),
-        )
-        .unwrap();
+        // An older, wider note is replaced by a private one.
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&path, "{}").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        record_at(&path, note("w1:p1", "work", None, 42, Some(&carried))).unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
         let _ = std::fs::remove_dir_all(&dir);
