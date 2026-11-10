@@ -87,7 +87,7 @@ pub fn texts(session: &str, back: &str, now_on: &str) -> (String, String) {
 const ENV: &str = "HERDR_MULTIACCOUNT_REMIND";
 
 /// Popup width in cells, border included.
-const WIDTH: u16 = 64;
+pub const WIDTH: u16 = 64;
 
 /// `herdr-multiaccount remind <pane> <back> <now on>`: opens the reminder
 /// as a Herdr popup over whatever is in front; a Herdr notification when
@@ -118,7 +118,7 @@ pub fn pane() -> i32 {
     let label = herdr::pane_label(pane).unwrap_or_else(|| pane.to_string());
     let (title, body) = texts(&label, &store.name_of(back), &store.name_of(now_on));
     let mut terminal = crate::enter_terminal();
-    let go = dialog(&mut terminal, &title, &body).unwrap_or(false);
+    let go = dialog(&mut terminal, &title, &body, " Esc later ").unwrap_or(false);
     crate::leave_terminal();
     if go {
         if let Some(tab) = herdr::pane_tab(pane) {
@@ -128,11 +128,14 @@ pub fn pane() -> i32 {
     0
 }
 
-/// Draws the dialog until a button is chosen: true for "Go to session".
-fn dialog(
+/// Draws the dialog until a button is chosen: true for "Go to session",
+/// false for the other button (`other`, its text). Also the popup of a
+/// failed move (`relocate::moved_pane`).
+pub fn dialog(
     terminal: &mut ratatui::DefaultTerminal,
     title: &str,
     body: &str,
+    other: &str,
 ) -> std::io::Result<bool> {
     use crate::theme::{self, ACCENT, BORDER, MUTED, TEXT};
     use ratatui::crossterm::event::{
@@ -177,7 +180,7 @@ fn dialog(
             );
             let y = inner.y + inner.height.saturating_sub(1);
             let go = " ⏎ Go to session ";
-            let later = " Esc later ";
+            let later = other;
             go_area = Rect::new(inner.x, y, go.chars().count() as u16, 1);
             later_area = Rect::new(go_area.x + go_area.width + 1, y, later.len() as u16, 1);
             f.render_widget(

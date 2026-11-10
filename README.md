@@ -85,7 +85,11 @@ to the next account when one is at its limit.
   main login.
   While a move runs, the footer and the session's row say so; then the list
   says it was moved, or why not (with the way by hand when it failed
-  halfway). Turning the move back (`n` or `Esc` on the question, `Esc` or
+  halfway). The move runs in a process of its own, so closing the list (with
+  `q`, the open-or-close action or Herdr) does not stop it: a list opened
+  later shows it, and when no list is open a failure opens a Herdr popup
+  (a notification when the popup cannot open) with the way to resume the
+  conversation by hand; a move that worked says nothing more. Turning the move back (`n` or `Esc` on the question, `Esc` or
   `q` in the account list) says the session was not moved.
 - **Questions.** `y` answers yes, `n` or `Esc` no, and any other key leaves
   the question open. `⏎` answers yes only on the move question, which
@@ -241,7 +245,7 @@ terminal.
 | `r` | Refresh now (sign-in state is checked every 10 minutes) |
 | `i` | Nerd Font icons or plain symbols |
 | `?` | All keys and how the list works (scrolls with `↑` `↓` when the window is low) |
-| `q` | Close the list (asks first); `Esc` only closes dialogs |
+| `q` | Close the list (asks first; a move that runs goes on); `Esc` only closes dialogs |
 
 ## Command line
 
@@ -286,6 +290,7 @@ Everything lives in the plugin's config directory
 | `backups/` | Files replaced by setup or when a link was restored; only you can open it, and each copy keeps the original's permissions |
 | `probe/` | Where the limit checks run (empty) |
 | `sessions/<pane>.json` | The account of each session started through the plugin, removed when it ends |
+| `moving/<pane>.json` | A move that runs, with its result until a list or popup has shown it; only you can read it |
 | `conversations/<pane>.json` | Which conversation each Claude Code pane holds, from its status line; dropped after a week |
 
 ## Development

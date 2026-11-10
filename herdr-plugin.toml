@@ -31,6 +31,13 @@ title = "Multiaccount reminder"
 placement = "overlay"
 command = ["./herdr-multiaccount", "remind-pane"]
 
+# A move of a session that failed after the list was closed.
+[[panes]]
+id = "moved"
+title = "Multiaccount move"
+placement = "overlay"
+command = ["./herdr-multiaccount", "move-pane"]
+
 [[actions]]
 id = "open"
 title = "Multiaccount: open or close"

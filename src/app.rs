@@ -71,8 +71,9 @@ pub type Opener = fn(&str, &str) -> bool;
 pub type PaneList = fn() -> Option<Vec<Pane>>;
 pub type PaneCloser = fn(&str) -> bool;
 /// The conversation a pane holds now and its Claude Code process
-/// (`real_conversation`), and the move itself (`relocate::perform`); fields
-/// so tests never reach Herdr.
+/// (`real_conversation`), and the start of the move (`relocate::perform`,
+/// which notes it in the folder given and starts its process); fields so
+/// tests never reach Herdr.
 pub type ConversationOf = fn(&str) -> Option<Held>;
 
 /// The conversation a pane holds, its Claude Code process, and what a move
@@ -83,7 +84,7 @@ pub struct Held {
     pub pid: u32,
     pub carry: Moved,
 }
-pub type Mover = fn(relocate::Plan) -> Result<String, String>;
+pub type Mover = fn(&std::path::Path, relocate::Plan) -> Result<(), String>;
 
 /// The program that opens links: `open` on macOS, `xdg-open` elsewhere.
 const OPENER: &str = if cfg!(target_os = "macos") {
@@ -296,11 +297,15 @@ pub struct App {
     pub mover: Mover,
     /// Whether the list runs inside Herdr (`herdr::inside`).
     pub in_herdr: bool,
-    /// A move that runs, and where its result arrives.
+    /// A move that runs, from the notes of moves (`relocate::Note`), also
+    /// one another list started.
     pub moving: Option<MoveRun>,
-    move_rx: Option<Receiver<Result<String, String>>>,
-    /// A failed move's message, kept until no other dialog is open.
-    move_failed: Option<(String, String)>,
+    /// Where the notes of moves are (`<config>/moving`).
+    pub moves_dir: PathBuf,
+    next_moves: Instant,
+    /// A failed move's message and the note it keeps (`relocate::hold`),
+    /// kept until no other dialog is open.
+    move_failed: Option<(String, String, PathBuf)>,
     pub cwd: Option<String>,
     pub read_at: Instant,
     next_files: Instant,
@@ -318,6 +323,7 @@ impl App {
         let store = Store::load();
         let twins = crate::login::twins(&store, &crate::login::all(&store));
         let usage = launch::load_usage_with(&store, &twins);
+        let moves_dir = dir.join("moving");
         App {
             config,
             dir,
@@ -354,7 +360,8 @@ impl App {
             mover: relocate::perform,
             in_herdr: herdr::inside(),
             moving: None,
-            move_rx: None,
+            moves_dir,
+            next_moves: Instant::now(),
             move_failed: None,
             cwd: std::env::current_dir()
                 .ok()
@@ -905,54 +912,112 @@ impl App {
             account_name: self.store.name_of(to),
             carry: held.carry,
         };
-        let (tx, rx) = channel();
-        let mover = self.mover;
-        std::thread::spawn(move || {
-            let _ = tx.send(mover(plan));
-        });
-        self.move_rx = Some(rx);
+        // Another list may have started a move since this one last looked.
+        if let Some(m) = self.running_move() {
+            self.move_refused(
+                &label,
+                format!(
+                    "{} is being moved; one move runs at a time. Try again once it is done.",
+                    m.label
+                ),
+            );
+            return;
+        }
+        let to_name = self.store.name_of(to);
+        if let Err(e) = (self.mover)(&self.moves_dir, plan) {
+            self.move_refused(&label, e);
+            return;
+        }
         // The footer shows it until the result arrives (`ui::draw_footer`).
         self.moving = Some(MoveRun {
             pane: plan_pane,
             label,
-            to: self.store.name_of(to),
+            to: to_name,
         });
+        self.next_moves = Instant::now();
     }
 
-    /// Takes the result of a move once it is done.
-    pub fn receive_move(&mut self) {
-        if self.mode == Mode::Normal {
-            if let Some((title, line)) = self.move_failed.take() {
-                self.mode = Mode::Message {
-                    title,
-                    lines: vec![line],
-                    good: false,
-                };
-            }
-        }
-        let Some(rx) = &self.move_rx else {
+    /// The move that runs now, from its note.
+    fn running_move(&self) -> Option<MoveRun> {
+        let now = crate::time::now();
+        relocate::notes(&self.moves_dir)
+            .into_iter()
+            .find(|n| relocate::state(n, now, &crate::sessions::alive) == relocate::State::Running)
+            .map(|n| MoveRun {
+                pane: n.plan.pane,
+                label: n.plan.label,
+                to: n.plan.account_name,
+            })
+    }
+
+    /// Shows a failed move kept for when no other dialog is open; its note
+    /// goes once the dialog is on screen.
+    fn show_move_failed(&mut self) {
+        if self.mode != Mode::Normal {
             return;
-        };
-        let result = match rx.try_recv() {
-            Ok(r) => r,
-            Err(std::sync::mpsc::TryRecvError::Empty) => return,
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                Err("The move stopped unexpectedly; look at the pane.".into())
+        }
+        if let Some((title, line, held)) = self.move_failed.take() {
+            self.mode = Mode::Message {
+                title,
+                lines: vec![line],
+                good: false,
+            };
+            let _ = std::fs::remove_file(held);
+        }
+    }
+
+    /// Reads the notes of moves (every half second): which one runs, and
+    /// the results of finished ones, from this list or another. Each result
+    /// is told by one list only.
+    pub fn receive_move(&mut self) {
+        self.show_move_failed();
+        if Instant::now() < self.next_moves {
+            return;
+        }
+        self.next_moves = Instant::now() + Duration::from_millis(500);
+        let dir = self.moves_dir.clone();
+        relocate::recover_held(&dir, &crate::sessions::alive);
+        let now = crate::time::now();
+        let me = std::process::id();
+        let mut running = None;
+        let mut finished = false;
+        for note in relocate::notes(&dir) {
+            let p = &note.plan;
+            let failed = match relocate::state(&note, now, &crate::sessions::alive) {
+                relocate::State::Running => {
+                    running.get_or_insert(MoveRun {
+                        pane: p.pane.clone(),
+                        label: p.label.clone(),
+                        to: p.account_name.clone(),
+                    });
+                    continue;
+                }
+                relocate::State::Done(Ok(msg)) => {
+                    if relocate::take(&dir, &p.pane) {
+                        self.flash(msg, crate::theme::GREEN);
+                        finished = true;
+                    }
+                    continue;
+                }
+                relocate::State::Done(Err(e)) => (format!("{} was not moved", p.label), e),
+                relocate::State::Stopped => relocate::stopped_text(p),
+            };
+            // One failure at a time; the next waits in its note.
+            if self.move_failed.is_some() {
+                continue;
             }
-        };
-        self.move_rx = None;
-        let label = self.moving.take().map(|m| m.label).unwrap_or_default();
-        match result {
-            Ok(msg) => self.flash(msg, crate::theme::GREEN),
-            Err(e) => {
-                // Shown now, or once the dialog the user is in has closed.
-                self.move_failed = Some((format!("{label} was not moved"), e));
-                self.receive_move();
+            if let Some(held) = relocate::hold(&dir, &p.pane, me) {
+                self.move_failed = Some((failed.0, failed.1, held));
+                finished = true;
             }
         }
-        // The pane's new label and note show on the next read.
-        self.herdr_rx = None;
-        self.next_herdr = Instant::now() + Duration::from_secs(1);
+        self.moving = running;
+        if finished {
+            self.show_move_failed();
+            // The pane's new label and note show on the next read.
+            self.herdr_rx = None;
+            self.next_herdr = Instant::now() + Duration::from_secs(1);
+        }
     }
 
     pub fn refresh_all(&mut self) {
@@ -1779,16 +1844,10 @@ impl App {
                 // Staying goes back to the dialog it was asked over, so a
                 // question or a move's account list never vanishes unsaid.
                 self.mode = self.quit_over.take().unwrap_or(Mode::Normal);
+                // A move goes on in its own process (the owner's decision
+                // on #12).
                 if k.code == KeyCode::Char('y') {
-                    // Quitting halfway would leave the session ended.
-                    if let Some(m) = self.moving.clone() {
-                        self.flash(
-                            format!("{} is being moved; quit once it is done", m.label),
-                            crate::theme::YELLOW,
-                        );
-                    } else {
-                        self.quit = true;
-                    }
+                    self.quit = true;
                 }
             }
             Mode::Help => match k.code {
@@ -2314,8 +2373,18 @@ mod tests {
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
+    /// A folder of its own for each test's notes of moves.
+    fn moves_dir() -> PathBuf {
+        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let d = std::env::temp_dir().join(format!("hm-moving-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        d
+    }
+
     fn app() -> App {
         let mut a = App::new(Config::default(), std::env::temp_dir());
+        a.moves_dir = moves_dir();
         a.store = Store::default();
         a.store.accounts.push(Account {
             id: "personal".into(),
@@ -3198,9 +3267,23 @@ mod tests {
         held(CONV, 4242, Moved::default())
     }
 
-    /// Hands back what it was asked to do, without Herdr.
-    fn moves(p: relocate::Plan) -> Result<String, String> {
-        Ok(format!(
+    /// Notes a move as its process would once done (this test process
+    /// stands in for it), without Herdr.
+    fn noted(dir: &std::path::Path, p: relocate::Plan, result: Option<Result<String, String>>) {
+        assert!(relocate::write_note(
+            dir,
+            &relocate::Note {
+                plan: p,
+                at: crate::time::now(),
+                mover: Some(std::process::id()),
+                result,
+            }
+        ));
+    }
+
+    /// Hands back what it was asked to do.
+    fn moves(dir: &std::path::Path, p: relocate::Plan) -> Result<(), String> {
+        let text = format!(
             "moved {} {} {} {} to {} with {}",
             p.pane,
             p.label,
@@ -3208,11 +3291,27 @@ mod tests {
             p.pid,
             p.account_id,
             p.carry.args().len()
-        ))
+        );
+        noted(dir, p, Some(Ok(text)));
+        Ok(())
     }
 
-    fn fails(_: relocate::Plan) -> Result<String, String> {
-        Err("Claude Code did not end in it, so nothing was started. By hand: type /exit in it, then HERDR_MULTIACCOUNT_USE=work claude --resume x.".into())
+    const FAILED: &str = "Claude Code did not end in it, so nothing was started. By hand: type /exit in it, then HERDR_MULTIACCOUNT_USE=work claude --resume x.";
+
+    fn fails(dir: &std::path::Path, p: relocate::Plan) -> Result<(), String> {
+        noted(dir, p, Some(Err(FAILED.into())));
+        Ok(())
+    }
+
+    /// A move whose process runs (this test process stands in for it).
+    fn runs(dir: &std::path::Path, p: relocate::Plan) -> Result<(), String> {
+        noted(dir, p, None);
+        Ok(())
+    }
+
+    /// A move whose process could not be started.
+    fn cannot_start(_: &std::path::Path, _: relocate::Plan) -> Result<(), String> {
+        Err("Nothing was changed: the move could not be started. By hand: type /exit in it.".into())
     }
 
     fn signed_in(plan: &str) -> Info {
@@ -3263,6 +3362,7 @@ mod tests {
     /// Waits for the move started in the background.
     fn finish(a: &mut App) {
         for _ in 0..200 {
+            a.next_moves = Instant::now();
             a.receive_move();
             if a.moving.is_none() {
                 return;
@@ -3747,22 +3847,244 @@ mod tests {
     }
 
     #[test]
-    fn while_a_move_runs_the_list_stays_and_the_session_is_kept() {
+    fn while_a_move_runs_the_session_is_kept_and_q_closes_the_list() {
         let mut a = movable();
-        a.moving = Some(MoveRun {
-            pane: "w91:p1".into(),
-            label: "Fix the login bug".into(),
-            to: "Work".into(),
-        });
-        press(&mut a, KeyCode::Char('q'));
+        a.mover = runs;
+        press(&mut a, KeyCode::Char('m'));
+        press(&mut a, KeyCode::Enter);
         press(&mut a, KeyCode::Char('y'));
-        assert!(!a.quit);
-        assert!(flash_text(&a).contains("quit once it is done"));
+        a.receive_move();
+        assert!(a.moving.is_some());
         press(&mut a, KeyCode::Char('d'));
         assert_eq!(a.mode, Mode::Normal);
         press(&mut a, KeyCode::Char('m'));
         assert_eq!(a.mode, Mode::Normal);
         assert!(flash_text(&a).contains("being moved"));
+        // The move goes on in its own process (the owner's decision on
+        // #12), so q closes the list, as Ctrl+C does.
+        press(&mut a, KeyCode::Char('q'));
+        press(&mut a, KeyCode::Char('y'));
+        assert!(a.quit);
+        assert!(
+            relocate::read_note(&a.moves_dir, "w91:p1").is_some(),
+            "the move is left to its process"
+        );
+        let mut b = movable();
+        b.mover = runs;
+        press(&mut b, KeyCode::Char('m'));
+        press(&mut b, KeyCode::Enter);
+        press(&mut b, KeyCode::Char('y'));
+        b.key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        press(&mut b, KeyCode::Char('y'));
+        assert!(b.quit);
+    }
+
+    /// Reads the notes again now, as the list does every half second.
+    fn poll(a: &mut App) {
+        a.next_moves = Instant::now();
+        a.receive_move();
+    }
+
+    #[test]
+    fn a_move_started_by_a_closed_list_reports_in_the_next_one() {
+        // Success: the next list says so once.
+        let mut a = movable();
+        a.mover = runs;
+        press(&mut a, KeyCode::Char('m'));
+        press(&mut a, KeyCode::Enter);
+        press(&mut a, KeyCode::Char('y'));
+        let dir = a.moves_dir.clone();
+        let plan = relocate::read_note(&dir, "w91:p1").unwrap().plan;
+        drop(a);
+        // The move process finishes after the list closed.
+        noted(
+            &dir,
+            plan.clone(),
+            Some(Ok("Moved Fix the login bug to Work".into())),
+        );
+        let mut b = movable();
+        b.moves_dir = dir.clone();
+        poll(&mut b);
+        assert_eq!(flash_text(&b), "Moved Fix the login bug to Work");
+        assert!(b.moving.is_none());
+        assert!(relocate::notes(&dir).is_empty(), "told once, then gone");
+        // A failure while the list was in a dialog, and the list closed
+        // before showing it: the next list shows it.
+        noted(&dir, plan, Some(Err(FAILED.into())));
+        let mut c = movable();
+        c.moves_dir = dir.clone();
+        c.mode = Mode::Help;
+        poll(&mut c);
+        assert_eq!(c.mode, Mode::Help);
+        // Kept by c's process, which still runs in this test: give it to a
+        // list whose process is gone, as when c closes.
+        let held = c.move_failed.as_ref().unwrap().2.clone();
+        drop(c);
+        let gone = std::fs::read_dir(&dir).unwrap().count();
+        assert_eq!(gone, 1);
+        let dead = dead_pid();
+        std::fs::rename(&held, dir.join(format!("w91_p1.held.{dead}"))).unwrap();
+        let mut d = movable();
+        d.moves_dir = dir.clone();
+        poll(&mut d);
+        match &d.mode {
+            Mode::Message { title, lines, good } => {
+                assert_eq!(title, "Fix the login bug was not moved");
+                assert!(lines.join(" ").contains("/exit"));
+                assert!(!good);
+            }
+            m => panic!("{m:?}"),
+        }
+        assert_eq!(
+            std::fs::read_dir(&dir).unwrap().count(),
+            0,
+            "gone once shown"
+        );
+        poll(&mut d);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A pid no process has: one that just ended.
+    fn dead_pid() -> u32 {
+        let mut c = std::process::Command::new("true").spawn().unwrap();
+        let pid = c.id();
+        c.wait().unwrap();
+        pid
+    }
+
+    #[test]
+    fn a_list_opened_during_a_move_shows_it_and_refuses_m_and_d() {
+        let mut a = asked_to_move();
+        a.mover = runs;
+        press(&mut a, KeyCode::Char('y'));
+        let mut b = movable();
+        b.moves_dir = a.moves_dir.clone();
+        poll(&mut b);
+        assert_eq!(
+            b.moving.as_ref().map(|m| (m.label.as_str(), m.to.as_str())),
+            Some(("Fix the login bug", "Work"))
+        );
+        let rows = screen_of(&mut b, 160, 40);
+        assert!(
+            rows[39].contains("Moving Fix the login bug to Work…"),
+            "{}",
+            rows[39]
+        );
+        for key in ['m', 'd'] {
+            press(&mut b, KeyCode::Char(key));
+            assert_eq!(b.mode, Mode::Normal, "{key}");
+            assert!(
+                flash_text(&b).contains("being moved; wait a moment"),
+                "{key}"
+            );
+        }
+        // The result shows there when the move ends.
+        let plan = relocate::read_note(&b.moves_dir, "w91:p1").unwrap().plan;
+        noted(
+            &b.moves_dir,
+            plan,
+            Some(Ok("Moved Fix the login bug to Work".into())),
+        );
+        poll(&mut b);
+        assert!(b.moving.is_none());
+        assert_eq!(flash_text(&b), "Moved Fix the login bug to Work");
+        let _ = std::fs::remove_dir_all(&b.moves_dir);
+    }
+
+    #[test]
+    fn two_lists_run_one_move_at_a_time() {
+        let mut a = movable();
+        a.mover = runs;
+        let mut b = movable();
+        b.mover = runs;
+        b.moves_dir = a.moves_dir.clone();
+        // b asks before a starts, and answers after.
+        press(&mut b, KeyCode::Char('j'));
+        press(&mut b, KeyCode::Char('m'));
+        press(&mut b, KeyCode::Enter);
+        press(&mut a, KeyCode::Char('m'));
+        press(&mut a, KeyCode::Enter);
+        press(&mut a, KeyCode::Char('y'));
+        press(&mut b, KeyCode::Char('y'));
+        match &b.mode {
+            Mode::Message { title, lines, .. } => {
+                assert_eq!(title, "Write the docs was not moved");
+                assert!(
+                    lines[0].contains("Fix the login bug is being moved"),
+                    "{lines:?}"
+                );
+            }
+            m => panic!("{m:?}"),
+        }
+        assert_eq!(relocate::notes(&a.moves_dir).len(), 1);
+        let _ = std::fs::remove_dir_all(&a.moves_dir);
+    }
+
+    #[test]
+    fn a_move_whose_process_is_gone_is_reported_once() {
+        let a = movable();
+        let dir = a.moves_dir.clone();
+        let mut plan = relocate::Plan {
+            pane: "w91:p1".into(),
+            label: "Fix the login bug".into(),
+            session_id: CONV.into(),
+            pid: 4242,
+            account_id: "work".into(),
+            account_name: "Work".into(),
+            carry: started_with_options(),
+        };
+        // Killed halfway, and one that never noted itself.
+        let now = crate::time::now();
+        for (mover, at) in [(Some(dead_pid()), now), (None, now - 60)] {
+            assert!(relocate::write_note(
+                &dir,
+                &relocate::Note {
+                    plan: plan.clone(),
+                    at,
+                    mover,
+                    result: None,
+                }
+            ));
+            let mut b = movable();
+            b.moves_dir = dir.clone();
+            poll(&mut b);
+            assert!(b.moving.is_none());
+            match &b.mode {
+                Mode::Message { title, lines, good } => {
+                    assert_eq!(
+                        title,
+                        "The move of Fix the login bug stopped before it finished"
+                    );
+                    let text = lines.join(" ");
+                    assert!(text.contains("Look at the pane"), "{text}");
+                    assert!(
+                        text.contains(&format!(
+                            "HERDR_MULTIACCOUNT_USE=work claude --resume {CONV} --model 'claude-opus-4-5[1m]'"
+                        )),
+                        "{text}"
+                    );
+                    assert!(!good);
+                }
+                m => panic!("{m:?}"),
+            }
+            b.mode = Mode::Normal;
+            poll(&mut b);
+            assert_eq!(b.mode, Mode::Normal, "said once");
+            assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+            plan.pane = "w91:p1".into();
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_move_that_cannot_start_presses_nothing_and_says_so() {
+        let mut a = movable();
+        a.mover = cannot_start;
+        press(&mut a, KeyCode::Char('m'));
+        press(&mut a, KeyCode::Enter);
+        press(&mut a, KeyCode::Char('y'));
+        assert!(a.moving.is_none());
+        refused(&a, "could not be started");
     }
 
     #[test]

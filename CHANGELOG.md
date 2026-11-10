@@ -24,6 +24,12 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- Closing the list while a session is being moved no longer stops the move
+  halfway and leaves the session ended without a word: the move runs in a
+  process of its own and finishes; a failure shows in the next list, or as
+  a Herdr popup (or notification) when no list is open. `q` now closes the
+  list during a move.
+
 - Questions wrap to narrow panes instead of being cut off at the edge.
 - Moving a session never ends without a word: `⏎` on the move question
   moves it, turning it back says it was not moved, a refusal after yes

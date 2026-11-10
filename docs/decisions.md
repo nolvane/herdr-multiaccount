@@ -388,6 +388,8 @@ no work in progress is cut off.
   and more against its limit. The question says so.
 - While a move runs (up to about half a minute), quitting the list, `d` and
   another `m` wait, since quitting halfway would leave the session ended.
+  (2026-11-10: replaced for quitting by "A move runs in a process of its
+  own"; `d` and another `m` still wait.)
 
 ## 2026-11-10: A move keeps the start options and the model
 
@@ -481,3 +483,42 @@ While the move runs (up to about half a minute) the footer keeps "Moving
 <session> to <account>…" (a newer note covers it only for its 5 seconds),
 and the session's row in the Agents tab says "moving to <account>…".
 Closing the list while a move runs is #12.
+
+## 2026-11-10: A move runs in a process of its own
+
+A move ran on a thread of the list, so closing the list (the open-or-close
+action, Herdr's close key, closing its tab or space) stopped it halfway and
+could leave the session ended with no word (#12). Now the list writes the
+move to a note, `moving/<pane>.json` (owner-only: it holds the start option
+values from #9), and starts `herdr-multiaccount move <pane>`, which runs the
+same steps (`relocate::run_move`) and writes the result into the note.
+
+- **Its own session, not only its own process group.** Checked in a
+  throwaway Herdr 0.9.5 server with a stand-in process: after `herdr plugin
+  pane close` and after closing the workspace, children in the pane's
+  process group, in their own process group, and in their own group with
+  SIGHUP ignored all ended at once; only a child that called `setsid` kept
+  running. Rust's `CommandExt::setsid` is not stable yet, so `pre_exec`
+  calls the C `setsid` in one small `unsafe` block, the project's first;
+  a test checks the child leads a session of its own. The list keeps a
+  thread that waits for the child, so a killed move process is no zombie
+  that would look alive.
+- **Only the pane on the command line.** Other users can read command
+  lines, so the plan stays in the note; `move` takes the pane id only.
+- **Who tells.** Every list reads the notes (twice a second): a running
+  move shows as #10's moving state in any list, also one opened later or in
+  another tab, and `m` and `d` wait for it. A result is told once: the one
+  that removes (or, for a dialog, renames) the note tells it. A list keeps a
+  failure as `<pane>.held.<list pid>` until its dialog is on screen, and a
+  later list takes it back when that list is gone. The move process leaves
+  its result to a list for 3 s; then a success says nothing (the owner's
+  decision on #12) and a failure opens a popup (entrypoint `moved`, reusing
+  the reminder's dialog) that takes its text from `<pane>.report`. If the
+  popup cannot open or has not taken the text within 10 s, a notification
+  goes out instead; whoever removes the report shows it, so never both.
+- **A move that stopped.** A note without result whose process is gone, or
+  that never noted its process within 10 s, or is older than 2 minutes (a
+  reused pid), is told as "The move of X stopped before it finished" with
+  the way to resume by hand.
+- **Quitting.** `q` / Ctrl+C then `y` close the list while a move runs (the
+  owner's decision on #12), since the move goes on.

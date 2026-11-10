@@ -48,13 +48,28 @@ fn dir() -> PathBuf {
     paths::config_dir().join("sessions")
 }
 
-/// A file name for a pane id (`w3:p1` → `w3_p1.json`).
-fn file(pane: &str) -> PathBuf {
-    let safe: String = pane
-        .chars()
+/// A pane id as a file name stem (`w3:p1` → `w3_p1`): letters and digits
+/// only, so no id can reach outside its folder.
+pub fn safe_name(pane: &str) -> String {
+    pane.chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-        .collect();
-    dir().join(format!("{safe}.json"))
+        .collect()
+}
+
+fn file(pane: &str) -> PathBuf {
+    dir().join(format!("{}.json", safe_name(pane)))
+}
+
+/// Whether a process runs; true when `ps` cannot tell, so nothing is
+/// removed on a guess.
+pub fn alive(pid: u32) -> bool {
+    std::process::Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "pid="])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .map(|o| o.status.success() && !o.stdout.is_empty())
+        .unwrap_or(true)
 }
 
 /// Notes the session the launcher starts in a pane. Only its owner can

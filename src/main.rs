@@ -10,6 +10,8 @@
 //! - `statusline`: Claude Code's status line command after setup.
 //! - `setup [--undo]`, `status`, `use <account>`: for the command line.
 //! - `startup`, `pane-event`, `install-bin`: Herdr hooks and the build.
+//! - `move <pane>`, `move-pane`: a move the list started, in a process of
+//!   its own, and the popup when it failed (`relocate.rs`).
 
 mod app;
 mod carry;
@@ -134,16 +136,6 @@ fn startup() -> i32 {
     0
 }
 
-fn alive(pid: u32) -> bool {
-    std::process::Command::new("ps")
-        .args(["-p", &pid.to_string(), "-o", "pid="])
-        .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .map(|o| o.status.success() && !o.stdout.is_empty())
-        .unwrap_or(true)
-}
-
 /// On agent events: clears a pane's account label once the Claude Code it
 /// was made for has ended.
 fn pane_event() -> i32 {
@@ -156,7 +148,7 @@ fn pane_event() -> i32 {
         return 0;
     };
     if let Some(entry) = sessions::get(&pane) {
-        if !alive(entry.pid) {
+        if !sessions::alive(entry.pid) {
             herdr::untag_pane(&pane);
             sessions::remove(&pane);
         }
@@ -289,6 +281,11 @@ fn main() {
         "startup" => startup(),
         "pane-event" => pane_event(),
         "remind-pane" => remind::pane(),
+        "move" => match args.get(1) {
+            Some(pane) => relocate::run_from_note(pane),
+            None => 2,
+        },
+        "move-pane" => relocate::moved_pane(),
         "remind" => match (args.get(1), args.get(2), args.get(3)) {
             (Some(pane), Some(back), Some(now_on)) => remind::show(pane, back, now_on),
             _ => 2,
