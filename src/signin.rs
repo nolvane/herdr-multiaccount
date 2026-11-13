@@ -85,29 +85,67 @@ pub fn find_url(text: &str) -> Option<String> {
     Some(url)
 }
 
+/// Claude Code's own `claude auth login` for a claude.ai account, in the
+/// account's (new) folder, where every sign-in goes. Prepares the folder
+/// first.
+fn login_command(account: &Account) -> Result<Command, String> {
+    let dir = mirror::new_dir_of(&account.id);
+    mirror::sync_at(&account.id, &dir).map_err(|e| format!("could not prepare its folder: {e}"))?;
+    let claude = launch::find_claude().ok_or("claude was not found on PATH")?;
+    let mut cmd = Command::new(claude);
+    // Clean first, so CLAUDE_CONFIG_DIR set below stays.
+    launch::clean_env(&mut cmd);
+    for v in [
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+    ] {
+        cmd.env_remove(v);
+    }
+    cmd.args(["auth", "login", "--claudeai"]);
+    if account.sso {
+        cmd.arg("--sso");
+    }
+    cmd.env("CLAUDE_CONFIG_DIR", &dir);
+    Ok(cmd)
+}
+
+/// SIGINT, and the dispositions `signal` takes.
+const SIGINT: i32 = 2;
+const SIG_DFL: usize = 0;
+const SIG_IGN: usize = 1;
+
+extern "C" {
+    fn signal(signum: i32, handler: usize) -> usize;
+}
+
+/// The sign-in in a terminal, for the launcher: Claude Code gets the
+/// terminal and asks and prints what it needs. Ctrl+C cancels the sign-in
+/// only: the launcher ignores it meanwhile and takes it back afterwards, so
+/// it can go on (and the Claude Code it starts next gets Ctrl+C as usual).
+/// Whether Claude Code reported success; the caller checks the login itself.
+pub fn in_terminal(account: &Account) -> Result<bool, String> {
+    use std::os::unix::process::CommandExt;
+    let mut cmd = login_command(account)?;
+    // SAFETY: runs in the child between fork and exec; `signal` is
+    // async-signal-safe. An ignored signal would stay ignored across exec.
+    unsafe {
+        cmd.pre_exec(|| {
+            signal(SIGINT, SIG_DFL);
+            Ok(())
+        });
+    }
+    // SAFETY: plain libc calls on this process's own disposition.
+    let before = unsafe { signal(SIGINT, SIG_IGN) };
+    let status = cmd.status();
+    unsafe { signal(SIGINT, before) };
+    status.map(|s| s.success()).map_err(|e| e.to_string())
+}
+
 impl SignIn {
     pub fn start(account: &Account, new_account: bool) -> Result<SignIn, String> {
-        // Every sign-in goes to the account's (new) folder.
-        let dir = mirror::new_dir_of(&account.id);
-        mirror::sync_at(&account.id, &dir)
-            .map_err(|e| format!("could not prepare its folder: {e}"))?;
-        let claude = launch::find_claude().ok_or("claude was not found on PATH")?;
-        let mut cmd = Command::new(claude);
-        // Clean first, so CLAUDE_CONFIG_DIR set below stays.
-        launch::clean_env(&mut cmd);
-        for v in [
-            "ANTHROPIC_API_KEY",
-            "ANTHROPIC_AUTH_TOKEN",
-            "CLAUDE_CODE_OAUTH_TOKEN",
-        ] {
-            cmd.env_remove(v);
-        }
-        cmd.args(["auth", "login", "--claudeai"]);
-        if account.sso {
-            cmd.arg("--sso");
-        }
-        cmd.env("CLAUDE_CONFIG_DIR", &dir)
-            .stdin(Stdio::piped())
+        let mut cmd = login_command(account)?;
+        cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let mut child = cmd.spawn().map_err(|e| e.to_string())?;

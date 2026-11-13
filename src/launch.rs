@@ -55,6 +55,20 @@ pub struct Choice {
     pub source: Source,
     /// Set when fallback moved the session: why.
     pub moved: Option<Limit>,
+    /// The session left the wanted account because it is not signed in.
+    pub signed_out: bool,
+}
+
+/// What to do for a new session, once sign-ins are known.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Pick {
+    /// Start on `choice.id`.
+    Start(Choice),
+    /// The wanted account is not signed in: ask whether to sign it in.
+    Ask(Choice),
+    /// The wanted account is not signed in and no other account may take
+    /// the session.
+    Stop(Choice),
 }
 
 /// The account fallback moves to from `from`: the next one in the list
@@ -97,6 +111,7 @@ pub fn choose(
         wanted,
         source,
         moved: None,
+        signed_out: false,
     };
     if !config.fallback || choice.source == Source::Explicit {
         return choice;
@@ -112,6 +127,86 @@ pub fn choose(
         choice.moved = Some(limit);
     }
     choice
+}
+
+/// Picks the account for a new session, also when accounts are signed out.
+/// `usable` is the cheap check (`usable`), `signed_in` the one that asks
+/// Claude Code. A limit moves the session as `choose` does, never onto an
+/// account that is not signed in. When the wanted account itself is not
+/// signed in, the start asks to sign it in where `may_ask` (a terminal, not
+/// a nested start); otherwise a named start or one with fallback off stops,
+/// and every other start goes down the list to the next account that is
+/// signed in, has room and takes part in fallback.
+#[allow(clippy::too_many_arguments)]
+pub fn pick(
+    store: &Store,
+    config: &Config,
+    usage: &HashMap<String, Usage>,
+    usable: &dyn Fn(&str) -> bool,
+    signed_in: &dyn Fn(&str) -> bool,
+    wanted: String,
+    source: Source,
+    now: i64,
+    may_ask: bool,
+) -> Pick {
+    let takes = |id: &str| usable(id) && signed_in(id);
+    let mut choice = choose(store, config, usage, &takes, wanted, source, now);
+    if choice.id != choice.wanted || signed_in(&choice.wanted) {
+        return Pick::Start(choice);
+    }
+    if may_ask {
+        return Pick::Ask(choice);
+    }
+    if choice.source == Source::Explicit || !config.fallback {
+        return Pick::Stop(choice);
+    }
+    match fallback_from(store, usage, &takes, &choice.wanted, config.threshold, now) {
+        Some(next) => {
+            choice.id = next;
+            choice.moved = None;
+            choice.signed_out = true;
+            Pick::Start(choice)
+        }
+        None => Pick::Stop(choice),
+    }
+}
+
+/// Whether a start may ask to sign in: only at a terminal, and never in a
+/// start inside another Claude Code (headless runs, subagents), which nobody
+/// watches.
+pub fn may_ask(terminal: bool, source: &Source) -> bool {
+    terminal && *source != Source::Inherited
+}
+
+/// The line when a session stops because `name` is not signed in: both ways
+/// out, the list and the shell.
+pub fn signed_out_stop(name: &str) -> String {
+    format!(
+        "{name} is not signed in, so this session cannot start on it. Sign it in with l in the accounts list (Herdr: the Multiaccount action), or start on the main login with: HERDR_MULTIACCOUNT_USE=main claude"
+    )
+}
+
+/// The line when a session moved away from `from` because it is not signed
+/// in.
+pub fn signed_out_moved(from: &str, to: &str) -> String {
+    format!(
+        "{from} is not signed in; this session uses {to}. Sign {from} in with l in the accounts list (Herdr: the Multiaccount action)."
+    )
+}
+
+/// Why `name` cannot be signed in from here: a claude.ai sign-in would sign
+/// out a main login that is a Console profile.
+pub fn console_note(name: &str) -> String {
+    format!(
+        "{name} can't be signed in here: the main login is a Claude Console sign-in without an API key, which signing in a claude.ai account would sign out. Sign the main login in with an API key first (claude auth login --console, then \"Create an API key\")."
+    )
+}
+
+/// The account a session's note names as the one it should go back to: only
+/// after a move for a limit, since a signed-out account has no room to go
+/// back to.
+pub fn note_wanted(choice: &Choice) -> Option<&str> {
+    (choice.id != choice.wanted && !choice.signed_out).then_some(choice.wanted.as_str())
 }
 
 /// What a space or the active setting asks for, with the reason.
@@ -172,6 +267,70 @@ pub fn usable(store: &Store, id: &str) -> bool {
         Some(Kind::Main) => true,
         None => false,
     }
+}
+
+/// Whether an account's folder is signed in with a login of its own, so a
+/// session runs on it (asks Claude Code: up to a second or two). Without a
+/// login of its own, Claude Code would quietly use the main login, or ask to
+/// sign in where the browser may pick the wrong account. API key accounts
+/// and the main login need no check here.
+pub fn signed_in(store: &Store, id: &str) -> bool {
+    match store.account(id).map(|a| a.kind) {
+        Some(Kind::Subscription) => {
+            let dir = mirror::folder(id);
+            mirror::has_login(&dir)
+                && info::takes_sessions(info::status_text(Some(&dir)).as_deref())
+        }
+        Some(_) => true,
+        None => false,
+    }
+}
+
+/// Asks a yes/no question on the terminal; anything but yes is no.
+fn ask_yes(question: &str) -> bool {
+    use std::io::Write;
+    eprint!("herdr-multiaccount: {question} [y/N] ");
+    let _ = std::io::stderr().flush();
+    let mut line = String::new();
+    if std::io::stdin().read_line(&mut line).is_err() {
+        return false;
+    }
+    matches!(line.trim().to_lowercase().as_str(), "y" | "yes")
+}
+
+/// Claude Code's own sign-in for `id`, in the terminal. True when the folder
+/// is signed in afterwards; says who signed in, and warns when that is the
+/// same login as another account.
+fn sign_in_here(store: &Store, id: &str) -> bool {
+    let Some(account) = store.account(id) else {
+        return false;
+    };
+    match crate::signin::in_terminal(account) {
+        Ok(true) => {}
+        Ok(false) => {
+            eprintln!("herdr-multiaccount: {} was not signed in.", account.name);
+            return false;
+        }
+        Err(e) => {
+            eprintln!(
+                "herdr-multiaccount: could not sign {} in: {e}",
+                account.name
+            );
+            return false;
+        }
+    }
+    let i = info::read(account);
+    if !i.own_login() {
+        eprintln!("herdr-multiaccount: {} was not signed in.", account.name);
+        return false;
+    }
+    // From now on the account stays on its new folder.
+    mirror::mark_moved(&mirror::home_of(id));
+    let same = login::same_as(store, account);
+    if !same.is_empty() {
+        eprintln!("herdr-multiaccount: {}", login::same_login_note(&same));
+    }
+    true
 }
 
 /// The real `claude` on `PATH` (the shell function is not on `PATH`, and
@@ -240,19 +399,6 @@ pub fn session_env(store: &Store, id: &str) -> Result<SessionEnv, String> {
                     "herdr-multiaccount: {name} in the {} folder is not linked to ~/.claude",
                     account.name
                 );
-            }
-            // Without a login of its own, Claude Code would quietly use the
-            // main login (or ask to sign in, where the browser may pick the
-            // wrong account): stop with a clear message instead. When Claude
-            // Code cannot be asked, start anyway.
-            if let Some(text) = info::status_text(Some(&dir)) {
-                let i = info::parse_status(&text);
-                if !i.signed_in || i.borrows_main {
-                    return Err(format!(
-                        "{} is not signed in, so this session would not run on it. Open the accounts list (Herdr: the Multiaccount action) and press l on {} to sign in.",
-                        account.name, account.name
-                    ));
-                }
             }
             if let Some(note) = start_note(&dir, &mirror::home_of(id), &account.name) {
                 eprintln!("herdr-multiaccount: {note}");
@@ -334,8 +480,69 @@ pub fn run(args: Vec<String>, moved: bool) -> i32 {
     let usage = load_usage(&store);
     let (wanted, source) = wanted(&store);
     let check = |id: &str| usable(&store, id);
-    let choice = choose(&store, &config, &usage, &check, wanted, source, time::now());
+    // Each account is asked about at most once per start.
+    let known = std::cell::RefCell::new(HashMap::<String, bool>::new());
+    let is_signed_in = |id: &str| {
+        if let Some(&v) = known.borrow().get(id) {
+            return v;
+        }
+        let v = signed_in(&store, id);
+        known.borrow_mut().insert(id.to_string(), v);
+        v
+    };
+    use std::io::IsTerminal;
+    let terminal = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
+    let may_ask = may_ask(terminal, &source);
+    let now = time::now();
+    let mut picked = pick(
+        &store,
+        &config,
+        &usage,
+        &check,
+        &is_signed_in,
+        wanted.clone(),
+        source.clone(),
+        now,
+        may_ask,
+    );
+    if let Pick::Ask(c) = &picked {
+        let name = store.name_of(&c.wanted);
+        if info::main_uses_profile() {
+            eprintln!("herdr-multiaccount: {}", console_note(&name));
+        } else if ask_yes(&format!("{name} is not signed in. Sign in now?"))
+            && sign_in_here(&store, &c.wanted)
+        {
+            known.borrow_mut().insert(c.wanted.clone(), true);
+        }
+        picked = pick(
+            &store,
+            &config,
+            &usage,
+            &check,
+            &is_signed_in,
+            wanted,
+            source,
+            now,
+            false,
+        );
+    }
+    let choice = match picked {
+        Pick::Start(c) => c,
+        Pick::Ask(c) | Pick::Stop(c) => {
+            eprintln!(
+                "herdr-multiaccount: {}",
+                signed_out_stop(&store.name_of(&c.wanted))
+            );
+            return 1;
+        }
+    };
 
+    if choice.signed_out {
+        eprintln!(
+            "herdr-multiaccount: {}",
+            signed_out_moved(&store.name_of(&choice.wanted), &store.name_of(&choice.id))
+        );
+    }
     if let Some(limit) = &choice.moved {
         eprintln!(
             "herdr-multiaccount: {} is at its {} limit ({:.0}%, resets in {}); this session uses {}.",
@@ -370,7 +577,6 @@ pub fn run(args: Vec<String>, moved: bool) -> i32 {
 
     // Label the pane in Herdr's sidebar: only for the session the user
     // started there, not for ones Claude Code starts inside it.
-    use std::io::IsTerminal;
     if herdr::inside() && choice.source != Source::Inherited && std::io::stdin().is_terminal() {
         if let Ok(pane) = std::env::var("HERDR_PANE_ID") {
             herdr::tag_pane(
@@ -380,11 +586,10 @@ pub fn run(args: Vec<String>, moved: bool) -> i32 {
                 std::process::id(),
             );
             // Herdr does not hand labels back, so the list reads this.
-            let wanted = (choice.id != choice.wanted).then_some(choice.wanted.as_str());
             crate::sessions::record(
                 &pane,
                 &choice.id,
-                wanted,
+                note_wanted(&choice),
                 std::process::id(),
                 carried.as_ref(),
             );
@@ -550,6 +755,221 @@ mod tests {
         );
         assert_eq!(c.id, "a");
         assert!(c.moved.is_none());
+    }
+
+    /// `pick` with fallback on, readings `usage`, and the accounts in
+    /// `out` signed out.
+    fn pick_with(
+        config: &Config,
+        usage: &HashMap<String, Usage>,
+        out: &[&str],
+        wanted: &str,
+        source: Source,
+        may_ask: bool,
+    ) -> Pick {
+        let s = store();
+        pick(
+            &s,
+            config,
+            usage,
+            &|_| true,
+            &|id| !out.contains(&id),
+            wanted.into(),
+            source,
+            NOW,
+            may_ask,
+        )
+    }
+
+    fn started(p: Pick) -> Choice {
+        match p {
+            Pick::Start(c) => c,
+            other => panic!("expected a start, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn signed_in_wanted_account_starts_as_before() {
+        let c = started(pick_with(
+            &Config::default(),
+            &HashMap::new(),
+            &[],
+            "a",
+            Source::Active,
+            true,
+        ));
+        assert_eq!(c.id, "a");
+        assert!(c.moved.is_none() && !c.signed_out);
+    }
+
+    #[test]
+    fn signed_out_wanted_account_asks_where_it_may() {
+        for source in [
+            Source::Active,
+            Source::Space("Work".into()),
+            Source::Explicit,
+        ] {
+            let p = pick_with(
+                &Config::default(),
+                &HashMap::new(),
+                &["a"],
+                "a",
+                source,
+                true,
+            );
+            assert!(matches!(p, Pick::Ask(ref c) if c.wanted == "a"), "{p:?}");
+        }
+    }
+
+    #[test]
+    fn only_a_watched_terminal_asks() {
+        assert!(may_ask(true, &Source::Active));
+        assert!(may_ask(true, &Source::Explicit));
+        assert!(may_ask(true, &Source::Space("Work".into())));
+        // Nested starts and starts without a terminal never wait for an answer.
+        assert!(!may_ask(true, &Source::Inherited));
+        assert!(!may_ask(false, &Source::Active));
+        assert!(!may_ask(false, &Source::Explicit));
+    }
+
+    #[test]
+    fn signed_out_falls_back_to_the_next_signed_in_account() {
+        let c = started(pick_with(
+            &Config::default(),
+            &HashMap::new(),
+            &["a"],
+            "a",
+            Source::Active,
+            false,
+        ));
+        // b is kept out of fallback; c is the next one and signed in.
+        assert_eq!(c.id, "c");
+        assert!(c.signed_out);
+        assert!(c.moved.is_none());
+        assert_eq!(
+            note_wanted(&c),
+            None,
+            "no reminder to go back to a signed-out account"
+        );
+    }
+
+    #[test]
+    fn fallback_skips_signed_out_full_and_kept_out_accounts() {
+        // c still has a login in its folder (usable) but is signed out.
+        let c = started(pick_with(
+            &Config::default(),
+            &HashMap::new(),
+            &["a", "c"],
+            "a",
+            Source::Active,
+            false,
+        ));
+        assert_eq!(c.id, "main", "everything else is signed out or kept out");
+        // c signed in but full: skipped too.
+        let usage: HashMap<String, Usage> = [("c".to_string(), full(99.0))].into();
+        let c = started(pick_with(
+            &Config::default(),
+            &usage,
+            &["a"],
+            "a",
+            Source::Active,
+            false,
+        ));
+        assert_eq!(c.id, "main");
+        // Nested starts fall back the same way.
+        let c = started(pick_with(
+            &Config::default(),
+            &HashMap::new(),
+            &["a"],
+            "a",
+            Source::Inherited,
+            false,
+        ));
+        assert_eq!(c.id, "c");
+    }
+
+    #[test]
+    fn stops_when_no_account_may_take_it() {
+        // Named starts never move, also after a "no".
+        let p = pick_with(
+            &Config::default(),
+            &HashMap::new(),
+            &["a"],
+            "a",
+            Source::Explicit,
+            false,
+        );
+        assert!(matches!(p, Pick::Stop(ref c) if c.id == "a"), "{p:?}");
+        // Fallback off.
+        let off = Config {
+            fallback: false,
+            ..Config::default()
+        };
+        let p = pick_with(&off, &HashMap::new(), &["a"], "a", Source::Active, false);
+        assert!(matches!(p, Pick::Stop(_)), "{p:?}");
+        // Everyone else signed out (b is out of fallback anyway).
+        let p = pick_with(
+            &Config::default(),
+            &HashMap::new(),
+            &["a", "c", "main"],
+            "a",
+            Source::Active,
+            false,
+        );
+        assert!(matches!(p, Pick::Stop(_)), "{p:?}");
+    }
+
+    #[test]
+    fn a_limit_move_never_lands_on_a_signed_out_account() {
+        let usage: HashMap<String, Usage> = [("a".to_string(), full(97.0))].into();
+        // c is next but signed out: main takes it, for the limit.
+        let c = started(pick_with(
+            &Config::default(),
+            &usage,
+            &["c"],
+            "a",
+            Source::Active,
+            true,
+        ));
+        assert_eq!(c.id, "main");
+        assert_eq!(c.moved.as_ref().unwrap().window, "5-hour");
+        assert!(!c.signed_out);
+        assert_eq!(note_wanted(&c), Some("a"), "the reminder to go back stays");
+        // A full account that is also signed out still moves for the limit,
+        // without asking.
+        let c = started(pick_with(
+            &Config::default(),
+            &usage,
+            &["a"],
+            "a",
+            Source::Active,
+            true,
+        ));
+        assert_eq!(c.id, "c");
+        assert!(c.moved.is_some());
+    }
+
+    #[test]
+    fn messages_name_the_ways_out() {
+        let stop = signed_out_stop("Work");
+        assert!(stop.contains("Work is not signed in"), "{stop}");
+        assert!(stop.contains("l in the accounts list"), "{stop}");
+        assert!(
+            stop.contains("HERDR_MULTIACCOUNT_USE=main claude"),
+            "{stop}"
+        );
+        let moved = signed_out_moved("Work", "Personal");
+        assert!(
+            moved.starts_with("Work is not signed in; this session uses Personal."),
+            "{moved}"
+        );
+        assert!(moved.contains("Sign Work in with l"), "{moved}");
+        let console = console_note("Work");
+        assert!(
+            console.contains("Console sign-in without an API key"),
+            "{console}"
+        );
+        assert!(console.contains("claude auth login --console"), "{console}");
     }
 
     #[test]

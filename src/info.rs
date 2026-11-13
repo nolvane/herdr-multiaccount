@@ -29,6 +29,21 @@ pub struct Info {
     pub old_folder: bool,
 }
 
+impl Info {
+    /// Signed in with a login of its own, not one borrowed from the main
+    /// login: what a folder needs to take a session.
+    pub fn own_login(&self) -> bool {
+        self.signed_in && !self.borrows_main
+    }
+}
+
+/// Whether a folder can take a session, from its `claude auth status` text.
+/// No answer (Claude Code could not be asked) counts as yes, so a session is
+/// never kept from starting only because the check could not run.
+pub fn takes_sessions(status: Option<&str>) -> bool {
+    status.is_none_or(|t| parse_status(t).own_login())
+}
+
 /// Parses `claude auth status --text`. A row ending in "not in use" names a
 /// credential that is there but loses to another one.
 pub fn parse_status(text: &str) -> Info {
@@ -224,6 +239,23 @@ pub fn read(account: &Account) -> Info {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn takes_sessions_only_with_a_login_of_its_own() {
+        // Claude Code could not be asked: start as before.
+        assert!(takes_sessions(None));
+        assert!(takes_sessions(Some(
+            "Login method: Claude Max Account\nEmail: alex@example.com\n"
+        )));
+        assert!(!takes_sessions(Some(
+            "Not logged in. Run claude auth login.\n"
+        )));
+        assert!(!takes_sessions(Some("")));
+        // Only the machine's Console profile, borrowed from the main login.
+        assert!(!takes_sessions(Some(
+            "Profile: credentials-file · user_oauth · profile default\nOrganization: Acme · 1\n"
+        )));
+    }
 
     #[test]
     fn status_text() {

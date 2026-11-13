@@ -47,6 +47,13 @@ to the next account when one is at its limit.
   room. You get one Herdr notification when that starts. Once the full
   window resets, sessions go back by themselves. `f` keeps an account out of
   fallback, `K` and `J` change the order, `F` turns fallback off.
+- **Signed-out accounts.** When the account a session would get is not
+  signed in, `claude` asks in the terminal whether to sign it in, with
+  Claude Code's own sign-in. Say no, and the session goes down the list to
+  the next account that is signed in and has room, like fallback (a session
+  started with a named account stops instead). When nothing is left, it
+  stops and says how to get in: `l` in the accounts list, or
+  `HERDR_MULTIACCOUNT_USE=main claude` for the main login.
 - **Reminder to go back.** A session that fallback started on another
   account cannot switch by itself once the full account has room again. Then
   a Herdr popup opens over whatever is in front and stays until you answer:

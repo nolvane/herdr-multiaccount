@@ -512,7 +512,7 @@ impl App {
                 };
                 match a.kind {
                     Kind::Main => i.signed_in && i.claude_ai,
-                    Kind::Subscription => i.signed_in && !i.borrows_main,
+                    Kind::Subscription => i.own_login(),
                     Kind::ApiKey => false,
                 }
             })
@@ -946,11 +946,7 @@ impl App {
     /// Whether a session can be moved to an account: it is checked and
     /// signed in with a login (or key) of its own, as the launcher demands.
     fn can_take(&self, id: &str) -> bool {
-        self.store.account(id).is_some()
-            && self
-                .info
-                .get(id)
-                .is_some_and(|i| i.signed_in && !i.borrows_main)
+        self.store.account(id).is_some() && self.info.get(id).is_some_and(Info::own_login)
     }
 
     /// Why a session cannot be moved now, from Herdr's status.
@@ -1687,7 +1683,7 @@ impl App {
         let account = self.store.account(&s.id).cloned();
         let was_old = self.info.get(&s.id).is_some_and(|i| i.old_folder);
         let info = account.as_ref().map(info::read).unwrap_or_default();
-        if ok && info.signed_in && !info.borrows_main {
+        if ok && info.own_login() {
             // From now on the account stays on its new folder.
             mirror::mark_moved(&mirror::home_of(&s.id));
             let who = info
@@ -1704,20 +1700,12 @@ impl App {
             )];
             // The browser often signs in with whatever account it already
             // has open.
-            let mine = account.as_ref().and_then(crate::login::of);
-            let same: Vec<String> = self
-                .store
-                .accounts
-                .iter()
-                .filter(|a| a.id != s.id)
-                .filter(|a| mine.is_some() && crate::login::of(a) == mine)
-                .map(|a| a.name.clone())
-                .collect();
+            let same = account
+                .as_ref()
+                .map(|a| crate::login::same_as(&self.store, a))
+                .unwrap_or_default();
             if !same.is_empty() {
-                lines.push(format!(
-                    "That is the same login as {}. If you meant another account, sign out in the browser (or use a private window) and press l to sign in again.",
-                    same.join(", ")
-                ));
+                lines.push(crate::login::same_login_note(&same));
             }
             if was_old && !info.old_folder {
                 lines.push(
@@ -2635,8 +2623,7 @@ fn sign_out(a: &Account) -> Vec<PathBuf> {
 
 fn sign_out_folder(dir: &std::path::Path) -> bool {
     let own_login = |dir: &std::path::Path| {
-        let i = info::parse_status(&info::status_text(Some(dir)).unwrap_or_default());
-        i.signed_in && !i.borrows_main
+        info::parse_status(&info::status_text(Some(dir)).unwrap_or_default()).own_login()
     };
     if !own_login(dir) {
         return true;
