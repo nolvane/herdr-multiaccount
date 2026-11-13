@@ -55,7 +55,8 @@ pub struct Choice {
     pub source: Source,
     /// Set when fallback moved the session: why.
     pub moved: Option<Limit>,
-    /// The session left the wanted account because it is not signed in.
+    /// The session left the wanted account, which is not signed in (also
+    /// when a limit moved it): nothing to go back to.
     pub signed_out: bool,
 }
 
@@ -151,7 +152,13 @@ pub fn pick(
 ) -> Pick {
     let takes = |id: &str| usable(id) && signed_in(id);
     let mut choice = choose(store, config, usage, &takes, wanted, source, now);
-    if choice.id != choice.wanted || signed_in(&choice.wanted) {
+    if choice.id != choice.wanted {
+        // Moved for a limit. When the wanted account is signed out as well,
+        // the session gets no reminder to go back to it.
+        choice.signed_out = !signed_in(&choice.wanted);
+        return Pick::Start(choice);
+    }
+    if signed_in(&choice.wanted) {
         return Pick::Start(choice);
     }
     if may_ask {
@@ -179,8 +186,14 @@ pub fn may_ask(terminal: bool, source: &Source) -> bool {
 }
 
 /// The line when a session stops because `name` is not signed in: both ways
-/// out, the list and the shell.
-pub fn signed_out_stop(name: &str) -> String {
+/// out, the list and the shell. While the main login is a Console profile
+/// (`console`), the list cannot sign it in either, so only the shell way out.
+pub fn signed_out_stop(name: &str, console: bool) -> String {
+    if console {
+        return format!(
+            "{name} is not signed in, so this session cannot start on it. Start on the main login with: HERDR_MULTIACCOUNT_USE=main claude"
+        );
+    }
     format!(
         "{name} is not signed in, so this session cannot start on it. Sign it in with l in the accounts list (Herdr: the Multiaccount action), or start on the main login with: HERDR_MULTIACCOUNT_USE=main claude"
     )
@@ -286,21 +299,36 @@ pub fn signed_in(store: &Store, id: &str) -> bool {
     }
 }
 
-/// Asks a yes/no question on the terminal; anything but yes is no.
+/// Asks a yes/no question on the terminal; anything but yes is no. Reads
+/// standard input byte by byte, unbuffered, so nothing typed after the
+/// answer is held back from the Claude Code that starts next.
 fn ask_yes(question: &str) -> bool {
-    use std::io::Write;
+    use std::io::{Read, Write};
+    use std::os::fd::FromRawFd;
     eprint!("herdr-multiaccount: {question} [y/N] ");
     let _ = std::io::stderr().flush();
-    let mut line = String::new();
-    if std::io::stdin().read_line(&mut line).is_err() {
-        return false;
+    // SAFETY: borrows file descriptor 0 without taking it over; ManuallyDrop
+    // keeps it open afterwards.
+    let mut input = std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(0) });
+    let mut line = Vec::new();
+    let mut byte = [0u8; 1];
+    while line.len() < 64 {
+        match input.read(&mut byte) {
+            Ok(1) if byte[0] != b'\n' => line.push(byte[0]),
+            _ => break,
+        }
     }
-    matches!(line.trim().to_lowercase().as_str(), "y" | "yes")
+    is_yes(&String::from_utf8_lossy(&line))
 }
 
-/// Claude Code's own sign-in for `id`, in the terminal. True when the folder
-/// is signed in afterwards; says who signed in, and warns when that is the
-/// same login as another account.
+/// Whether an answer to a [y/N] question is yes.
+fn is_yes(answer: &str) -> bool {
+    matches!(answer.trim().to_lowercase().as_str(), "y" | "yes")
+}
+
+/// Claude Code's own sign-in for `id`, in the terminal (Claude Code says
+/// who signed in). True when the folder is signed in afterwards; warns when
+/// that is the same login as another account.
 fn sign_in_here(store: &Store, id: &str) -> bool {
     let Some(account) = store.account(id) else {
         return false;
@@ -506,14 +534,18 @@ pub fn run(args: Vec<String>, moved: bool) -> i32 {
         now,
         may_ask,
     );
+    // A claude.ai sign-in would sign out a main login that is a Console
+    // profile; that check takes a second, so only after a yes.
+    let mut console = false;
     if let Pick::Ask(c) = &picked {
         let name = store.name_of(&c.wanted);
-        if info::main_uses_profile() {
-            eprintln!("herdr-multiaccount: {}", console_note(&name));
-        } else if ask_yes(&format!("{name} is not signed in. Sign in now?"))
-            && sign_in_here(&store, &c.wanted)
-        {
-            known.borrow_mut().insert(c.wanted.clone(), true);
+        if ask_yes(&format!("{name} is not signed in. Sign in now?")) {
+            if info::main_uses_profile() {
+                console = true;
+                eprintln!("herdr-multiaccount: {}", console_note(&name));
+            } else if sign_in_here(&store, &c.wanted) {
+                known.borrow_mut().insert(c.wanted.clone(), true);
+            }
         }
         picked = pick(
             &store,
@@ -532,13 +564,13 @@ pub fn run(args: Vec<String>, moved: bool) -> i32 {
         Pick::Ask(c) | Pick::Stop(c) => {
             eprintln!(
                 "herdr-multiaccount: {}",
-                signed_out_stop(&store.name_of(&c.wanted))
+                signed_out_stop(&store.name_of(&c.wanted), console)
             );
             return 1;
         }
     };
 
-    if choice.signed_out {
+    if choice.signed_out && choice.moved.is_none() {
         eprintln!(
             "herdr-multiaccount: {}",
             signed_out_moved(&store.name_of(&choice.wanted), &store.name_of(&choice.id))
@@ -948,16 +980,38 @@ mod tests {
         ));
         assert_eq!(c.id, "c");
         assert!(c.moved.is_some());
+        assert_eq!(
+            note_wanted(&c),
+            None,
+            "no reminder to go back to an account that is signed out too"
+        );
+    }
+
+    #[test]
+    fn only_yes_is_yes() {
+        for yes in ["y", "Y", "yes", " YES \r"] {
+            assert!(is_yes(yes), "{yes:?}");
+        }
+        for no in ["", "n", "no", "ja", "yy", "\u{4}"] {
+            assert!(!is_yes(no), "{no:?}");
+        }
     }
 
     #[test]
     fn messages_name_the_ways_out() {
-        let stop = signed_out_stop("Work");
+        let stop = signed_out_stop("Work", false);
         assert!(stop.contains("Work is not signed in"), "{stop}");
         assert!(stop.contains("l in the accounts list"), "{stop}");
         assert!(
             stop.contains("HERDR_MULTIACCOUNT_USE=main claude"),
             "{stop}"
+        );
+        // With a Console main login, the list cannot sign Work in either.
+        let console_stop = signed_out_stop("Work", true);
+        assert!(!console_stop.contains("accounts list"), "{console_stop}");
+        assert!(
+            console_stop.contains("HERDR_MULTIACCOUNT_USE=main claude"),
+            "{console_stop}"
         );
         let moved = signed_out_moved("Work", "Personal");
         assert!(
