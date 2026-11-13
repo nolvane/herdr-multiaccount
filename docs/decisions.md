@@ -124,7 +124,8 @@ other programs can read. The key is checked for the characters a key has.
 Before a session starts on a subscription, the launcher asks `claude auth
 status` for its folder (about 0.8 s). Without a login of its own the folder
 would quietly use the main login, so the start stops with a message instead.
-When Claude Code cannot be asked, the session starts.
+When Claude Code cannot be asked, the session starts. Extended on
+2026-11-13: a signed-out account asks to sign in, then falls back.
 
 ## 2026-11-09: Labels through Herdr metadata
 
@@ -620,3 +621,31 @@ and clearing would take its skills and login while it runs. Once the new
 folder has a login the old one is never picked again, so it stays until the
 account is removed, which signs out every folder that holds a login and
 deletes both, links removed and never followed.
+
+## 2026-11-13: A signed-out account asks to sign in, then falls back
+
+"Sessions start only on a signed-in folder" only stopped, so when every
+account was signed out, `claude` started nowhere and Claude Code's own
+`/login` could not be reached (#20). Now, when the account a session would
+get is not signed in:
+
+- at a terminal, and not in a start nested inside another Claude Code, the
+  launcher asks whether to sign it in and runs Claude Code's own
+  `claude auth login` with the terminal handed over (the same command the
+  list runs). Ctrl+C ends only the sign-in: the launcher ignores it while
+  the sign-in runs and restores it before Claude Code starts;
+- without a terminal, or after a no or a failed sign-in, the session goes
+  down the list like fallback (same order, `f` and `F` respected) to the
+  next account that is signed in and has room. A named start
+  (`HERDR_MULTIACCOUNT_USE`, `c`, a move) never moves, and with fallback
+  off the start stops;
+- a stop names both ways out: `l` in the list and
+  `HERDR_MULTIACCOUNT_USE=main claude`;
+- a session moved away from a signed-out account gets no reminder to go
+  back, since that account has no room to go back to.
+
+The sign-in check moved from preparing the session's environment into
+picking the account, so a limit fallback never lands on a signed-out
+account either; it still asks Claude Code once per start for a subscription
+(the cost #22 is about). Ask-then-fall-back was the owner's choice over
+falling back silently or only asking.

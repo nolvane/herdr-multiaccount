@@ -29,6 +29,12 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- `claude` no longer leaves you without a way in when the account it would
+  use is signed out: at a terminal it offers Claude Code's own sign-in for
+  that account; otherwise, or after a no, the session moves to the next
+  account that is signed in, as fallback does. When nothing is left, the
+  message names `l` in the accounts list and
+  `HERDR_MULTIACCOUNT_USE=main claude`.
 - In a session on a subscription account, Claude no longer asks before every
   edit in `~/.claude` (skills, `CLAUDE.md`, settings): each account's folder
   is now `homes/<account>/.claude/`, so auto mode checks these edits as on

@@ -52,6 +52,29 @@ pub fn of(account: &Account) -> Option<Login> {
     }
 }
 
+/// The names of the other accounts that hold the same login as `account`,
+/// in list order.
+pub fn same_as(store: &Store, account: &Account) -> Vec<String> {
+    let Some(mine) = of(account) else {
+        return Vec::new();
+    };
+    store
+        .accounts
+        .iter()
+        .filter(|a| a.id != account.id && of(a).as_ref() == Some(&mine))
+        .map(|a| a.name.clone())
+        .collect()
+}
+
+/// The warning after a sign-in that ended up with another account's login:
+/// the browser often signs in with whatever account it already has open.
+pub fn same_login_note(names: &[String]) -> String {
+    format!(
+        "That is the same login as {}. If you meant another account, sign out in the browser (or use a private window) and press l to sign in again.",
+        names.join(", ")
+    )
+}
+
 /// Each account's login, where it has one.
 pub fn all(store: &Store) -> HashMap<String, Login> {
     store
