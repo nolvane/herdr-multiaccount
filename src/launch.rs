@@ -319,8 +319,9 @@ fn sign_in_here(store: &Store, id: &str) -> bool {
             return false;
         }
     }
-    let i = info::read(account);
-    if !i.own_login() {
+    // The same check as for any start: no answer from Claude Code does not
+    // undo a sign-in it just reported as done.
+    if !signed_in(store, id) {
         eprintln!("herdr-multiaccount: {} was not signed in.", account.name);
         return false;
     }
