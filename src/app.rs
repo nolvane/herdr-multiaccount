@@ -12,6 +12,7 @@ use crate::secret;
 use crate::setup;
 use crate::signin::SignIn;
 use crate::store::{Account, Kind, Store, MAIN_ID};
+use crate::theme;
 use crate::time;
 use crate::ui;
 use crate::usage::Usage;
@@ -93,6 +94,23 @@ pub struct Held {
 }
 /// The folder of the notes, this list's id and the plan.
 pub type Mover = fn(&std::path::Path, u32, relocate::Plan) -> Result<(), String>;
+
+/// Signs an account's folders out (`sign_out`), returning those still
+/// signed in, and deletes its folder (`mirror::remove`) and its usage
+/// reading; fields so tests never reach Claude Code or the config directory.
+pub type Signer = fn(&Account) -> Vec<PathBuf>;
+pub type FolderRemover = fn(&str) -> std::io::Result<Vec<String>>;
+pub type UsageRemover = fn(&str);
+
+/// An account's sign-out, running in the background before the account
+/// goes, so the list never waits on Claude Code.
+pub struct SigningOut {
+    pub id: String,
+    /// A half-added account dropped after its sign-in did not finish,
+    /// rather than one removed with `d`.
+    dropping: bool,
+    rx: Receiver<Vec<PathBuf>>,
+}
 
 /// The program that opens links: `open` on macOS, `xdg-open` elsewhere.
 const OPENER: &str = if cfg!(target_os = "macos") {
@@ -262,14 +280,15 @@ pub enum Mode {
 
 type HerdrState = (Option<Vec<Workspace>>, Option<Vec<Pane>>);
 
-/// How the list works, shown on first open and under `?`.
+/// How the list works, shown on first open and under `?`. Keys stand
+/// between backticks (`theme::keys`).
 pub const INTRO: [&str; 6] = [
     "Main login is the login Claude Code already has in ~/.claude, the one /login sets. This list never changes it; to switch it, run /login in Claude Code.",
     "Every other account sits next to it in a folder of its own with its own login, and shares your settings, skills, plugins and history.",
-    "New sessions start on the active account; choose it with ⏎. Running sessions keep theirs, and a space can have an account of its own (Spaces).",
-    "When an account is at its limit, new sessions go to the next account in the list that has room (fallback, F).",
+    "New sessions start on the active account; choose it with `⏎`. Running sessions keep theirs, and a space can have an account of its own (Spaces).",
+    "When an account is at its limit, new sessions go to the next account in the list that has room (fallback, `F`).",
     "Limits come from Claude Code: the status line of running sessions, and its /usage, read while this list is in view for accounts without a reading from the last 5 minutes.",
-    "Agents shows which account each Claude Code session runs on. ? shows all keys and this note again.",
+    "Agents shows which account each Claude Code session runs on. `?` shows all keys and this note again.",
 ];
 
 /// The field an API key is pasted into.
@@ -355,6 +374,11 @@ pub struct App {
     /// wait while it is not. True when Herdr cannot tell.
     pub in_view: bool,
     last_click: Option<(Instant, Hit)>,
+    /// Accounts being signed out before they go.
+    pub signing_out: Vec<SigningOut>,
+    pub signer: Signer,
+    pub folder_remover: FolderRemover,
+    pub usage_remover: UsageRemover,
 }
 
 impl App {
@@ -419,6 +443,12 @@ impl App {
             force_probe: false,
             in_view: true,
             last_click: None,
+            signing_out: vec![],
+            signer: sign_out,
+            folder_remover: mirror::remove,
+            usage_remover: |id| {
+                let _ = std::fs::remove_file(paths::usage_dir().join(format!("{id}.json")));
+            },
         }
     }
 
@@ -517,6 +547,10 @@ impl App {
             .accounts
             .iter()
             .filter(|a| {
+                // Its folder is being signed out and deleted.
+                if self.is_signing_out(&a.id) {
+                    return false;
+                }
                 let Some(i) = self.info.get(&a.id) else {
                     return false;
                 };
@@ -908,10 +942,10 @@ impl App {
         }
         let group = Self::space_group(&now, &first.id);
         if let Some(new) = group.iter().find(|w| !named.iter().any(|n| n.id == w.id)) {
-            self.flash(
-                format!(
-                    "{} opened since; nothing was closed. Press d again",
-                    Self::space_name(new)
+            self.flash_keys(
+                theme::named(
+                    &Self::space_name(new),
+                    " opened since; nothing was closed. Press `d` again",
                 ),
                 crate::theme::YELLOW,
             );
@@ -931,8 +965,11 @@ impl App {
             .filter(|p| group.iter().any(|w| w.id == p.workspace) && self.is_session(p))
             .any(|p| !counted.contains(&p.id) || (Self::busy(p) && !warned.contains(&p.id)));
         if changed {
-            self.flash(
-                format!("{label} changed since the question; nothing was closed. Press d again"),
+            self.flash_keys(
+                theme::named(
+                    label,
+                    " changed since the question; nothing was closed. Press `d` again",
+                ),
                 crate::theme::YELLOW,
             );
             self.workspaces = now;
@@ -973,11 +1010,17 @@ impl App {
                         s.assign(id, name, Some(account));
                     }
                 });
-            self.flash(
+            self.flash_keys(
                 if back {
-                    format!("Herdr could not close {label}")
+                    format!("Herdr could not close {}", theme::plain(label))
                 } else {
-                    format!("Herdr could not close {label}, and its account choice is lost: choose it again with ⏎")
+                    format!(
+                        "Herdr could not close {}",
+                        theme::named(
+                            label,
+                            ", and its account choice is lost: choose it again with `⏎`"
+                        )
+                    )
                 },
                 crate::theme::RED,
             );
@@ -1026,7 +1069,9 @@ impl App {
     /// Whether a session can be moved to an account: it is checked and
     /// signed in with a login (or key) of its own, as the launcher demands.
     fn can_take(&self, id: &str) -> bool {
-        self.store.account(id).is_some() && self.info.get(id).is_some_and(Info::own_login)
+        self.store.account(id).is_some()
+            && !self.is_signing_out(id)
+            && self.info.get(id).is_some_and(Info::own_login)
     }
 
     /// Why a session cannot be moved now, from Herdr's status.
@@ -1079,7 +1124,7 @@ impl App {
             self.mode = Mode::Message {
                 title: format!("Which conversation {label} holds is not known"),
                 lines: vec![
-                    "Its status line notes it (every 30 seconds while it runs), and only once setup (S) is done. Try again in a moment.".into(),
+                    theme::keys("Its status line notes it (every 30 seconds while it runs), and only once setup (`S`) is done. Try again in a moment."),
                     format!(
                         "To move it by hand: type /exit in it, then {}=<account> claude --resume and pick the conversation.",
                         launch::ENV_USE
@@ -1212,7 +1257,13 @@ impl App {
 
     /// The user answered yes and waits for an outcome: a refusal gets the
     /// dialog a failed move gets, not a note in the footer.
+    /// `why` often holds a name or an error, so any key mark is taken out.
     fn move_refused(&mut self, label: &str, why: String) {
+        self.move_refused_keys(label, theme::plain(&why));
+    }
+
+    /// `move_refused` for a reason of the list's own that names a key.
+    fn move_refused_keys(&mut self, label: &str, why: String) {
         self.mode = Mode::Message {
             title: format!("{label} was not moved"),
             lines: vec![why],
@@ -1244,18 +1295,24 @@ impl App {
         let Some(held) = (self.conversation_of)(&s.pane)
             .filter(|h| h.session_id == s.session_id && h.pid == s.pid)
         else {
-            self.move_refused(
+            self.move_refused_keys(
                 &label,
-                format!("{label} holds another conversation now. Press m again to move that one."),
+                theme::named(
+                    &label,
+                    " holds another conversation now. Press `m` again to move that one.",
+                ),
             );
             return;
         };
         // The question named the model; a /model since then would move it
         // on another. A model noted only since is the one it runs on.
         if s.carry.model.is_some() && held.carry.model != s.carry.model {
-            self.move_refused(
+            self.move_refused_keys(
                 &label,
-                format!("{label}'s model changed since the question. Press m again to move it on the new one."),
+                theme::named(
+                    &label,
+                    "'s model changed since the question. Press `m` again to move it on the new one.",
+                ),
             );
             return;
         }
@@ -1335,9 +1392,10 @@ impl App {
                 relocate::State::Done(Err(e)) => (format!("{} was not moved", p.label), e),
                 _ => relocate::stopped_text(p),
             };
+            // The report holds names and errors: no key marks.
             self.mode = Mode::Message {
                 title,
-                lines: vec![line],
+                lines: vec![theme::plain(&line)],
                 good: false,
             };
         }
@@ -1357,8 +1415,16 @@ impl App {
         // The limits that are due follow once the accounts are checked.
     }
 
+    /// A note in the footer for 5 seconds. It often holds a name or an
+    /// error, so any key mark is taken out: no part of it looks like a key.
     pub fn flash(&mut self, text: impl Into<String>, color: Color) {
-        self.flash = Some((text.into(), color, Instant::now() + Duration::from_secs(5)));
+        self.flash_keys(theme::plain(&text.into()), color);
+    }
+
+    /// `flash` for a note of the list's own that names a key, marked with
+    /// `theme::keys`; a name in it goes through `theme::plain` first.
+    fn flash_keys(&mut self, text: String, color: Color) {
+        self.flash = Some((text, color, Instant::now() + Duration::from_secs(5)));
     }
 
     /// Changes the stored accounts (locked, on a fresh read) and takes the
@@ -1504,7 +1570,12 @@ impl App {
             detail: format!("follows it, now {}", self.store.name_of(&self.store.active)),
             value: None,
         }];
-        for a in &self.store.accounts {
+        for a in self
+            .store
+            .accounts
+            .iter()
+            .filter(|a| !self.is_signing_out(&a.id))
+        {
             let detail = self
                 .info
                 .get(&a.id)
@@ -1733,11 +1804,16 @@ impl App {
     /// The sign-in may have stored a login before it was stopped, so the
     /// folder is signed out first, and its id is never used again.
     fn drop_new_account(&mut self, id: &str) {
-        let failed = match self.store.account(id).cloned() {
-            Some(a) if a.kind == Kind::Subscription => sign_out(&a),
-            _ => vec![],
-        };
-        let _ = mirror::remove(id);
+        match self.store.account(id).cloned() {
+            Some(a) if a.kind == Kind::Subscription => self.sign_out_in_background(&a, true),
+            _ => self.finish_drop(id, vec![]),
+        }
+    }
+
+    /// The rest of `drop_new_account`, once the folder is signed out
+    /// (`failed`: the folders still signed in).
+    fn finish_drop(&mut self, id: &str, failed: Vec<PathBuf>) {
+        let _ = (self.folder_remover)(id);
         self.update(|s| {
             s.accounts.retain(|a| a.id != id);
             if !s.retired.iter().any(|r| r == id) {
@@ -1746,6 +1822,63 @@ impl App {
         });
         if !failed.is_empty() {
             self.mode = sign_out_failed(&failed);
+        }
+    }
+
+    /// Signs an account out in a thread; `receive_sign_outs` finishes its
+    /// removal (or the drop of a half-added account) when it is done.
+    fn sign_out_in_background(&mut self, a: &Account, dropping: bool) {
+        if self.is_signing_out(&a.id) {
+            return;
+        }
+        let (tx, rx) = channel();
+        let signer = self.signer;
+        let account = a.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(signer(&account));
+        });
+        self.signing_out.push(SigningOut {
+            id: a.id.clone(),
+            dropping,
+            rx,
+        });
+    }
+
+    pub fn is_signing_out(&self, id: &str) -> bool {
+        self.signing_out.iter().any(|s| s.id == id)
+    }
+
+    /// Finishes the sign-outs that are done. Only while no dialog is open,
+    /// as with moves: a notice never replaces a question, and a list closed
+    /// meanwhile leaves the account in place rather than a notice unshown.
+    fn receive_sign_outs(&mut self) {
+        if !matches!(self.mode, Mode::Normal) {
+            return;
+        }
+        let mut done = vec![];
+        self.signing_out.retain(|s| match s.rx.try_recv() {
+            Ok(failed) => {
+                done.push((s.id.clone(), s.dropping, failed));
+                false
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => true,
+            // The thread ended without an answer: whatever could hold a
+            // login counts as still signed in, so the notice names it.
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                done.push((
+                    s.id.clone(),
+                    s.dropping,
+                    login_folders(&mirror::home_of(&s.id)),
+                ));
+                false
+            }
+        });
+        for (id, dropping, failed) in done {
+            if dropping {
+                self.finish_drop(&id, failed);
+            } else {
+                self.finish_remove(&id, failed);
+            }
         }
     }
 
@@ -1761,7 +1894,11 @@ impl App {
         let s = self.signin.take().expect("checked above");
         let account = self.store.account(&s.id).cloned();
         let was_old = self.info.get(&s.id).is_some_and(|i| i.old_folder);
-        let info = account.as_ref().map(info::read).unwrap_or_default();
+        // A sign-in that failed needs no check (Claude Code may hang).
+        let info = match &account {
+            Some(a) if ok => info::read(a),
+            _ => Info::default(),
+        };
         if ok && info.own_login() {
             // From now on the account stays on its new folder.
             mirror::mark_moved(&mirror::home_of(&s.id));
@@ -1770,11 +1907,12 @@ impl App {
                 .clone()
                 .or(info.organization.clone())
                 .unwrap_or_else(|| "an account".into());
+            let who = theme::plain(&who);
             let mut lines = vec![format!(
                 "Signed in as {who}{}.",
                 info.plan
                     .as_deref()
-                    .map(|p| format!(" ({p})"))
+                    .map(|p| format!(" ({})", theme::plain(p)))
                     .unwrap_or_default()
             )];
             // The browser often signs in with whatever account it already
@@ -1845,6 +1983,22 @@ impl App {
         }
     }
 
+    /// Whether the selected account is being signed out, flashing so when
+    /// it is.
+    fn selected_signing_out(&mut self) -> bool {
+        let Some(a) = self.selected().cloned() else {
+            return false;
+        };
+        if !self.is_signing_out(&a.id) {
+            return false;
+        }
+        self.flash(
+            format!("{} is being signed out", a.name),
+            crate::theme::MUTED,
+        );
+        true
+    }
+
     fn ask_remove(&mut self) {
         let Some(a) = self.selected().cloned() else {
             return;
@@ -1888,9 +2042,8 @@ impl App {
         let Some(a) = self.store.account(id).cloned() else {
             return;
         };
-        let mut still_signed_in = vec![];
         match a.kind {
-            Kind::Main => return,
+            Kind::Main => {}
             Kind::ApiKey => {
                 secret::delete(id);
                 if secret::exists(id) {
@@ -1899,31 +2052,50 @@ impl App {
                         lines: vec![
                             "The keychain did not delete its API key, so the account stays in the list.".into(),
                             format!(
-                                "Delete the item \"{id}\" (service herdr-multiaccount) in Keychain Access, then remove the account again."
+                                "Delete the item \"{}\" (service herdr-multiaccount) in Keychain Access, then remove the account again.",
+                                theme::plain(id)
                             ),
                         ],
                         good: false,
                     };
                     return;
                 }
+                self.finish_remove(id, vec![]);
             }
-            Kind::Subscription => {
-                still_signed_in = sign_out(&a);
-                match mirror::remove(id) {
-                    Ok(kept) if !kept.is_empty() => {
-                        self.flash(
-                            format!("Removed {}; kept in backups: {}", a.name, kept.join(", ")),
-                            crate::theme::ACCENT,
-                        );
-                    }
-                    Ok(_) => {}
-                    Err(e) => {
-                        self.flash(
-                            format!("Could not delete its folder: {e}"),
-                            crate::theme::RED,
-                        );
-                        return;
-                    }
+            // Signing out asks Claude Code, which takes seconds: the
+            // account goes once that is done (`receive_sign_outs`).
+            Kind::Subscription => self.sign_out_in_background(&a, false),
+        }
+    }
+
+    /// The rest of `remove`, once the account's login is signed out
+    /// (`still_signed_in`: the folders that kept one).
+    fn finish_remove(&mut self, id: &str, still_signed_in: Vec<PathBuf>) {
+        let Some(a) = self.store.account(id).cloned() else {
+            // Gone meanwhile (another list removed it): a login left behind
+            // is still worth saying.
+            if !still_signed_in.is_empty() {
+                self.mode = sign_out_failed(&still_signed_in);
+            }
+            return;
+        };
+        let mut kept_note = false;
+        if a.kind == Kind::Subscription {
+            match (self.folder_remover)(id) {
+                Ok(kept) if !kept.is_empty() => {
+                    kept_note = true;
+                    self.flash(
+                        format!("Removed {}; kept in backups: {}", a.name, kept.join(", ")),
+                        crate::theme::ACCENT,
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    self.flash(
+                        format!("Could not delete its folder: {e}"),
+                        crate::theme::RED,
+                    );
+                    return;
                 }
             }
         }
@@ -1942,14 +2114,14 @@ impl App {
         }) {
             return;
         }
-        let _ = std::fs::remove_file(paths::usage_dir().join(format!("{id}.json")));
+        (self.usage_remover)(id);
         self.info.remove(id);
         if !still_signed_in.is_empty() {
             // Removed anyway: its id is never used again, so no new account
             // can find the login. Saying so keeps the login from being
             // forgotten.
             self.mode = sign_out_failed(&still_signed_in);
-        } else if self.flash.is_none() {
+        } else if !kept_note {
             self.flash(format!("Removed {}", a.name), crate::theme::ACCENT);
         }
     }
@@ -2016,8 +2188,8 @@ impl App {
             return;
         }
         if !self.setup.shell {
-            self.flash(
-                "Set up first (S): the claude function picks the account",
+            self.flash_keys(
+                theme::keys("Set up first (`S`): the claude function picks the account"),
                 crate::theme::YELLOW,
             );
             return;
@@ -2349,6 +2521,9 @@ impl App {
             KeyCode::Char('1') => self.switch(Section::Accounts),
             KeyCode::Char('2') => self.switch(Section::Spaces),
             KeyCode::Char('3') => self.switch(Section::Sessions),
+            // An account being signed out takes nothing but waiting.
+            KeyCode::Enter | KeyCode::Delete | KeyCode::Char(' ' | 'l' | 'n' | 'd' | 'f' | 'c')
+                if self.section == Section::Accounts && self.selected_signing_out() => {}
             KeyCode::Enter | KeyCode::Char(' ') => self.enter(),
             KeyCode::Char('r') => {
                 self.refresh_all();
@@ -2564,7 +2739,7 @@ impl App {
         if self.update(|s| s.intro_seen = true) {
             self.mode = Mode::Message {
                 title: "How this list works".into(),
-                lines: INTRO.iter().map(|l| l.to_string()).collect(),
+                lines: INTRO.iter().map(|l| theme::keys(l)).collect(),
                 good: true,
             };
         }
@@ -2578,6 +2753,7 @@ impl App {
             self.receive_info();
             self.receive_probe();
             self.receive_move();
+            self.receive_sign_outs();
             self.start_probe();
             if Instant::now() >= self.next_files {
                 self.reload_files();
@@ -2710,27 +2886,40 @@ fn login_folders(home: &std::path::Path) -> Vec<PathBuf> {
     out
 }
 
+/// How long each `claude auth` call of a sign-out may take before it is
+/// stopped and the folder counts as not signed out.
+const SIGN_OUT_LIMIT: Duration = Duration::from_secs(30);
+
 /// Signs every folder of an account out of its own claude.ai login, and
 /// checks that it worked. A folder without a login of its own (or one that
 /// only borrows the main login, which must not be signed out) needs
-/// nothing. Returns the folders that still have a login afterwards.
+/// nothing. Returns the folders that still have a login afterwards, or that
+/// Claude Code did not answer about in time. Takes seconds: the list runs it
+/// in a thread.
 fn sign_out(a: &Account) -> Vec<PathBuf> {
+    // Without Claude Code there is no login it could keep.
+    let Some(claude) = launch::find_claude() else {
+        return vec![];
+    };
     login_folders(&mirror::home_of(&a.id))
         .into_iter()
-        .filter(|dir| !sign_out_folder(dir))
+        .filter(|dir| !sign_out_folder(&claude, dir, SIGN_OUT_LIMIT))
         .collect()
 }
 
-fn sign_out_folder(dir: &std::path::Path) -> bool {
-    let own_login = |dir: &std::path::Path| {
-        info::parse_status(&info::status_text(Some(dir)).unwrap_or_default()).own_login()
+/// Signs one folder out with `claude`; true when it has no login of its own
+/// afterwards. A call that does not end within `limit` is stopped, and an
+/// unanswered check counts as still signed in.
+fn sign_out_folder(claude: &std::path::Path, dir: &std::path::Path, limit: Duration) -> bool {
+    let own_login = |dir: &std::path::Path| match info::status_within(claude, dir, limit) {
+        info::Answer::Text(t) => Some(info::parse_status(&t).own_login()),
+        info::Answer::NoAnswer => None,
     };
-    if !own_login(dir) {
-        return true;
+    match own_login(dir) {
+        Some(false) => return true,
+        Some(true) => {}
+        None => return false,
     }
-    let Some(claude) = launch::find_claude() else {
-        return false;
-    };
     let mut cmd = std::process::Command::new(claude);
     // Clean first: it may remove CLAUDE_CONFIG_DIR, and without it the main
     // login would be signed out.
@@ -2738,10 +2927,9 @@ fn sign_out_folder(dir: &std::path::Path) -> bool {
     cmd.args(["auth", "logout"])
         .env("CLAUDE_CONFIG_DIR", dir)
         .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
-    let _ = cmd.status();
-    !own_login(dir)
+    let _ = launch::run_within(&mut cmd, limit);
+    own_login(dir) == Some(false)
 }
 
 /// The notice when a removed account's login could not be signed out, with
@@ -2754,7 +2942,7 @@ fn sign_out_failed(dirs: &[PathBuf]) -> Mode {
     for dir in dirs {
         lines.push(format!(
             "CLAUDE_CONFIG_DIR=\"{}\" command claude auth logout",
-            dir.display()
+            theme::plain(&dir.display().to_string())
         ));
     }
     Mode::Message {
@@ -2767,6 +2955,20 @@ fn sign_out_failed(dirs: &[PathBuf]) -> Mode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_folder_path_in_a_message_never_has_the_key_look() {
+        // A folder name is text from outside: a key mark in it is dropped.
+        let dir = PathBuf::from(format!("/tmp/a{0}b{0}c", theme::KEY_MARK));
+        let Mode::Message { lines, .. } = sign_out_failed(&[dir]) else {
+            panic!("not a message");
+        };
+        assert!(
+            lines.iter().all(|l| !l.contains(theme::KEY_MARK)),
+            "{lines:?}"
+        );
+        assert!(lines.iter().any(|l| l.contains("/tmp/abc")), "{lines:?}");
+    }
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
@@ -2838,6 +3040,62 @@ mod tests {
             active_tab: None,
             worktree: None,
         }];
+        a.signer = answered_signer;
+        a.folder_remover = |_| Ok(vec![]);
+        a.usage_remover = |_| {};
+        STORED.with(|s| *s.borrow_mut() = a.store.clone());
+        a
+    }
+
+    /// What the sign-out stand-in answers per account id: the folders still
+    /// signed in. It waits until a test sets an answer, as a slow `claude`
+    /// would (at most 20 seconds).
+    static SIGN_OUT_ANSWERS: std::sync::Mutex<Vec<(String, Vec<PathBuf>)>> =
+        std::sync::Mutex::new(Vec::new());
+
+    fn answered_signer(a: &Account) -> Vec<PathBuf> {
+        let until = Instant::now() + Duration::from_secs(20);
+        while Instant::now() < until {
+            {
+                let mut answers = SIGN_OUT_ANSWERS.lock().unwrap();
+                if let Some(i) = answers.iter().position(|(id, _)| *id == a.id) {
+                    return answers.remove(i).1;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        vec![]
+    }
+
+    fn answer_sign_out(id: &str, still_signed_in: Vec<PathBuf>) {
+        SIGN_OUT_ANSWERS
+            .lock()
+            .unwrap()
+            .push((id.to_string(), still_signed_in));
+    }
+
+    /// Runs the list's loop step until no sign-out is left.
+    fn until_signed_out(a: &mut App) {
+        let until = Instant::now() + Duration::from_secs(10);
+        while !a.signing_out.is_empty() {
+            assert!(Instant::now() < until, "the sign-out never finished");
+            a.receive_sign_outs();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// `app()` with a second subscription, selected and active.
+    fn app_with(id: &str, name: &str) -> App {
+        let mut a = app();
+        a.store.accounts.push(Account {
+            id: id.into(),
+            name: name.into(),
+            kind: Kind::Subscription,
+            sso: false,
+            fallback: true,
+        });
+        a.store.active = id.into();
+        a.sel = a.store.accounts.len() - 1;
         STORED.with(|s| *s.borrow_mut() = a.store.clone());
         a
     }
@@ -2975,7 +3233,7 @@ mod tests {
                 .collect();
             assert_eq!(with.len(), 1, "only Personal's row: {}", rows.join("\n"));
             assert!(
-                with[0].contains(ui::OLD_FOLDER_NOTICE),
+                with[0].contains(&ui::OLD_FOLDER_NOTICE.replace('`', "")),
                 "whole notice: {}",
                 with[0]
             );
@@ -4570,8 +4828,12 @@ mod tests {
         p.items.iter().map(|i| i.label.clone()).collect()
     }
 
+    /// The footer note's words, without the marks of its keys.
     fn flash_text(a: &App) -> String {
-        a.flash.as_ref().map(|f| f.0.clone()).unwrap_or_default()
+        a.flash
+            .as_ref()
+            .map(|f| theme::plain(&f.0))
+            .unwrap_or_default()
     }
 
     /// Waits for the move started in the background.
@@ -4898,7 +5160,7 @@ mod tests {
         match &a.mode {
             Mode::Message { title, lines, .. } => {
                 assert!(title.contains("not known"), "{title}");
-                let text = lines.join(" ");
+                let text = theme::plain(&lines.join(" "));
                 assert!(text.contains("/exit"), "{text}");
                 assert!(text.contains("claude --resume"), "{text}");
                 assert!(text.contains("setup (S)"), "{text}");
@@ -5567,6 +5829,711 @@ mod tests {
                 assert!(whole, "{w}x{h}: {word} cut off\n{screen}");
             }
         }
+    }
+
+    #[test]
+    fn removing_a_subscription_never_waits_for_its_sign_out() {
+        let mut a = app_with("bg-remove", "Backup");
+        let started = Instant::now();
+        press(&mut a, KeyCode::Char('d'));
+        assert_eq!(confirm(&a).purpose, ConfirmFor::Remove("bg-remove".into()));
+        press(&mut a, KeyCode::Char('y'));
+        // The stand-in has not answered: a removal on the drawing thread
+        // would still wait for it.
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(a.mode, Mode::Normal);
+        assert!(a.is_signing_out("bg-remove"));
+        assert!(stored().account("bg-remove").is_some(), "not gone yet");
+        let screen = screen_of(&mut a, 120, 30).join("\n");
+        assert!(screen.contains("signing out…"), "{screen}");
+        // The account takes no second removal or sign-in meanwhile.
+        press(&mut a, KeyCode::Char('d'));
+        assert_eq!(a.mode, Mode::Normal);
+        press(&mut a, KeyCode::Char('l'));
+        assert_eq!(a.mode, Mode::Normal);
+        assert!(a.signin.is_none());
+        let flash = a.flash.as_ref().map(|f| f.0.clone()).unwrap_or_default();
+        assert_eq!(flash, "Backup is being signed out");
+        // Nor can it be made active, change fallback, start Claude, take a
+        // moved session or a space, or have its limits read.
+        a.store.active = MAIN_ID.into();
+        press(&mut a, KeyCode::Enter);
+        assert_eq!(a.store.active, MAIN_ID);
+        press(&mut a, KeyCode::Char('f'));
+        assert!(a.store.account("bg-remove").unwrap().fallback);
+        press(&mut a, KeyCode::Char('c'));
+        assert_eq!(a.mode, Mode::Normal);
+        a.store.active = "bg-remove".into();
+        a.info.insert("bg-remove".into(), signed_in("Max"));
+        assert!(!a.can_take("bg-remove"));
+        assert!(a.probe_targets().iter().all(|(id, _)| id != "bg-remove"));
+        a.section = Section::Spaces;
+        a.open_space_picker();
+        let Mode::Pick(p) = &a.mode else {
+            panic!("no picker: {:?}", a.mode)
+        };
+        assert!(p
+            .items
+            .iter()
+            .all(|i| i.value.as_deref() != Some("bg-remove")));
+        a.mode = Mode::Normal;
+        a.section = Section::Accounts;
+
+        answer_sign_out("bg-remove", vec![]);
+        until_signed_out(&mut a);
+        let s = stored();
+        assert!(s.account("bg-remove").is_none());
+        assert!(s.retired.iter().any(|r| r == "bg-remove"));
+        assert_eq!(s.active, MAIN_ID);
+        assert_eq!(a.mode, Mode::Normal);
+        let flash = a.flash.as_ref().map(|f| f.0.clone()).unwrap_or_default();
+        assert_eq!(flash, "Removed Backup");
+    }
+
+    #[test]
+    fn a_login_left_after_removal_shows_the_command() {
+        let mut a = app_with("bg-left", "Left");
+        press(&mut a, KeyCode::Char('d'));
+        press(&mut a, KeyCode::Char('y'));
+        // Another dialog is open when the answer comes: the removal and its
+        // notice wait until it is closed.
+        a.mode = Mode::Help;
+        answer_sign_out("bg-left", vec![mirror::new_dir_of("bg-left")]);
+        std::thread::sleep(Duration::from_millis(200));
+        a.receive_sign_outs();
+        assert_eq!(a.mode, Mode::Help, "the open dialog stays");
+        assert!(stored().account("bg-left").is_some());
+        a.mode = Mode::Normal;
+        until_signed_out(&mut a);
+        assert!(stored().account("bg-left").is_none(), "removed anyway");
+        let Mode::Message { title, lines, .. } = &a.mode else {
+            panic!("no notice: {:?}", a.mode)
+        };
+        assert_eq!(title, "Sign-out did not work");
+        assert!(lines
+            .iter()
+            .any(|l| l.contains("bg-left/.claude\" command claude auth logout")));
+    }
+
+    #[test]
+    fn a_half_added_account_is_dropped_in_the_background() {
+        let mut a = app_with("bg-drop", "Fresh");
+        let started = Instant::now();
+        a.drop_new_account("bg-drop");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(a.is_signing_out("bg-drop"));
+        assert!(stored().account("bg-drop").is_some());
+        answer_sign_out("bg-drop", vec![mirror::new_dir_of("bg-drop")]);
+        until_signed_out(&mut a);
+        let s = stored();
+        assert!(s.account("bg-drop").is_none());
+        assert!(s.retired.iter().any(|r| r == "bg-drop"));
+        let Mode::Message { title, .. } = &a.mode else {
+            panic!("no notice: {:?}", a.mode)
+        };
+        assert_eq!(title, "Sign-out did not work");
+    }
+
+    #[test]
+    fn closing_during_a_sign_out_keeps_the_account() {
+        let mut a = app_with("bg-quit", "Later");
+        press(&mut a, KeyCode::Char('d'));
+        press(&mut a, KeyCode::Char('y'));
+        assert!(a.is_signing_out("bg-quit"));
+        press(&mut a, KeyCode::Char('q'));
+        press(&mut a, KeyCode::Char('y'));
+        assert!(a.quit);
+        // The list ends here: nothing of the removal happened yet, so the
+        // account is still there for another try.
+        let s = stored();
+        assert!(s.account("bg-quit").is_some());
+        assert!(!s.retired.iter().any(|r| r == "bg-quit"));
+        assert_eq!(s.active, "bg-quit");
+        answer_sign_out("bg-quit", vec![]);
+    }
+
+    /// A stand-in for `claude` in a folder of its own. `status` and
+    /// `logout` are the shell commands for `claude auth status` and
+    /// `claude auth logout`; a file `out` in the account folder marks it
+    /// signed out.
+    fn fake_claude(name: &str, status: &str, logout: &str) -> (PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let root =
+            std::env::temp_dir().join(format!("hm-fake-claude-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dir = root.join("account");
+        std::fs::create_dir_all(&dir).unwrap();
+        let claude = root.join("claude");
+        std::fs::write(
+            &claude,
+            format!(
+                "#!/bin/sh\ncase \"$2\" in\n  status) {status} ;;\n  logout) {logout} ;;\nesac\n"
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Another test thread may still hold the file open while it starts
+        // a process ("text file busy"): wait until it runs.
+        for _ in 0..100 {
+            match std::process::Command::new(&claude).arg("none").status() {
+                Err(e) if e.raw_os_error() == Some(26) => {
+                    std::thread::sleep(Duration::from_millis(20))
+                }
+                _ => break,
+            }
+        }
+        (claude, dir)
+    }
+
+    const SIGNED_IN: &str = "if [ -f \"$CLAUDE_CONFIG_DIR/out\" ]; then echo 'Not logged in. Run claude auth login.'; else printf 'Login method: Claude Max Account\\nEmail: alex@example.com\\n'; fi";
+
+    #[test]
+    fn sign_out_folder_signs_out_and_checks() {
+        let (claude, dir) = fake_claude("works", SIGNED_IN, "touch \"$CLAUDE_CONFIG_DIR/out\"");
+        assert!(sign_out_folder(&claude, &dir, Duration::from_secs(10)));
+        assert!(
+            dir.join("out").exists(),
+            "logout ran in the account's folder"
+        );
+        // A folder that is signed out already needs nothing.
+        assert!(sign_out_folder(&claude, &dir, Duration::from_secs(10)));
+        let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+    }
+
+    #[test]
+    fn a_claude_that_does_not_answer_is_stopped() {
+        for (name, status, logout) in [
+            // The check before the logout hangs.
+            (
+                "status-hangs",
+                "sleep 30",
+                "touch \"$CLAUDE_CONFIG_DIR/out\"",
+            ),
+            // The logout hangs, and the folder is still signed in after.
+            ("logout-hangs", SIGNED_IN, "sleep 30"),
+        ] {
+            let (claude, dir) = fake_claude(name, status, logout);
+            let started = Instant::now();
+            assert!(
+                !sign_out_folder(&claude, &dir, Duration::from_millis(500)),
+                "{name}: counts as still signed in"
+            );
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "{name}: stopped at the limit"
+            );
+            let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+        }
+        // A `claude` that cannot be started does not count as signed out.
+        let dir = std::env::temp_dir();
+        assert!(!sign_out_folder(
+            std::path::Path::new("/nonexistent/claude"),
+            &dir,
+            Duration::from_secs(1)
+        ));
+    }
+
+    #[test]
+    fn a_login_left_is_named_when_the_account_went_meanwhile() {
+        let mut a = app_with("bg-gone", "Gone");
+        press(&mut a, KeyCode::Char('d'));
+        press(&mut a, KeyCode::Char('y'));
+        // Another list removed it in the meantime.
+        a.store.accounts.retain(|x| x.id != "bg-gone");
+        answer_sign_out("bg-gone", vec![mirror::new_dir_of("bg-gone")]);
+        until_signed_out(&mut a);
+        let Mode::Message { title, .. } = &a.mode else {
+            panic!("no notice: {:?}", a.mode)
+        };
+        assert_eq!(title, "Sign-out did not work");
+    }
+
+    // ---- the key look (#18) ------------------------------------------
+
+    /// The drawn frame: each row's text, and the buffer for its looks.
+    fn drawn(a: &mut App, w: u16, h: u16) -> (Vec<String>, ratatui::buffer::Buffer) {
+        let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+        t.draw(|f| ui::draw(f, a)).unwrap();
+        let buf = t.backend().buffer().clone();
+        let rows = (0..h)
+            .map(|y| (0..w).map(|x| buf[(x, y)].symbol().to_string()).collect())
+            .collect();
+        (rows, buf)
+    }
+
+    fn is_key(buf: &ratatui::buffer::Buffer, x: u16, y: u16) -> bool {
+        let c = &buf[(x, y)];
+        c.fg == theme::ACCENT && c.modifier.contains(ratatui::style::Modifier::BOLD)
+    }
+
+    /// Where `text` starts on screen (one cell per character), searched
+    /// from row `from` on.
+    fn spot_from(rows: &[String], text: &str, from: usize) -> (u16, u16) {
+        rows.iter()
+            .enumerate()
+            .skip(from)
+            .find_map(|(y, r)| {
+                r.find(text)
+                    .map(|i| (r[..i].chars().count() as u16, y as u16))
+            })
+            .unwrap_or_else(|| panic!("{text:?} not on screen:\n{}", rows.join("\n")))
+    }
+
+    /// Checks one text on screen: the characters between backticks in
+    /// `marked` have the key look, every other character has not.
+    fn looks_from(rows: &[String], buf: &ratatui::buffer::Buffer, marked: &str, from: usize) {
+        let shown = marked.replace('`', "");
+        let (x0, y) = spot_from(rows, &shown, from);
+        let mut key = false;
+        let mut x = x0;
+        for c in marked.chars() {
+            if c == '`' {
+                key = !key;
+                continue;
+            }
+            assert_eq!(
+                is_key(buf, x, y),
+                key,
+                "{c:?} at {x} in {marked:?}: {:?}\n{}",
+                buf[(x, y)],
+                rows[y as usize]
+            );
+            x += 1;
+        }
+    }
+
+    fn looks(rows: &[String], buf: &ratatui::buffer::Buffer, marked: &str) {
+        looks_from(rows, buf, marked, 0)
+    }
+
+    #[test]
+    fn footer_keys_have_the_key_look_and_click_where_they_are() {
+        let footers: [(Section, &[&str]); 3] = [
+            (
+                Section::Accounts,
+                &[
+                    "`⏎` make active",
+                    "`a` add",
+                    "`c` start Claude",
+                    "`?` all keys",
+                    "`q` close",
+                ],
+            ),
+            (
+                Section::Spaces,
+                &[
+                    "`⏎` choose account",
+                    "`x` use active",
+                    "`d` close space",
+                    "`?` all keys",
+                ],
+            ),
+            (
+                Section::Sessions,
+                &[
+                    "`⏎` go to session",
+                    "`m` move",
+                    "`d` end session",
+                    "`?` all keys",
+                ],
+            ),
+        ];
+        for (section, hints) in footers {
+            let mut a = app();
+            a.section = section;
+            a.info_loading = false;
+            let (rows, buf) = drawn(&mut a, 160, 30);
+            for hint in hints {
+                looks_from(&rows, &buf, hint, 29);
+            }
+            looks_from(&rows, &buf, "`r` refresh", 29);
+            // Every key the footer lets click starts at its key.
+            for (r, h) in a.hits.iter().filter(|(r, _)| r.y == 29) {
+                if let Hit::Key(_) = h {
+                    assert!(is_key(&buf, r.x, 29), "{h:?} at {}: {}", r.x, rows[29]);
+                }
+            }
+        }
+        // A click on a key does what it did before.
+        let mut a = app();
+        a.info_loading = false;
+        let (rows, _) = drawn(&mut a, 160, 30);
+        let (x, y) = spot_from(&rows, "a add", 29);
+        a.click(x, y);
+        assert!(matches!(a.mode, Mode::Pick(_)), "{:?}", a.mode);
+        let mut a = app();
+        let (rows, _) = drawn(&mut a, 160, 30);
+        let (x, y) = spot_from(&rows, "? all keys", 29);
+        a.click(x, y);
+        assert_eq!(a.mode, Mode::Help);
+        // A narrow footer still drops whole hints from the right.
+        let mut a = app();
+        let (rows, buf) = drawn(&mut a, 60, 30);
+        assert!(!rows[29].contains("close"), "{}", rows[29]);
+        assert!(!a.hits.iter().any(|(_, h)| *h == Hit::Key('q')));
+        looks_from(&rows, &buf, "`⏎` make active", 29);
+    }
+
+    #[test]
+    fn status_lines_show_only_their_key_in_the_key_look() {
+        let mut a = app();
+        a.info_loading = false;
+        a.setup = setup::State {
+            shell: true,
+            statusline: true,
+        };
+        // One-letter and backtick names are names, never keys.
+        a.store.accounts[1].name = "d".into();
+        a.store.accounts.push(Account {
+            id: "key".into(),
+            name: "`x`".into(),
+            kind: Kind::ApiKey,
+            sso: false,
+            fallback: true,
+        });
+        a.store.accounts.push(Account {
+            id: "work".into(),
+            name: "Work".into(),
+            kind: Kind::Subscription,
+            sso: false,
+            fallback: true,
+        });
+        a.info.insert(MAIN_ID.into(), signed_in("Max"));
+        a.info.insert("personal".into(), Info::default());
+        a.info.insert("key".into(), Info::default());
+        a.info.insert(
+            "work".into(),
+            Info {
+                old_folder: true,
+                ..signed_in("Pro")
+            },
+        );
+        let (rows, buf) = drawn(&mut a, 160, 30);
+        looks(&rows, &buf, "not signed in · `l` signs in");
+        looks(&rows, &buf, "no key stored · `l` adds it");
+        looks(&rows, &buf, "`l` signs in again to stop edit prompts");
+        let (x, y) = spot_from(&rows, "not signed in", 0);
+        assert_eq!(buf[(x, y)].fg, theme::RED, "the rest stays red");
+        let (x, y) = spot_from(&rows, "signs in again", 0);
+        assert_eq!(buf[(x, y)].fg, theme::YELLOW, "the rest stays yellow");
+        // "active" is no longer bold accent; the accent mark stays.
+        looks(&rows, &buf, "active");
+        let (x, y) = spot_from(&rows, "active", 0);
+        assert!(
+            (0..x).any(|cx| buf[(cx, y - 1)].fg == theme::ACCENT),
+            "{}",
+            rows[y as usize - 1]
+        );
+        // Names: the backticks show, nothing is a key.
+        let (x, y) = spot_from(&rows, "`x`", 0);
+        for dx in 0..3 {
+            assert!(!is_key(&buf, x + dx, y), "{}", rows[y as usize]);
+        }
+        let (x, y) = spot_from(&rows, " d ", 0);
+        assert!(!is_key(&buf, x + 1, y), "{}", rows[y as usize]);
+    }
+
+    #[test]
+    fn the_setup_notice_shows_s_as_a_key() {
+        let mut a = app();
+        a.setup = setup::State {
+            shell: false,
+            statusline: true,
+        };
+        let (rows, buf) = drawn(&mut a, 160, 30);
+        looks(&rows, &buf, "`S` set up");
+    }
+
+    #[test]
+    fn notes_and_messages_show_the_keys_they_name() {
+        // A note in the footer.
+        let mut a = app();
+        a.flash_keys(
+            format!(
+                "{}{}",
+                theme::plain("fix-login"),
+                theme::keys(" changed since the question; nothing was closed. Press `d` again")
+            ),
+            theme::YELLOW,
+        );
+        let (rows, buf) = drawn(&mut a, 160, 30);
+        looks(&rows, &buf, "nothing was closed. Press `d` again");
+        // A plain note never gets the look, not even from a marked name.
+        let mut a = app();
+        a.flash(
+            format!("Renamed to a{}d{}", theme::KEY_MARK, theme::KEY_MARK),
+            theme::ACCENT,
+        );
+        assert_eq!(flash_text(&a), "Renamed to ad");
+        let (rows, buf) = drawn(&mut a, 160, 30);
+        looks(&rows, &buf, "Renamed to ad");
+        // Setup named in a note.
+        let mut a = app();
+        a.in_herdr = true;
+        a.setup = setup::State {
+            shell: false,
+            statusline: true,
+        };
+        press(&mut a, KeyCode::Char('c'));
+        let (rows, buf) = drawn(&mut a, 160, 30);
+        looks_from(&rows, &buf, "Set up first (`S`): the claude", 29);
+        // A session label with a mark of its own in a refused move: plain.
+        let mut a = movable();
+        a.panes[0].label = format!("Fix{}the{}bug", theme::KEY_MARK, theme::KEY_MARK);
+        set_fresh(Some(a.panes.clone()));
+        press(&mut a, KeyCode::Char('m'));
+        press(&mut a, KeyCode::Enter);
+        set_fresh(Some(vec![shell("w91:p1", "w91:t1")]));
+        press(&mut a, KeyCode::Char('y'));
+        let (rows, buf) = drawn(&mut a, 120, 40);
+        looks(&rows, &buf, "Fixthebug has ended.");
+        // Setup named in a message.
+        let mut a = movable();
+        a.conversation_of = knows_nothing;
+        press(&mut a, KeyCode::Char('m'));
+        let (rows, buf) = drawn(&mut a, 120, 40);
+        looks(&rows, &buf, "setup (`S`) is done");
+        // A move refused after yes.
+        let mut a = movable();
+        press(&mut a, KeyCode::Char('m'));
+        press(&mut a, KeyCode::Enter);
+        a.conversation_of = knows_another;
+        press(&mut a, KeyCode::Char('y'));
+        let (rows, buf) = drawn(&mut a, 120, 40);
+        looks(&rows, &buf, "Press `m` again");
+        // The note after a sign-in with another account's login: marked for
+        // the list, plain for a terminal, names as they are.
+        let names = vec!["`d`".to_string()];
+        let note = crate::login::same_login_note(&names);
+        assert!(note.contains("`d`"), "{note}");
+        assert!(
+            note.contains(&theme::keys("press `l` to sign in")),
+            "{note}"
+        );
+        // What the launcher prints (`launch.rs`).
+        let terminal = theme::plain(&note);
+        assert!(terminal.contains("as `d`. If") && terminal.contains("press l to"));
+        let mut a = app();
+        a.mode = Mode::Message {
+            title: "Work is signed in".into(),
+            lines: vec!["Work is signed in.".into(), note],
+            good: false,
+        };
+        let (rows, buf) = drawn(&mut a, 120, 40);
+        let (x, y) = spot_from(&rows, "same login as `d`", 0);
+        for dx in 14..17 {
+            assert!(!is_key(&buf, x + dx, y), "{}", rows[y as usize]);
+        }
+        looks(&rows, &buf, "press `l` to sign");
+        // The note on how the list works, first as a message.
+        let mut a = app();
+        a.store.intro_seen = false;
+        STORED.with(|s| s.borrow_mut().intro_seen = false);
+        a.show_intro();
+        let (rows, buf) = drawn(&mut a, 120, 50);
+        looks(&rows, &buf, "choose it with `⏎`.");
+        looks(&rows, &buf, "(fallback, `F`)");
+        looks(&rows, &buf, "`?` shows");
+        // Commands are no keys.
+        looks(&rows, &buf, "/login");
+        looks(&rows, &buf, "/usage");
+    }
+
+    #[test]
+    fn help_keys_have_the_key_look_and_headings_do_not() {
+        let (_, rows, area, t) = help_on(160, 64, opens);
+        let buf = t.backend().buffer();
+        // The key column is 18 wide; its padding is no key.
+        let entry =
+            |k: &str, what: &str| format!("`{k}`{}{what}", " ".repeat(18 - k.chars().count()));
+        looks(&rows, buf, &entry("⏎  Space", "make active"));
+        looks(&rows, buf, &entry("K J  Shift+↑ ↓", "move up / down"));
+        looks(&rows, buf, &entry("n  Esc", "no"));
+        looks(&rows, buf, "`any other key` leaves the question open");
+        for heading in [
+            "Accounts",
+            "Spaces",
+            "Agents",
+            "Questions",
+            "List",
+            "How it works",
+        ] {
+            let (x, y) = spot_from(&rows, heading, area.y as usize + 1);
+            let c = &buf[(x, y)];
+            assert_eq!(c.fg, theme::TEXT, "{heading}");
+            assert!(
+                c.modifier.contains(ratatui::style::Modifier::BOLD),
+                "{heading}"
+            );
+        }
+        looks(&rows, buf, "choose it with `⏎`.");
+        looks(&rows, buf, "`?` shows");
+        looks(&rows, buf, "/login");
+        // The title in the border keeps its bold accent.
+        let (x, y) = spot_from(&rows, " Keys ", 0);
+        assert!(is_key(buf, x + 1, y));
+        // Taller than the pane: the scroll hint's keys too.
+        let (_, rows, _, t) = help_on(80, 20, opens);
+        looks(&rows, t.backend().buffer(), "`↑ ↓` scroll ·");
+    }
+
+    #[test]
+    fn dialog_footers_show_their_keys() {
+        let mut a = app();
+        press(&mut a, KeyCode::Char('a'));
+        let (rows, buf) = drawn(&mut a, 120, 40);
+        looks(&rows, &buf, "`⏎` choose  `Esc` back");
+        press(&mut a, KeyCode::Char('3'));
+        let (rows, buf) = drawn(&mut a, 120, 40);
+        looks(&rows, &buf, "`⏎` ok  `Esc` cancel");
+        let mut a = app();
+        a.signin = Some(SignIn::showing("https://example.com/sign-in"));
+        a.mode = Mode::SignIn {
+            code: String::new(),
+        };
+        let (rows, buf) = drawn(&mut a, 120, 40);
+        looks(&rows, &buf, "`o` open again  `y` copy link  `Esc` cancel");
+    }
+
+    #[test]
+    fn grey_buttons_show_their_keys_coloured_buttons_stay_one_block() {
+        let mut a = movable();
+        press(&mut a, KeyCode::Char('m'));
+        press(&mut a, KeyCode::Enter);
+        for (w, no) in [(120, "`Esc` `n` no"), (24, "`n` no")] {
+            let (rows, buf) = drawn(&mut a, w, 40);
+            looks(&rows, &buf, no);
+            let (no_x, y) = spot_from(&rows, &no.replace('`', ""), 0);
+            assert_eq!(buf[(no_x, y)].bg, theme::BORDER, "the key keeps the grey");
+            // The yes button: one green block, no key look.
+            let (x, y) = spot_from(&rows, "y yes", 0);
+            for dx in 0..5 {
+                assert_eq!(buf[(x + dx, y)].bg, theme::GREEN);
+                assert!(!is_key(&buf, x + dx, y));
+            }
+            // A click on the no button still answers no.
+            let hit = a
+                .hits
+                .iter()
+                .find_map(|(r, h)| (*h == Hit::Key('n')).then_some(*r))
+                .unwrap();
+            assert_eq!(hit.x + 1, no_x, "{w}: {}", rows[y as usize]);
+        }
+        // The quit question.
+        let mut a = app();
+        press(&mut a, KeyCode::Char('q'));
+        let (rows, buf) = drawn(&mut a, 120, 30);
+        looks(&rows, &buf, "`any other key` stays");
+        let (x, y) = spot_from(&rows, "y close", 29);
+        for dx in 0..7 {
+            assert_eq!(buf[(x + dx, y)].bg, theme::RED);
+            assert!(!is_key(&buf, x + dx, y));
+        }
+        let (x, y) = spot_from(&rows, "any other key", 29);
+        a.click(x, y);
+        assert_eq!(a.mode, Mode::Normal);
+        assert!(!a.quit);
+    }
+
+    #[test]
+    fn a_long_question_scrolls_with_its_keys_named() {
+        let mut a = app();
+        a.mode = Mode::Confirm(Confirm {
+            question: "Set up the accounts?".into(),
+            lines: vec!["word ".repeat(300)],
+            purpose: ConfirmFor::Setup,
+        });
+        let (rows, buf) = drawn(&mut a, 60, 16);
+        looks(&rows, &buf, "`↑ ↓` scroll ·");
+    }
+
+    #[test]
+    fn only_keys_and_titles_are_bold_accent() {
+        // Every main view (with the setup notice, a signed-out account, the
+        // active one and a note naming a key) and the help: below the header
+        // and outside a dialog's top border, each stretch of bold accent
+        // cells is one of the keys the list names, never a word.
+        let keys = [
+            "⏎",
+            "a",
+            "c",
+            "?",
+            "q",
+            "r",
+            "S",
+            "l",
+            "x",
+            "d",
+            "m",
+            "F",
+            "f",
+            "n",
+            "y",
+            "i",
+            "K J  Shift+↑ ↓",
+            "⏎  Space",
+            "n  Esc",
+            "Esc",
+            "↑ ↓  j k",
+            "← →  Tab  1 2 3",
+            "any other key",
+        ];
+        let runs = |rows: &[String], buf: &ratatui::buffer::Buffer| {
+            let mut out = vec![];
+            for (y, row) in rows.iter().enumerate().skip(1) {
+                if row.contains('╭') {
+                    continue;
+                }
+                let mut run = String::new();
+                for (x, c) in row.chars().enumerate() {
+                    if is_key(buf, x as u16, y as u16) {
+                        run.push(c);
+                    } else if !run.is_empty() {
+                        out.push((y, std::mem::take(&mut run)));
+                    }
+                }
+                if !run.is_empty() {
+                    out.push((y, run));
+                }
+            }
+            out
+        };
+        let mut seen = 0;
+        for section in Section::ORDER {
+            let mut a = movable();
+            a.section = section;
+            a.setup = setup::State {
+                shell: false,
+                statusline: false,
+            };
+            a.info.insert("work".into(), Info::default());
+            a.flash_keys(
+                theme::named(
+                    "notes",
+                    " opened since; nothing was closed. Press `d` again",
+                ),
+                theme::YELLOW,
+            );
+            let (rows, buf) = drawn(&mut a, 160, 40);
+            for (y, run) in runs(&rows, &buf) {
+                assert!(
+                    keys.contains(&run.trim()),
+                    "{run:?} on row {y}: {}",
+                    rows[y]
+                );
+                seen += 1;
+            }
+        }
+        let (_, rows, _, t) = help_on(160, 64, opens);
+        for (y, run) in runs(&rows, t.backend().buffer()) {
+            assert!(
+                keys.contains(&run.trim()),
+                "{run:?} on row {y}: {}",
+                rows[y]
+            );
+            seen += 1;
+        }
+        assert!(seen > 30, "{seen} keys seen");
     }
 
     /// Personal and Work, both subscriptions signed in with their own

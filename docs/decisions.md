@@ -668,3 +668,100 @@ picking the account, so a limit fallback never lands on a signed-out
 account either; it still asks Claude Code once per start for a subscription
 (the cost #22 is about). Ask-then-fall-back was the owner's choice over
 falling back silently or only asking.
+
+## 2026-11-14: Removing an account signs it out in the background, with a time limit
+
+Removing a subscription (and dropping one added for a sign-in that did not
+finish) ran `claude auth status`, `claude auth logout` and `claude auth
+status` again for each folder on the thread that draws the list, with no
+time limit, so the list froze for seconds, or for good when `claude` hung
+(#16). Now:
+
+- the sign-out runs in a thread, like the account checks and limit
+  readings; the account stays in `accounts.json` with "signing out…" on its
+  row until the answer comes, and only then is its folder removed and the
+  account retired, on the list's own thread as before. Closing the list
+  meanwhile leaves the account in place, so `d` can remove it again;
+- each `claude auth` call of a sign-out is stopped after 30 seconds
+  (`launch::run_within`, the spawn-and-poll loop `probe.rs` had, now shared
+  with it). A check that did not answer counts as still signed in, so the
+  notice with the by-hand command shows rather than a removal that may have
+  left a login behind;
+- while it runs, the account takes nothing else in the list (no `⏎`, `c`,
+  `f`, `n`, `l` or `d`, no moved session, no space, no limit reading), so
+  nothing new starts on a folder about to go;
+- the answer is taken only while no dialog is open, like the end of a move:
+  the notice never replaces a question, and closing the list meanwhile
+  leaves the account in place instead of a notice nobody saw;
+- each call runs in its own process group, which is stopped as a whole at
+  the limit, also when the call ended but something it started still
+  holds its output open, and a `claude` that cannot be started counts as
+  no answer. The limit is per call, so an account with two login folders
+  can show "signing out…" for a few minutes at worst;
+- the lock above holds inside this list only: a `claude` started from a
+  shell or another list can still pick the account until it is removed;
+- a sign-in that failed no longer asks `claude auth status` before the
+  half-added account is dropped.
+
+Running the whole removal in the thread was rejected: the list's state and
+its writes to `accounts.json` stay on one thread. Other `claude auth status`
+calls (the Console-profile check, the launcher's start check) keep running
+as before.
+
+## 2026-11-14: A key has one look, also inside a sentence
+
+Every key the list names is bold and in the accent colour (`key_style` in
+`ui.rs`): in the footer and the `r` in front of the status, the footers of
+the picker, the text field and the sign-in dialog, the help's key column,
+on grey buttons (the no button, "any other key stays", the popups' "Esc
+later" and "Esc close"), and inside a sentence (the status line's "`l`
+signs in", the setup notice's `S`, notes and messages that name a key,
+the note on how the list works). What a key does stands beside it in a
+quieter colour. The word "active" in the status line and the help's
+headings turn white, so the accent colour in a text means a key; the
+accent `●` in front of the row still marks the active account. Titles
+(the list's, a dialog's, the reminder popup's) keep their bold accent, as
+in herdr-routines: they stand alone in a border or at the top of a box
+(the owner's answer on #18). Coloured block buttons (`y yes`, `y close`,
+`⏎ ok`, `⏎ Go to session`) stay one block, since an accent key on green,
+red or accent would not read.
+
+A key inside a sentence is written between backticks in the source
+("`l` signs in"); `theme::keys` turns each backtick into U+2060 (word
+joiner), and `with_keys` draws what stands between two of them as a key.
+Only texts written in the code go through `theme::keys`, never a name, a
+pane label or an error's text, which may hold backticks of their own.
+
+- The same building blocks and look as herdr-routines (its decision of
+  2026-11-11) and herdr-git-panel, so the plugins look alike.
+- The mark has no width, and the drawn spans hold no mark, so `wrap`,
+  `shorten` and every click area stay as they were. The popups measure
+  their grey button by display width, not by bytes.
+- Notes in the footer go through `App::flash`, and a refused move's
+  message through `App::move_refused`; both take any mark out, since they
+  often hold a name or an error. `flash_keys` and `move_refused_keys` are
+  for the list's own texts that name a key, built with `theme::named`
+  (the name as it is, only the rest marked). A finished move's report and
+  "Signed in as …" drop marks too. The same-login note is marked; the
+  launcher prints it through `theme::plain`, and a Herdr notification
+  never gets a mark.
+- A key with a space in it ("`any other key`") that a wrap splits stays a
+  key on both lines (`wrap_with_keys`).
+
+## 2026-11-14: The status line command is written with `$HOME`
+
+Setup wrote the status line command into `~/.claude/settings.json` with the
+absolute path of the binary, so a `settings.json` kept under version control
+or shared held the user name (#19). It now writes
+`"$HOME/.config/herdr/plugins/config/multiaccount/bin/herdr-multiaccount" statusline`,
+the same path the shell function already uses. Claude Code runs the command
+in a shell, which expands `$HOME` inside the double quotes; `quotable()`
+still refuses a path that would break out of them. A config directory
+outside the home folder keeps the absolute path.
+
+Both spellings count as set up everywhere (the list's banner, `status`), so
+an existing setup keeps working and nothing is rewritten on its own. Only
+setup run by hand (`S`, `herdr-multiaccount setup`) moves an absolute-path
+command of the plugin to the `$HOME` form, after the usual backup: the
+owner's choice over leaving old commands alone or rewriting them when the
+plugin starts.

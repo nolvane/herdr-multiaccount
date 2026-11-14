@@ -19,6 +19,10 @@ All notable changes to this project are documented here. The format follows
 
 ### Changed
 
+- Setup writes the status line command in `~/.claude/settings.json` with
+  `$HOME` in place of your home folder, so the file holds no user name.
+  A command from an earlier setup keeps working; running setup again moves
+  it to the `$HOME` form, after a backup.
 - A session moved with `m` keeps the model it ran on and the options it was
   started with that are safe to give again (such as `--permission-mode`,
   `--add-dir` and `--dangerously-skip-permissions`); the prompt and options
@@ -33,6 +37,12 @@ All notable changes to this project are documented here. The format follows
   another open list and a check of an
   account with the same login count as a reading. No checks start while
   the list is not in front in Herdr; `r` still checks every account.
+- Every key the list names is bold and in the accent colour, as in the
+  other Herdr plugins: in the footer, the dialogs' footers, the `?` help,
+  on grey buttons and inside a sentence ("not signed in · `l` signs in").
+  What a key does stays in a quieter colour; the word "active" and the
+  headings in the help turn white, so the accent colour in a text means a
+  key (#18).
 
 ### Fixed
 
@@ -62,6 +72,14 @@ All notable changes to this project are documented here. The format follows
 - `o` in the sign-in dialog says when the browser opener could not be
   started, and opened links no longer leave an ended opener process behind
   while the list is open.
+- Removing a subscription account no longer freezes the list while it is
+  signed out: the sign-out runs in the background, the account's row says
+  "signing out…" until it is gone, and closing the list meanwhile keeps the
+  account for another try. Each `claude` call that does not answer
+  within 30 seconds is stopped (an account with two login folders can take
+  a few minutes in all), and the list shows the command that signs it out
+  by hand. The same holds when an account added for a sign-in that did not
+  finish is dropped again.
 
 ## [1.0.0] - 2026-11-09
 
