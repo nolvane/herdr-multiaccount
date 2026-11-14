@@ -454,11 +454,15 @@ pub fn run_within(
         }
     }
     // Something it started may still hold its output open: wait for the
-    // text only until the limit.
+    // text only until the limit, then stop what is left of its group.
     let left = deadline.saturating_duration_since(std::time::Instant::now());
-    Ok(rx
+    let text = rx
         .recv_timeout(left.max(std::time::Duration::from_millis(100)))
-        .ok())
+        .ok();
+    if text.is_none() {
+        stop(&mut child);
+    }
+    Ok(text)
 }
 
 /// The line a session on `dir` prints when that is the old folder `home`
@@ -722,21 +726,51 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out.as_deref(), Some("ready\n"));
-        // It ends, but leaves something behind that holds its output open.
+        // It ends, but leaves something behind that holds its output open:
+        // no answer, and what it left behind is stopped too.
+        let dir = std::env::temp_dir().join(format!("ma-run-within-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pid_file = dir.join("pid");
         let started = std::time::Instant::now();
         let out = run_within(
-            Command::new("sh").args(["-c", "sleep 30 & echo ready"]),
+            Command::new("sh").args([
+                "-c",
+                &format!("sleep 30 & echo $! > '{}'; echo ready", pid_file.display()),
+            ]),
             std::time::Duration::from_millis(500),
         )
         .unwrap();
         assert_eq!(out, None);
         assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        let left = std::fs::read_to_string(&pid_file).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(still_runs(std::process::id()));
+        let gone = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while still_runs(left.trim().parse().unwrap()) {
+            assert!(
+                std::time::Instant::now() < gone,
+                "the leftover sleep still runs"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
         // What cannot start is an error, not an answer.
         assert!(run_within(
             &mut Command::new("/nonexistent/claude"),
             std::time::Duration::from_secs(1)
         )
         .is_err());
+    }
+
+    /// Whether `pid` still runs: a zombie (state Z), which nobody may reap
+    /// in a container without an init, counts as stopped.
+    fn still_runs(pid: u32) -> bool {
+        let out = Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+            .unwrap();
+        let state = String::from_utf8_lossy(&out.stdout);
+        let state = state.trim();
+        !state.is_empty() && !state.starts_with('Z')
     }
 
     fn store() -> Store {

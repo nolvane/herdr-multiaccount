@@ -675,7 +675,12 @@ time limit, so the list froze for seconds, or for good when `claude` hung
   the notice never replaces a question, and closing the list meanwhile
   leaves the account in place instead of a notice nobody saw;
 - each call runs in its own process group, which is stopped as a whole at
-  the limit, and a `claude` that cannot be started counts as no answer;
+  the limit, also when the call ended but something it started still
+  holds its output open, and a `claude` that cannot be started counts as
+  no answer. The limit is per call, so an account with two login folders
+  can show "signing out…" for a few minutes at worst;
+- the lock above holds inside this list only: a `claude` started from a
+  shell or another list can still pick the account until it is removed;
 - a sign-in that failed no longer asks `claude auth status` before the
   half-added account is dropped.
 
