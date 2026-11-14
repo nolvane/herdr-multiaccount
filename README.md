@@ -180,6 +180,18 @@ session starts.
   `ANTHROPIC_API_KEY`.
 - **The main login** is what `~/.claude` holds; the plugin does not touch it.
   Sign it in again with `/login` in Claude Code.
+- **`/login` inside a session** on a subscription account signs that
+  account's folder in to whatever account you choose, as Claude Code always
+  does. When that is the login of another entry, both rows say `same login
+  as …` and every new session on the account says so at start; it still
+  starts. `l` on the account signs it in to its own login again.
+- **Real folders where a link belongs.** Claude Code sometimes makes a folder
+  in an account folder before `~/.claude` has one of that name. For its
+  caches of pasted text and images (`paste-cache`, `image-cache`) the next
+  start moves the files into `~/.claude`'s folder (a file of the same name
+  with other content goes to `backups/` first, `~/.claude`'s stays) and
+  links the folder again. Any other such folder is left alone, and each
+  start names it and says how to share it.
 
 Two things outside Herdr make it work. Setup (`S` in the list) adds both,
 backs up each file first, and `herdr-multiaccount setup --undo` takes them back:

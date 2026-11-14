@@ -409,6 +409,15 @@ pub fn start_note(dir: &std::path::Path, home: &std::path::Path, name: &str) -> 
     ))
 }
 
+/// The start line for an entry of the account folder `dir` that is a real
+/// folder where `~/.claude` has one of that name: it says how to share it.
+pub fn separate_note(name: &str, account: &str, dir: &std::path::Path) -> String {
+    format!(
+        "{name} in the {account} folder is a folder of its own, not linked to ~/.claude/{name}. To share it, move what you want to keep from {} into ~/.claude/{name} and remove that folder; the next start links it.",
+        dir.join(name).display()
+    )
+}
+
 /// Variables to set and variables to remove for a session.
 pub type SessionEnv = (Vec<(String, String)>, Vec<&'static str>);
 
@@ -425,8 +434,8 @@ pub fn session_env(store: &Store, id: &str) -> Result<SessionEnv, String> {
                 mirror::sync(id).map_err(|e| format!("could not prepare its folder: {e}"))?;
             for name in &report.separate {
                 eprintln!(
-                    "herdr-multiaccount: {name} in the {} folder is not linked to ~/.claude",
-                    account.name
+                    "herdr-multiaccount: {}",
+                    separate_note(name, &account.name, &dir)
                 );
             }
             if let Some(note) = start_note(&dir, &mirror::home_of(id), &account.name) {
@@ -506,7 +515,8 @@ pub fn run(args: Vec<String>, moved: bool) -> i32 {
     };
     let config = Config::load(&paths::config_dir());
     let store = Store::load();
-    let usage = load_usage(&store);
+    let twins = login::twins(&store, &login::all(&store));
+    let usage = load_usage_with(&store, &twins);
     let (wanted, source) = wanted(&store);
     let check = |id: &str| usable(&store, id);
     // Each account is asked about at most once per start.
@@ -537,6 +547,8 @@ pub fn run(args: Vec<String>, moved: bool) -> i32 {
     // A claude.ai sign-in would sign out a main login that is a Console
     // profile; that check takes a second, so only after a yes.
     let mut console = false;
+    // The account signed in just now: its sign-in already named a twin.
+    let mut signed_in_now: Option<String> = None;
     if let Pick::Ask(c) = &picked {
         let name = store.name_of(&c.wanted);
         if ask_yes(&format!("{name} is not signed in. Sign in now?")) {
@@ -545,6 +557,7 @@ pub fn run(args: Vec<String>, moved: bool) -> i32 {
                 eprintln!("herdr-multiaccount: {}", console_note(&name));
             } else if sign_in_here(&store, &c.wanted) {
                 known.borrow_mut().insert(c.wanted.clone(), true);
+                signed_in_now = Some(c.wanted.clone());
             }
         }
         picked = pick(
@@ -585,6 +598,26 @@ pub fn run(args: Vec<String>, moved: bool) -> i32 {
             time::span(limit.resets_at - time::now()),
             store.name_of(&choice.id)
         );
+    }
+
+    // A /login inside one of its sessions puts another login into the
+    // account's folder; it starts anyway, but says so. Only to a person at
+    // the terminal: not in starts nested inside a session (headless runs,
+    // subagents) or run by scripts.
+    if let Some(account) = store.account(&choice.id) {
+        if account.kind == Kind::Subscription
+            && choice.source != Source::Inherited
+            && std::io::stderr().is_terminal()
+            && signed_in_now.as_deref() != Some(&choice.id)
+        {
+            let same: Vec<String> = twins
+                .get(&choice.id)
+                .map(|ids| ids.iter().map(|id| store.name_of(id)).collect())
+                .unwrap_or_default();
+            if let Some(note) = login::shared_login_note(&account.name, &same) {
+                eprintln!("herdr-multiaccount: {note}");
+            }
+        }
     }
 
     let mut cmd = Command::new(&claude);
@@ -1037,5 +1070,15 @@ mod tests {
             "{note}"
         );
         assert_eq!(start_note(&home.join(".claude"), home, "Work"), None);
+    }
+
+    #[test]
+    fn a_folder_that_stays_separate_says_what_to_do() {
+        let dir = std::path::Path::new("/x/homes/work/.claude");
+        let line = separate_note("skills", "Work", dir);
+        assert!(line.contains("skills in the Work folder"), "{line}");
+        assert!(line.contains("/x/homes/work/.claude/skills"), "{line}");
+        assert!(line.contains("into ~/.claude/skills"), "{line}");
+        assert!(line.contains("the next start links it"), "{line}");
     }
 }

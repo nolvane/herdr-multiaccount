@@ -55,6 +55,14 @@ All notable changes to this project are documented here. The format follows
 - `o` in the sign-in dialog says when the browser opener could not be
   started, and opened links no longer leave an ended opener process behind
   while the list is open.
+- A `paste-cache` (or `image-cache`) folder that Claude Code made in an
+  account folder no longer makes every start print that it is not linked:
+  the next start moves its files into `~/.claude` (a clashing file goes to
+  `backups/`) and links it again. Other folders that are not linked still
+  get a start line, which now says how to share them.
+- After a `/login` inside a session put another entry's login into an
+  account's folder, sessions on that account say so at start and name `l`
+  to sign it in again; they still start.
 
 ## [1.0.0] - 2026-11-09
 

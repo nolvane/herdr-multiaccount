@@ -47,7 +47,10 @@ it is built this way: [docs/decisions.md](docs/decisions.md).
 - Never handle a claude.ai token: logins happen in Claude Code's own flow and
   stay with Claude Code (see decisions). API keys only through the keychain.
 - Never write outside the plugin's config directory except through setup
-  (shell startup file, `~/.claude/settings.json`), and back up first.
+  (shell startup file, `~/.claude/settings.json`), and back up first. The
+  one exception is folding an account folder's copies back into `~/.claude`
+  (`mirror.rs`: a file saved over its link, a cache folder; see decisions),
+  which backs up what it replaces.
 - Removing an account must never follow a link into `~/.claude`.
 - `Esc` never closes the list; `q` asks with `y`.
 

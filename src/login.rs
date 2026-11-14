@@ -75,6 +75,15 @@ pub fn same_login_note(names: &[String]) -> String {
     )
 }
 
+/// The start line for an account whose folder holds the same login as the
+/// accounts `names`, such as after a `/login` inside one of its sessions.
+pub fn shared_login_note(name: &str, names: &[String]) -> Option<String> {
+    (!names.is_empty()).then(|| format!(
+        "{name} holds the same login as {}, so this session runs on that login (a /login inside a session, or the browser at sign-in, can do that). If {name} should have its own, open the accounts list (Herdr: the Multiaccount action) and press l on {name} to sign it in again.",
+        names.join(", ")
+    ))
+}
+
 /// Each account's login, where it has one.
 pub fn all(store: &Store) -> HashMap<String, Login> {
     store
@@ -162,6 +171,18 @@ mod tests {
         assert_eq!(parse("{}"), None);
         assert_eq!(parse(r#"{"oauthAccount": {"accountUuid": "p1"}}"#), None);
         assert_eq!(parse("not json"), None);
+    }
+
+    #[test]
+    fn a_login_shared_with_another_entry_is_named_at_start() {
+        assert_eq!(shared_login_note("Work", &[]), None);
+        let line = shared_login_note("Work", &["Main login".to_string()]).unwrap();
+        assert!(
+            line.contains("Work holds the same login as Main login"),
+            "{line}"
+        );
+        assert!(line.contains("/login"), "{line}");
+        assert!(line.contains("press l on Work"), "{line}");
     }
 
     #[test]
