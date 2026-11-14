@@ -9,10 +9,9 @@
 //! the session history.
 
 use crate::launch;
-use std::io::Read;
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// One window as `/usage` printed it.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -262,28 +261,10 @@ pub fn run(home: Option<&Path>, cwd: &Path) -> Result<Reading, String> {
     ])
     .current_dir(cwd)
     .stdin(Stdio::null())
-    .stdout(Stdio::piped())
     .stderr(Stdio::null());
-    let mut child = cmd.spawn().map_err(|e| e.to_string())?;
-    let mut stdout = child.stdout.take().ok_or("no output")?;
-    let reader = std::thread::spawn(move || {
-        let mut s = String::new();
-        let _ = stdout.read_to_string(&mut s);
-        s
-    });
-    let deadline = Instant::now() + Duration::from_secs(45);
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(200)),
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err("Claude Code took too long".into());
-            }
-        }
-    }
-    let out = reader.join().unwrap_or_default();
+    let out = launch::run_within(&mut cmd, Duration::from_secs(45))
+        .map_err(|e| e.to_string())?
+        .ok_or("Claude Code took too long")?;
     let v: serde_json::Value =
         serde_json::from_str(out.trim()).map_err(|_| "unexpected answer from Claude Code")?;
     if v["is_error"].as_bool() == Some(true) {

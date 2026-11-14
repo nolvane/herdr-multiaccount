@@ -95,6 +95,23 @@ pub struct Held {
 /// The folder of the notes, this list's id and the plan.
 pub type Mover = fn(&std::path::Path, u32, relocate::Plan) -> Result<(), String>;
 
+/// Signs an account's folders out (`sign_out`), returning those still
+/// signed in, and deletes its folder (`mirror::remove`) and its usage
+/// reading; fields so tests never reach Claude Code or the config directory.
+pub type Signer = fn(&Account) -> Vec<PathBuf>;
+pub type FolderRemover = fn(&str) -> std::io::Result<Vec<String>>;
+pub type UsageRemover = fn(&str);
+
+/// An account's sign-out, running in the background before the account
+/// goes, so the list never waits on Claude Code.
+pub struct SigningOut {
+    pub id: String,
+    /// A half-added account dropped after its sign-in did not finish,
+    /// rather than one removed with `d`.
+    dropping: bool,
+    rx: Receiver<Vec<PathBuf>>,
+}
+
 /// The program that opens links: `open` on macOS, `xdg-open` elsewhere.
 const OPENER: &str = if cfg!(target_os = "macos") {
     "open"
@@ -350,6 +367,11 @@ pub struct App {
     pub probing: bool,
     next_probe: Instant,
     last_click: Option<(Instant, Hit)>,
+    /// Accounts being signed out before they go.
+    pub signing_out: Vec<SigningOut>,
+    pub signer: Signer,
+    pub folder_remover: FolderRemover,
+    pub usage_remover: UsageRemover,
 }
 
 impl App {
@@ -412,6 +434,12 @@ impl App {
             probing: false,
             next_probe: Instant::now(),
             last_click: None,
+            signing_out: vec![],
+            signer: sign_out,
+            folder_remover: mirror::remove,
+            usage_remover: |id| {
+                let _ = std::fs::remove_file(paths::usage_dir().join(format!("{id}.json")));
+            },
         }
     }
 
@@ -509,6 +537,10 @@ impl App {
             .accounts
             .iter()
             .filter(|a| {
+                // Its folder is being signed out and deleted.
+                if self.is_signing_out(&a.id) {
+                    return false;
+                }
                 let Some(i) = self.info.get(&a.id) else {
                     return false;
                 };
@@ -957,7 +989,9 @@ impl App {
     /// Whether a session can be moved to an account: it is checked and
     /// signed in with a login (or key) of its own, as the launcher demands.
     fn can_take(&self, id: &str) -> bool {
-        self.store.account(id).is_some() && self.info.get(id).is_some_and(Info::own_login)
+        self.store.account(id).is_some()
+            && !self.is_signing_out(id)
+            && self.info.get(id).is_some_and(Info::own_login)
     }
 
     /// Why a session cannot be moved now, from Herdr's status.
@@ -1457,7 +1491,12 @@ impl App {
             detail: format!("follows it, now {}", self.store.name_of(&self.store.active)),
             value: None,
         }];
-        for a in &self.store.accounts {
+        for a in self
+            .store
+            .accounts
+            .iter()
+            .filter(|a| !self.is_signing_out(&a.id))
+        {
             let detail = self
                 .info
                 .get(&a.id)
@@ -1686,11 +1725,16 @@ impl App {
     /// The sign-in may have stored a login before it was stopped, so the
     /// folder is signed out first, and its id is never used again.
     fn drop_new_account(&mut self, id: &str) {
-        let failed = match self.store.account(id).cloned() {
-            Some(a) if a.kind == Kind::Subscription => sign_out(&a),
-            _ => vec![],
-        };
-        let _ = mirror::remove(id);
+        match self.store.account(id).cloned() {
+            Some(a) if a.kind == Kind::Subscription => self.sign_out_in_background(&a, true),
+            _ => self.finish_drop(id, vec![]),
+        }
+    }
+
+    /// The rest of `drop_new_account`, once the folder is signed out
+    /// (`failed`: the folders still signed in).
+    fn finish_drop(&mut self, id: &str, failed: Vec<PathBuf>) {
+        let _ = (self.folder_remover)(id);
         self.update(|s| {
             s.accounts.retain(|a| a.id != id);
             if !s.retired.iter().any(|r| r == id) {
@@ -1699,6 +1743,63 @@ impl App {
         });
         if !failed.is_empty() {
             self.mode = sign_out_failed(&failed);
+        }
+    }
+
+    /// Signs an account out in a thread; `receive_sign_outs` finishes its
+    /// removal (or the drop of a half-added account) when it is done.
+    fn sign_out_in_background(&mut self, a: &Account, dropping: bool) {
+        if self.is_signing_out(&a.id) {
+            return;
+        }
+        let (tx, rx) = channel();
+        let signer = self.signer;
+        let account = a.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(signer(&account));
+        });
+        self.signing_out.push(SigningOut {
+            id: a.id.clone(),
+            dropping,
+            rx,
+        });
+    }
+
+    pub fn is_signing_out(&self, id: &str) -> bool {
+        self.signing_out.iter().any(|s| s.id == id)
+    }
+
+    /// Finishes the sign-outs that are done. Only while no dialog is open,
+    /// as with moves: a notice never replaces a question, and a list closed
+    /// meanwhile leaves the account in place rather than a notice unshown.
+    fn receive_sign_outs(&mut self) {
+        if !matches!(self.mode, Mode::Normal) {
+            return;
+        }
+        let mut done = vec![];
+        self.signing_out.retain(|s| match s.rx.try_recv() {
+            Ok(failed) => {
+                done.push((s.id.clone(), s.dropping, failed));
+                false
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => true,
+            // The thread ended without an answer: whatever could hold a
+            // login counts as still signed in, so the notice names it.
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                done.push((
+                    s.id.clone(),
+                    s.dropping,
+                    login_folders(&mirror::home_of(&s.id)),
+                ));
+                false
+            }
+        });
+        for (id, dropping, failed) in done {
+            if dropping {
+                self.finish_drop(&id, failed);
+            } else {
+                self.finish_remove(&id, failed);
+            }
         }
     }
 
@@ -1714,7 +1815,11 @@ impl App {
         let s = self.signin.take().expect("checked above");
         let account = self.store.account(&s.id).cloned();
         let was_old = self.info.get(&s.id).is_some_and(|i| i.old_folder);
-        let info = account.as_ref().map(info::read).unwrap_or_default();
+        // A sign-in that failed needs no check (Claude Code may hang).
+        let info = match &account {
+            Some(a) if ok => info::read(a),
+            _ => Info::default(),
+        };
         if ok && info.own_login() {
             // From now on the account stays on its new folder.
             mirror::mark_moved(&mirror::home_of(&s.id));
@@ -1797,6 +1902,22 @@ impl App {
         }
     }
 
+    /// Whether the selected account is being signed out, flashing so when
+    /// it is.
+    fn selected_signing_out(&mut self) -> bool {
+        let Some(a) = self.selected().cloned() else {
+            return false;
+        };
+        if !self.is_signing_out(&a.id) {
+            return false;
+        }
+        self.flash(
+            format!("{} is being signed out", a.name),
+            crate::theme::MUTED,
+        );
+        true
+    }
+
     fn ask_remove(&mut self) {
         let Some(a) = self.selected().cloned() else {
             return;
@@ -1840,9 +1961,8 @@ impl App {
         let Some(a) = self.store.account(id).cloned() else {
             return;
         };
-        let mut still_signed_in = vec![];
         match a.kind {
-            Kind::Main => return,
+            Kind::Main => {}
             Kind::ApiKey => {
                 secret::delete(id);
                 if secret::exists(id) {
@@ -1859,24 +1979,42 @@ impl App {
                     };
                     return;
                 }
+                self.finish_remove(id, vec![]);
             }
-            Kind::Subscription => {
-                still_signed_in = sign_out(&a);
-                match mirror::remove(id) {
-                    Ok(kept) if !kept.is_empty() => {
-                        self.flash(
-                            format!("Removed {}; kept in backups: {}", a.name, kept.join(", ")),
-                            crate::theme::ACCENT,
-                        );
-                    }
-                    Ok(_) => {}
-                    Err(e) => {
-                        self.flash(
-                            format!("Could not delete its folder: {e}"),
-                            crate::theme::RED,
-                        );
-                        return;
-                    }
+            // Signing out asks Claude Code, which takes seconds: the
+            // account goes once that is done (`receive_sign_outs`).
+            Kind::Subscription => self.sign_out_in_background(&a, false),
+        }
+    }
+
+    /// The rest of `remove`, once the account's login is signed out
+    /// (`still_signed_in`: the folders that kept one).
+    fn finish_remove(&mut self, id: &str, still_signed_in: Vec<PathBuf>) {
+        let Some(a) = self.store.account(id).cloned() else {
+            // Gone meanwhile (another list removed it): a login left behind
+            // is still worth saying.
+            if !still_signed_in.is_empty() {
+                self.mode = sign_out_failed(&still_signed_in);
+            }
+            return;
+        };
+        let mut kept_note = false;
+        if a.kind == Kind::Subscription {
+            match (self.folder_remover)(id) {
+                Ok(kept) if !kept.is_empty() => {
+                    kept_note = true;
+                    self.flash(
+                        format!("Removed {}; kept in backups: {}", a.name, kept.join(", ")),
+                        crate::theme::ACCENT,
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    self.flash(
+                        format!("Could not delete its folder: {e}"),
+                        crate::theme::RED,
+                    );
+                    return;
                 }
             }
         }
@@ -1895,14 +2033,14 @@ impl App {
         }) {
             return;
         }
-        let _ = std::fs::remove_file(paths::usage_dir().join(format!("{id}.json")));
+        (self.usage_remover)(id);
         self.info.remove(id);
         if !still_signed_in.is_empty() {
             // Removed anyway: its id is never used again, so no new account
             // can find the login. Saying so keeps the login from being
             // forgotten.
             self.mode = sign_out_failed(&still_signed_in);
-        } else if self.flash.is_none() {
+        } else if !kept_note {
             self.flash(format!("Removed {}", a.name), crate::theme::ACCENT);
         }
     }
@@ -2302,6 +2440,9 @@ impl App {
             KeyCode::Char('1') => self.switch(Section::Accounts),
             KeyCode::Char('2') => self.switch(Section::Spaces),
             KeyCode::Char('3') => self.switch(Section::Sessions),
+            // An account being signed out takes nothing but waiting.
+            KeyCode::Enter | KeyCode::Delete | KeyCode::Char(' ' | 'l' | 'n' | 'd' | 'f' | 'c')
+                if self.section == Section::Accounts && self.selected_signing_out() => {}
             KeyCode::Enter | KeyCode::Char(' ') => self.enter(),
             KeyCode::Char('r') => {
                 self.refresh_all();
@@ -2530,6 +2671,7 @@ impl App {
             self.receive_info();
             self.receive_probe();
             self.receive_move();
+            self.receive_sign_outs();
             if Instant::now() >= self.next_probe {
                 self.start_probe();
             }
@@ -2644,27 +2786,40 @@ fn login_folders(home: &std::path::Path) -> Vec<PathBuf> {
     out
 }
 
+/// How long each `claude auth` call of a sign-out may take before it is
+/// stopped and the folder counts as not signed out.
+const SIGN_OUT_LIMIT: Duration = Duration::from_secs(30);
+
 /// Signs every folder of an account out of its own claude.ai login, and
 /// checks that it worked. A folder without a login of its own (or one that
 /// only borrows the main login, which must not be signed out) needs
-/// nothing. Returns the folders that still have a login afterwards.
+/// nothing. Returns the folders that still have a login afterwards, or that
+/// Claude Code did not answer about in time. Takes seconds: the list runs it
+/// in a thread.
 fn sign_out(a: &Account) -> Vec<PathBuf> {
+    // Without Claude Code there is no login it could keep.
+    let Some(claude) = launch::find_claude() else {
+        return vec![];
+    };
     login_folders(&mirror::home_of(&a.id))
         .into_iter()
-        .filter(|dir| !sign_out_folder(dir))
+        .filter(|dir| !sign_out_folder(&claude, dir, SIGN_OUT_LIMIT))
         .collect()
 }
 
-fn sign_out_folder(dir: &std::path::Path) -> bool {
-    let own_login = |dir: &std::path::Path| {
-        info::parse_status(&info::status_text(Some(dir)).unwrap_or_default()).own_login()
+/// Signs one folder out with `claude`; true when it has no login of its own
+/// afterwards. A call that does not end within `limit` is stopped, and an
+/// unanswered check counts as still signed in.
+fn sign_out_folder(claude: &std::path::Path, dir: &std::path::Path, limit: Duration) -> bool {
+    let own_login = |dir: &std::path::Path| match info::status_within(claude, dir, limit) {
+        info::Answer::Text(t) => Some(info::parse_status(&t).own_login()),
+        info::Answer::NoAnswer => None,
     };
-    if !own_login(dir) {
-        return true;
+    match own_login(dir) {
+        Some(false) => return true,
+        Some(true) => {}
+        None => return false,
     }
-    let Some(claude) = launch::find_claude() else {
-        return false;
-    };
     let mut cmd = std::process::Command::new(claude);
     // Clean first: it may remove CLAUDE_CONFIG_DIR, and without it the main
     // login would be signed out.
@@ -2672,10 +2827,9 @@ fn sign_out_folder(dir: &std::path::Path) -> bool {
     cmd.args(["auth", "logout"])
         .env("CLAUDE_CONFIG_DIR", dir)
         .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
-    let _ = cmd.status();
-    !own_login(dir)
+    let _ = launch::run_within(&mut cmd, limit);
+    own_login(dir) == Some(false)
 }
 
 /// The notice when a removed account's login could not be signed out, with
@@ -2785,6 +2939,62 @@ mod tests {
             focused: true,
             worktree: None,
         }];
+        a.signer = answered_signer;
+        a.folder_remover = |_| Ok(vec![]);
+        a.usage_remover = |_| {};
+        STORED.with(|s| *s.borrow_mut() = a.store.clone());
+        a
+    }
+
+    /// What the sign-out stand-in answers per account id: the folders still
+    /// signed in. It waits until a test sets an answer, as a slow `claude`
+    /// would (at most 20 seconds).
+    static SIGN_OUT_ANSWERS: std::sync::Mutex<Vec<(String, Vec<PathBuf>)>> =
+        std::sync::Mutex::new(Vec::new());
+
+    fn answered_signer(a: &Account) -> Vec<PathBuf> {
+        let until = Instant::now() + Duration::from_secs(20);
+        while Instant::now() < until {
+            {
+                let mut answers = SIGN_OUT_ANSWERS.lock().unwrap();
+                if let Some(i) = answers.iter().position(|(id, _)| *id == a.id) {
+                    return answers.remove(i).1;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        vec![]
+    }
+
+    fn answer_sign_out(id: &str, still_signed_in: Vec<PathBuf>) {
+        SIGN_OUT_ANSWERS
+            .lock()
+            .unwrap()
+            .push((id.to_string(), still_signed_in));
+    }
+
+    /// Runs the list's loop step until no sign-out is left.
+    fn until_signed_out(a: &mut App) {
+        let until = Instant::now() + Duration::from_secs(10);
+        while !a.signing_out.is_empty() {
+            assert!(Instant::now() < until, "the sign-out never finished");
+            a.receive_sign_outs();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// `app()` with a second subscription, selected and active.
+    fn app_with(id: &str, name: &str) -> App {
+        let mut a = app();
+        a.store.accounts.push(Account {
+            id: id.into(),
+            name: name.into(),
+            kind: Kind::Subscription,
+            sso: false,
+            fallback: true,
+        });
+        a.store.active = id.into();
+        a.sel = a.store.accounts.len() - 1;
         STORED.with(|s| *s.borrow_mut() = a.store.clone());
         a
     }
@@ -5517,6 +5727,223 @@ mod tests {
                 assert!(whole, "{w}x{h}: {word} cut off\n{screen}");
             }
         }
+    }
+
+    #[test]
+    fn removing_a_subscription_never_waits_for_its_sign_out() {
+        let mut a = app_with("bg-remove", "Backup");
+        let started = Instant::now();
+        press(&mut a, KeyCode::Char('d'));
+        assert_eq!(confirm(&a).purpose, ConfirmFor::Remove("bg-remove".into()));
+        press(&mut a, KeyCode::Char('y'));
+        // The stand-in has not answered: a removal on the drawing thread
+        // would still wait for it.
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(a.mode, Mode::Normal);
+        assert!(a.is_signing_out("bg-remove"));
+        assert!(stored().account("bg-remove").is_some(), "not gone yet");
+        let screen = screen_of(&mut a, 120, 30).join("\n");
+        assert!(screen.contains("signing out…"), "{screen}");
+        // The account takes no second removal or sign-in meanwhile.
+        press(&mut a, KeyCode::Char('d'));
+        assert_eq!(a.mode, Mode::Normal);
+        press(&mut a, KeyCode::Char('l'));
+        assert_eq!(a.mode, Mode::Normal);
+        assert!(a.signin.is_none());
+        let flash = a.flash.as_ref().map(|f| f.0.clone()).unwrap_or_default();
+        assert_eq!(flash, "Backup is being signed out");
+        // Nor can it be made active, change fallback, start Claude, take a
+        // moved session or a space, or have its limits read.
+        a.store.active = MAIN_ID.into();
+        press(&mut a, KeyCode::Enter);
+        assert_eq!(a.store.active, MAIN_ID);
+        press(&mut a, KeyCode::Char('f'));
+        assert!(a.store.account("bg-remove").unwrap().fallback);
+        press(&mut a, KeyCode::Char('c'));
+        assert_eq!(a.mode, Mode::Normal);
+        a.store.active = "bg-remove".into();
+        a.info.insert("bg-remove".into(), signed_in("Max"));
+        assert!(!a.can_take("bg-remove"));
+        assert!(a.probe_targets().iter().all(|(id, _)| id != "bg-remove"));
+        a.section = Section::Spaces;
+        a.open_space_picker();
+        let Mode::Pick(p) = &a.mode else {
+            panic!("no picker: {:?}", a.mode)
+        };
+        assert!(p
+            .items
+            .iter()
+            .all(|i| i.value.as_deref() != Some("bg-remove")));
+        a.mode = Mode::Normal;
+        a.section = Section::Accounts;
+
+        answer_sign_out("bg-remove", vec![]);
+        until_signed_out(&mut a);
+        let s = stored();
+        assert!(s.account("bg-remove").is_none());
+        assert!(s.retired.iter().any(|r| r == "bg-remove"));
+        assert_eq!(s.active, MAIN_ID);
+        assert_eq!(a.mode, Mode::Normal);
+        let flash = a.flash.as_ref().map(|f| f.0.clone()).unwrap_or_default();
+        assert_eq!(flash, "Removed Backup");
+    }
+
+    #[test]
+    fn a_login_left_after_removal_shows_the_command() {
+        let mut a = app_with("bg-left", "Left");
+        press(&mut a, KeyCode::Char('d'));
+        press(&mut a, KeyCode::Char('y'));
+        // Another dialog is open when the answer comes: the removal and its
+        // notice wait until it is closed.
+        a.mode = Mode::Help;
+        answer_sign_out("bg-left", vec![mirror::new_dir_of("bg-left")]);
+        std::thread::sleep(Duration::from_millis(200));
+        a.receive_sign_outs();
+        assert_eq!(a.mode, Mode::Help, "the open dialog stays");
+        assert!(stored().account("bg-left").is_some());
+        a.mode = Mode::Normal;
+        until_signed_out(&mut a);
+        assert!(stored().account("bg-left").is_none(), "removed anyway");
+        let Mode::Message { title, lines, .. } = &a.mode else {
+            panic!("no notice: {:?}", a.mode)
+        };
+        assert_eq!(title, "Sign-out did not work");
+        assert!(lines
+            .iter()
+            .any(|l| l.contains("bg-left/.claude\" command claude auth logout")));
+    }
+
+    #[test]
+    fn a_half_added_account_is_dropped_in_the_background() {
+        let mut a = app_with("bg-drop", "Fresh");
+        let started = Instant::now();
+        a.drop_new_account("bg-drop");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(a.is_signing_out("bg-drop"));
+        assert!(stored().account("bg-drop").is_some());
+        answer_sign_out("bg-drop", vec![mirror::new_dir_of("bg-drop")]);
+        until_signed_out(&mut a);
+        let s = stored();
+        assert!(s.account("bg-drop").is_none());
+        assert!(s.retired.iter().any(|r| r == "bg-drop"));
+        let Mode::Message { title, .. } = &a.mode else {
+            panic!("no notice: {:?}", a.mode)
+        };
+        assert_eq!(title, "Sign-out did not work");
+    }
+
+    #[test]
+    fn closing_during_a_sign_out_keeps_the_account() {
+        let mut a = app_with("bg-quit", "Later");
+        press(&mut a, KeyCode::Char('d'));
+        press(&mut a, KeyCode::Char('y'));
+        assert!(a.is_signing_out("bg-quit"));
+        press(&mut a, KeyCode::Char('q'));
+        press(&mut a, KeyCode::Char('y'));
+        assert!(a.quit);
+        // The list ends here: nothing of the removal happened yet, so the
+        // account is still there for another try.
+        let s = stored();
+        assert!(s.account("bg-quit").is_some());
+        assert!(!s.retired.iter().any(|r| r == "bg-quit"));
+        assert_eq!(s.active, "bg-quit");
+        answer_sign_out("bg-quit", vec![]);
+    }
+
+    /// A stand-in for `claude` in a folder of its own. `status` and
+    /// `logout` are the shell commands for `claude auth status` and
+    /// `claude auth logout`; a file `out` in the account folder marks it
+    /// signed out.
+    fn fake_claude(name: &str, status: &str, logout: &str) -> (PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let root =
+            std::env::temp_dir().join(format!("hm-fake-claude-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dir = root.join("account");
+        std::fs::create_dir_all(&dir).unwrap();
+        let claude = root.join("claude");
+        std::fs::write(
+            &claude,
+            format!(
+                "#!/bin/sh\ncase \"$2\" in\n  status) {status} ;;\n  logout) {logout} ;;\nesac\n"
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Another test thread may still hold the file open while it starts
+        // a process ("text file busy"): wait until it runs.
+        for _ in 0..100 {
+            match std::process::Command::new(&claude).arg("none").status() {
+                Err(e) if e.raw_os_error() == Some(26) => {
+                    std::thread::sleep(Duration::from_millis(20))
+                }
+                _ => break,
+            }
+        }
+        (claude, dir)
+    }
+
+    const SIGNED_IN: &str = "if [ -f \"$CLAUDE_CONFIG_DIR/out\" ]; then echo 'Not logged in. Run claude auth login.'; else printf 'Login method: Claude Max Account\\nEmail: alex@example.com\\n'; fi";
+
+    #[test]
+    fn sign_out_folder_signs_out_and_checks() {
+        let (claude, dir) = fake_claude("works", SIGNED_IN, "touch \"$CLAUDE_CONFIG_DIR/out\"");
+        assert!(sign_out_folder(&claude, &dir, Duration::from_secs(10)));
+        assert!(
+            dir.join("out").exists(),
+            "logout ran in the account's folder"
+        );
+        // A folder that is signed out already needs nothing.
+        assert!(sign_out_folder(&claude, &dir, Duration::from_secs(10)));
+        let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+    }
+
+    #[test]
+    fn a_claude_that_does_not_answer_is_stopped() {
+        for (name, status, logout) in [
+            // The check before the logout hangs.
+            (
+                "status-hangs",
+                "sleep 30",
+                "touch \"$CLAUDE_CONFIG_DIR/out\"",
+            ),
+            // The logout hangs, and the folder is still signed in after.
+            ("logout-hangs", SIGNED_IN, "sleep 30"),
+        ] {
+            let (claude, dir) = fake_claude(name, status, logout);
+            let started = Instant::now();
+            assert!(
+                !sign_out_folder(&claude, &dir, Duration::from_millis(500)),
+                "{name}: counts as still signed in"
+            );
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "{name}: stopped at the limit"
+            );
+            let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+        }
+        // A `claude` that cannot be started does not count as signed out.
+        let dir = std::env::temp_dir();
+        assert!(!sign_out_folder(
+            std::path::Path::new("/nonexistent/claude"),
+            &dir,
+            Duration::from_secs(1)
+        ));
+    }
+
+    #[test]
+    fn a_login_left_is_named_when_the_account_went_meanwhile() {
+        let mut a = app_with("bg-gone", "Gone");
+        press(&mut a, KeyCode::Char('d'));
+        press(&mut a, KeyCode::Char('y'));
+        // Another list removed it in the meantime.
+        a.store.accounts.retain(|x| x.id != "bg-gone");
+        answer_sign_out("bg-gone", vec![mirror::new_dir_of("bg-gone")]);
+        until_signed_out(&mut a);
+        let Mode::Message { title, .. } = &a.mode else {
+            panic!("no notice: {:?}", a.mode)
+        };
+        assert_eq!(title, "Sign-out did not work");
     }
 
     // ---- the key look (#18) ------------------------------------------
