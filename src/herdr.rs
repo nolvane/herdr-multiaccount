@@ -52,6 +52,8 @@ pub struct Workspace {
     pub label: String,
     pub number: u64,
     pub focused: bool,
+    /// The tab in front in this space.
+    pub active_tab: Option<String>,
     /// The git checkout the space is for; `None` outside a repository.
     pub worktree: Option<Worktree>,
 }
@@ -81,6 +83,7 @@ pub fn workspaces_from(v: &Value) -> Option<Vec<Workspace>> {
                     label: w["label"].as_str().unwrap_or("").to_string(),
                     number: w["number"].as_u64().unwrap_or(0),
                     focused: w["focused"].as_bool().unwrap_or(false),
+                    active_tab: w["active_tab_id"].as_str().map(str::to_string),
                     worktree: w["worktree"]["repo_key"].as_str().map(|key| Worktree {
                         repo_key: key.to_string(),
                         linked: w["worktree"]["is_linked_worktree"]
@@ -404,6 +407,7 @@ mod tests {
         let v = json!({"id": "cli:workspace:list", "result": {"type": "workspace_list",
         "workspaces": [
             {"workspace_id": "w1", "number": 1, "label": "acme-app", "focused": true,
+                "active_tab_id": "w1:t2",
                 "worktree": {"repo_key": "/src/acme-app/.git", "repo_name": "acme-app",
                     "repo_root": "/src/acme-app", "checkout_path": "/src/acme-app",
                     "is_linked_worktree": false}},
@@ -430,6 +434,8 @@ mod tests {
             ]
         );
         assert_eq!(list[0].label, "acme-app");
+        assert_eq!(list[0].active_tab.as_deref(), Some("w1:t2"));
+        assert_eq!(list[2].active_tab, None);
         // Without the flag a space counts as a worktree: it closes alone.
         let v = json!({"result": {"workspaces": [{"workspace_id": "w1",
             "worktree": {"repo_key": "k"}}]}});
