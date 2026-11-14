@@ -708,7 +708,7 @@ pub fn moved_pane() -> i32 {
         return 0;
     };
     let mut terminal = crate::enter_terminal();
-    let go = crate::remind::dialog(&mut terminal, &title, &body, " Esc close ").unwrap_or(false);
+    let go = crate::remind::dialog(&mut terminal, &title, &body, " `Esc` close ").unwrap_or(false);
     crate::leave_terminal();
     if go {
         if let Some(tab) = herdr::pane_tab(&pane) {
