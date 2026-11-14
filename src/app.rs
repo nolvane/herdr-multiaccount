@@ -499,18 +499,26 @@ impl App {
     pub fn start_info(&mut self) {
         self.next_info = Instant::now() + Duration::from_secs(600);
         let (tx, rx) = channel();
-        self.info_left = self.store.accounts.len();
-        self.info_started = time::now();
-        self.info_forgotten.clear();
+        self.begin_info();
         for account in self.store.accounts.clone() {
             let tx = tx.clone();
             std::thread::spawn(move || {
+                // Before `info::read`, which asks about this same folder: a
+                // sign-in that moves the account to its new folder throws
+                // the note away anyway (`forget_check`).
                 let folder =
                     (account.kind == Kind::Subscription).then(|| mirror::folder(&account.id));
                 let _ = tx.send((account.id.clone(), info::read(&account), folder));
             });
         }
         self.info_rx = Some(rx);
+    }
+
+    /// The bookkeeping of a new sign-in refresh, before its threads run.
+    fn begin_info(&mut self) {
+        self.info_left = self.store.accounts.len();
+        self.info_started = time::now();
+        self.info_forgotten.clear();
         self.info_loading = true;
     }
 
@@ -2856,16 +2864,11 @@ mod tests {
         }
     }
 
-    /// What `start_info` does before its threads run (which would ask
-    /// Claude Code about the real folders).
-    fn refresh_starts(a: &mut App) {
-        a.info_started = time::now();
-        a.info_forgotten.clear();
-    }
-
-    /// Hands `results` to the list as a finished sign-in refresh.
+    /// Hands `results` to the list as a finished sign-in refresh (without
+    /// its threads, which would ask Claude Code about the real folders).
     fn refresh(a: &mut App, results: Vec<(&str, Info, Option<PathBuf>)>) {
         let (tx, rx) = channel();
+        a.info_loading = true;
         a.info_left = results.len();
         for (id, info, folder) in results {
             tx.send((id.to_string(), info, folder)).unwrap();
@@ -2890,7 +2893,7 @@ mod tests {
     fn with_noted_check() -> (App, PathBuf) {
         let mut a = app();
         let folder = a.checks_dir.join("homes/personal/.claude");
-        a.info_started = time::now();
+        a.begin_info();
         refresh(
             &mut a,
             vec![("personal", signed_in_info(), Some(folder.clone()))],
@@ -2917,7 +2920,7 @@ mod tests {
             fallback: true,
         });
         let folder = a.checks_dir.join("homes/personal/.claude");
-        refresh_starts(&mut a);
+        a.begin_info();
         refresh(
             &mut a,
             vec![
@@ -2982,7 +2985,7 @@ mod tests {
         a.start_sign_in(&account, false);
         assert!(matches!(a.mode, Mode::SignIn { .. }));
         assert!(!a.checks_dir.join("personal.json").exists());
-        refresh_starts(&mut a);
+        a.begin_info();
         refresh(
             &mut a,
             vec![("personal", signed_in_info(), Some(folder.clone()))],

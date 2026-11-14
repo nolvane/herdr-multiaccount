@@ -665,7 +665,11 @@ before. A noted "signed out" is never reused, so an account signed in
 outside the list is never refused for an old result.
 
 The note is deleted before the list starts a sign-in, removes an account or
-drops a half-added one, and before the launcher's own sign-in; a refresh
-already running does not write it back (nor while a sign-in runs). Only the
+drops a half-added one, and before the launcher's own sign-in. A refresh
+the same list already runs does not write it back (nor while its sign-in
+runs); after its own sign-in the launcher always checks live, since a list
+open elsewhere may write a note meanwhile. The list and the launcher can
+reach the config directory through different paths (a link above it), so
+the folders are also compared resolved. Only the
 list writes notes: the launcher writing its own live result would make
 starts fast with the list closed too, but the issue left that out.

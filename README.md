@@ -55,7 +55,7 @@ to the next account when one is at its limit.
   stops and says how to get in: `l` in the accounts list, or
   `HERDR_MULTIACCOUNT_USE=main claude` for the main login. To know
   whether an account is signed in, `claude` asks Claude Code, which takes a
-  second or two; while the list is open (or was in the last 10 minutes) it
+  second or two; while the list is open (or was in the last 11 minutes) it
   uses the list's own check instead, unless that found the account signed
   out or the account's folder no longer holds a login.
 - **Reminder to go back.** A session that fallback started on another
@@ -310,7 +310,7 @@ Everything lives in the plugin's config directory
 |---|---|
 | `accounts.json` | The accounts, the active one, the spaces |
 | `usage/<account>.json` | Last usage reading and this month's sessions per account |
-| `signin/<account>.json` | The list's last sign-in check of a subscription (folder, time, signed in or not), which `claude` reuses for 11 minutes; deleted when the list signs the account in or removes it |
+| `signin/<account>.json` | The list's last sign-in check of a subscription (folder, time, signed in or not), which `claude` reuses for 11 minutes; deleted before a sign-in (in the list or by `claude`) and when the account is removed |
 | `homes/<account>/.claude/` | A subscription's Claude Code folder (links to `~/.claude`) |
 | `homes/<account>/` | Holds that folder; for an account from version 1.0.0 also its old folder, used until it signs in again |
 | `homes/<account>.new` | Notes that the account signed in in its new folder and never goes back to the old one |

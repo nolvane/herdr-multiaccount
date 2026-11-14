@@ -190,8 +190,21 @@ pub fn fresh_check(dir: &Path, id: &str, folder: &Path, now: i64) -> bool {
     ) else {
         return false;
     };
-    let age = now - at;
-    Path::new(dir_of_check) == folder && (0..=CHECK_FRESH_SECS).contains(&age)
+    let fresh = now
+        .checked_sub(at)
+        .is_some_and(|age| (0..=CHECK_FRESH_SECS).contains(&age));
+    fresh && same_folder(Path::new(dir_of_check), folder)
+}
+
+/// Whether two paths name the same folder. The list and the launcher can
+/// reach the config directory through different paths (a link somewhere
+/// above it), so the paths are also compared resolved.
+fn same_folder(a: &Path, b: &Path) -> bool {
+    a == b
+        || matches!(
+            (std::fs::canonicalize(a), std::fs::canonicalize(b)),
+            (Ok(x), Ok(y)) if x == y
+        )
 }
 
 /// Whether the main login is the machine-wide Anthropic profile. A claude.ai
@@ -425,6 +438,34 @@ mod tests {
         // A folder in place of the file.
         let _ = std::fs::remove_file(d.join("work.json"));
         std::fs::create_dir_all(d.join("work.json")).unwrap();
+        assert!(!fresh_check(&d, "work", &folder, NOW));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_check_reached_through_a_link_is_the_same_folder() {
+        let d = scratch("link");
+        let real = d.join("real/homes/work/.claude");
+        std::fs::create_dir_all(&real).unwrap();
+        std::os::unix::fs::symlink(d.join("real"), d.join("linked")).unwrap();
+        save_check(
+            &d,
+            "work",
+            &d.join("linked/homes/work/.claude"),
+            true,
+            NOW - 10,
+        );
+        assert!(fresh_check(&d, "work", &real, NOW));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn extreme_times_lead_to_the_live_check() {
+        let d = scratch("extreme");
+        let folder = d.join("homes/work/.claude");
+        save_check(&d, "work", &folder, true, i64::MIN);
+        assert!(!fresh_check(&d, "work", &folder, NOW));
+        save_check(&d, "work", &folder, true, i64::MAX);
         assert!(!fresh_check(&d, "work", &folder, NOW));
         let _ = std::fs::remove_dir_all(&d);
     }
