@@ -650,6 +650,45 @@ account either; it still asks Claude Code once per start for a subscription
 (the cost #22 is about). Ask-then-fall-back was the owner's choice over
 falling back silently or only asking.
 
+## 2026-11-14: Removing an account signs it out in the background, with a time limit
+
+Removing a subscription (and dropping one added for a sign-in that did not
+finish) ran `claude auth status`, `claude auth logout` and `claude auth
+status` again for each folder on the thread that draws the list, with no
+time limit, so the list froze for seconds, or for good when `claude` hung
+(#16). Now:
+
+- the sign-out runs in a thread, like the account checks and limit
+  readings; the account stays in `accounts.json` with "signing out…" on its
+  row until the answer comes, and only then is its folder removed and the
+  account retired, on the list's own thread as before. Closing the list
+  meanwhile leaves the account in place, so `d` can remove it again;
+- each `claude auth` call of a sign-out is stopped after 30 seconds
+  (`launch::run_within`, the spawn-and-poll loop `probe.rs` had, now shared
+  with it). A check that did not answer counts as still signed in, so the
+  notice with the by-hand command shows rather than a removal that may have
+  left a login behind;
+- while it runs, the account takes nothing else in the list (no `⏎`, `c`,
+  `f`, `n`, `l` or `d`, no moved session, no space, no limit reading), so
+  nothing new starts on a folder about to go;
+- the answer is taken only while no dialog is open, like the end of a move:
+  the notice never replaces a question, and closing the list meanwhile
+  leaves the account in place instead of a notice nobody saw;
+- each call runs in its own process group, which is stopped as a whole at
+  the limit, also when the call ended but something it started still
+  holds its output open, and a `claude` that cannot be started counts as
+  no answer. The limit is per call, so an account with two login folders
+  can show "signing out…" for a few minutes at worst;
+- the lock above holds inside this list only: a `claude` started from a
+  shell or another list can still pick the account until it is removed;
+- a sign-in that failed no longer asks `claude auth status` before the
+  half-added account is dropped.
+
+Running the whole removal in the thread was rejected: the list's state and
+its writes to `accounts.json` stay on one thread. Other `claude auth status`
+calls (the Console-profile check, the launcher's start check) keep running
+as before.
+
 ## 2026-11-14: A key has one look, also inside a sentence
 
 Every key the list names is bold and in the accent colour (`key_style` in

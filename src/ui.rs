@@ -309,6 +309,10 @@ fn status_line(app: &App, a: &Account) -> Line<'static> {
         ));
         spans.push(Span::styled(" · ", Style::new().fg(FAINT)));
     }
+    if app.is_signing_out(&a.id) {
+        spans.push(Span::styled("signing out…", Style::new().fg(YELLOW)));
+        return Line::from(spans);
+    }
     let info = app.info.get(&a.id);
     let now = app.now();
     let limit = app

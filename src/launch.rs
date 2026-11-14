@@ -404,6 +404,70 @@ pub fn clean_env(cmd: &mut Command) {
     cmd.env_remove(ENV_SET);
 }
 
+/// Runs `cmd` and returns what it printed, or `None` when it did not end
+/// within `limit`: it is stopped then, with everything it started (its own
+/// process group), so a `claude` that hangs (on the network or the
+/// keychain) never holds its caller for good. Standard input and error are
+/// left as `cmd` sets them; standard output is read here.
+pub fn run_within(
+    cmd: &mut Command,
+    limit: std::time::Duration,
+) -> std::io::Result<Option<String>> {
+    use std::io::Read;
+    use std::os::unix::process::CommandExt;
+    let deadline = std::time::Instant::now() + limit;
+    let mut child = cmd
+        .stdout(std::process::Stdio::piped())
+        .process_group(0)
+        .spawn()?;
+    let stop = |child: &mut std::process::Child| {
+        // The whole group: a wrapper script's `claude` too.
+        let _ = Command::new("kill")
+            .args(["-KILL", "--", &format!("-{}", child.id())])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        let _ = child.kill();
+        let _ = child.wait();
+    };
+    let Some(mut stdout) = child.stdout.take() else {
+        stop(&mut child);
+        return Err(std::io::Error::other("no output"));
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut s = String::new();
+        let _ = stdout.read_to_string(&mut s);
+        let _ = tx.send(s);
+    });
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(50))
+            }
+            Ok(None) => {
+                stop(&mut child);
+                return Ok(None);
+            }
+            Err(e) => {
+                stop(&mut child);
+                return Err(e);
+            }
+        }
+    }
+    // Something it started may still hold its output open: wait for the
+    // text only until the limit, then stop what is left of its group.
+    let left = deadline.saturating_duration_since(std::time::Instant::now());
+    let text = rx
+        .recv_timeout(left.max(std::time::Duration::from_millis(100)))
+        .ok();
+    if text.is_none() {
+        stop(&mut child);
+    }
+    Ok(text)
+}
+
 /// The line a session on `dir` prints when that is the old folder `home`
 /// an older version made: Claude asks before every edit in ~/.claude there.
 pub fn start_note(dir: &std::path::Path, home: &std::path::Path, name: &str) -> Option<String> {
@@ -648,6 +712,69 @@ mod tests {
     use serde_json::json;
 
     const NOW: i64 = 1_794_225_600;
+
+    #[test]
+    fn run_within_stops_what_does_not_end() {
+        let started = std::time::Instant::now();
+        let out = run_within(
+            Command::new("sh").args(["-c", "sleep 30"]),
+            std::time::Duration::from_millis(300),
+        )
+        .unwrap();
+        assert_eq!(out, None);
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        let out = run_within(
+            Command::new("sh").args(["-c", "echo ready"]),
+            std::time::Duration::from_secs(10),
+        )
+        .unwrap();
+        assert_eq!(out.as_deref(), Some("ready\n"));
+        // It ends, but leaves something behind that holds its output open:
+        // no answer, and what it left behind is stopped too.
+        let dir = std::env::temp_dir().join(format!("ma-run-within-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pid_file = dir.join("pid");
+        let started = std::time::Instant::now();
+        let out = run_within(
+            Command::new("sh").args([
+                "-c",
+                &format!("sleep 30 & echo $! > '{}'; echo ready", pid_file.display()),
+            ]),
+            std::time::Duration::from_millis(500),
+        )
+        .unwrap();
+        assert_eq!(out, None);
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        let left = std::fs::read_to_string(&pid_file).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(still_runs(std::process::id()));
+        let gone = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while still_runs(left.trim().parse().unwrap()) {
+            assert!(
+                std::time::Instant::now() < gone,
+                "the leftover sleep still runs"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        // What cannot start is an error, not an answer.
+        assert!(run_within(
+            &mut Command::new("/nonexistent/claude"),
+            std::time::Duration::from_secs(1)
+        )
+        .is_err());
+    }
+
+    /// Whether `pid` still runs: a zombie (state Z), which nobody may reap
+    /// in a container without an init, counts as stopped.
+    fn still_runs(pid: u32) -> bool {
+        let out = Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+            .unwrap();
+        let state = String::from_utf8_lossy(&out.stdout);
+        let state = state.trim();
+        !state.is_empty() && !state.starts_with('Z')
+    }
 
     fn store() -> Store {
         let mut s = Store::default();
