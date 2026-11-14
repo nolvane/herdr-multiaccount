@@ -16,6 +16,11 @@ All notable changes to this project are documented here. The format follows
   warns when one is working or waiting for an answer, names the worktree
   spaces that close with a repository's main checkout, and says when the
   list closes too. The space's account choice is forgotten.
+- An account that still runs on its 1.0.0 folder is hard to miss: inside
+  Herdr every session started on it shows a notification before Claude Code
+  starts, naming the account, what Claude asks about (skills, `CLAUDE.md`,
+  memory) and `l` to stop it. Its row keeps the notice also while the
+  account is at its limit.
 
 ### Changed
 
@@ -30,6 +35,13 @@ All notable changes to this project are documented here. The format follows
   again. The question names what carries over, and scrolls when it is
   taller than the pane.
 - The Sessions tab is called Agents, the word Herdr's sidebar uses.
+- The open list starts far fewer Claude Code processes for its limit
+  checks: it checks an account only when its last reading is older than
+  `check_limits`, now 300 seconds by default (was 60). A session that
+  answered in that time (its status line brings the limits), a check from
+  another open list and a check of an
+  account with the same login count as a reading. No checks start while
+  the list is not in front in Herdr; `r` still checks every account.
 - Every key the list names is bold and in the accent colour, as in the
   other Herdr plugins: in the footer, the dialogs' footers, the `?` help,
   on grey buttons and inside a sentence ("not signed in · `l` signs in").

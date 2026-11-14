@@ -355,7 +355,14 @@ fn status_line(app: &App, a: &Account) -> Line<'static> {
         } else {
             format!("at its {} limit", l.window)
         };
-        spans.push(Span::styled(text, Style::new().fg(YELLOW)));
+        // The limit never hides why Claude keeps asking: the notice comes
+        // first, since the limit also shows in its own column.
+        if info.is_some_and(|i| i.old_folder) {
+            spans.extend(keyed(theme::keys(OLD_FOLDER_NOTICE), YELLOW));
+            spans.push(Span::styled(" · ", Style::new().fg(YELLOW)));
+        }
+        // The limit names an account: plain text, never a key.
+        spans.push(Span::styled(theme::plain(&text), Style::new().fg(YELLOW)));
         return Line::from(spans);
     }
     // Signed in on the folder an older version made: Claude asks before

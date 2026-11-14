@@ -68,7 +68,7 @@ impl Default for Config {
             fallback: true,
             threshold: 95.0,
             notify: true,
-            check_limits: 60,
+            check_limits: 300,
             remind: true,
         }
     }
@@ -207,7 +207,8 @@ mod tests {
         assert_eq!(c.threshold, 80.0);
         assert!(c.notify, "an unknown value keeps the default");
         assert_eq!(Config::parse("threshold = 10").threshold, 95.0);
-        assert_eq!(c.check_limits, 60);
+        assert_eq!(c.check_limits, 300, "every 5 minutes without a line");
+        assert_eq!(Config::parse("check_limits = 60").check_limits, 60);
         assert_eq!(Config::parse("check_limits = 0").check_limits, 0);
         assert_eq!(Config::parse("check_limits = 5").check_limits, 30);
         assert_eq!(Config::parse("check_limits = 120s").check_limits, 120);

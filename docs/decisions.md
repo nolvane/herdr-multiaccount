@@ -201,6 +201,25 @@ minute by default (`check_limits`, at least 30 seconds): enough to see a
 window fill up, little load, and nothing runs in the background when nobody
 looks. API keys and logins without limits are skipped.
 
+Changed on 2026-11-14 (#23): one check a minute per account was a full
+Claude Code start per account and minute, also for accounts whose running
+session already reports its limits through the status line. Now an account
+is checked only when its freshest reading (the status line's `limits_at`,
+set only by a call that carried limits after a new answer, which the
+session's cost changing shows, since an idle session repeats its last
+answer's windows; or `/usage`'s `probed_at` from any open list; among
+accounts with the same login) is older than `check_limits`, whose default
+became 300 seconds. The list looks at this on every tick rather than on one
+fixed timer, so while checks work and the list is in view a reading is
+never older than the interval plus one check; a check that failed is tried
+again after the interval. Checks also wait while the list is not in front:
+Herdr's `workspace list` (`focused`, `active_tab_id`) and `pane list` (each
+pane's tab) tell whether its space and tab are shown, polled every 5
+seconds already. Herdr's focus events were not used: a split list is
+visible while you type in the pane next to it. When Herdr cannot tell, the
+list counts as in view; Herdr does not say whether a client is attached or
+another pane of the tab is zoomed, so checks still run then.
+
 ## 2026-11-09: Sessions tab
 
 Renamed to the Agents tab on 2026-11-10 (see "Ending a session from the
@@ -685,6 +704,32 @@ already marks both rows `same login as …`. Refusing to start was rejected
 (owner's choice): the login works, its limits are shared as twins, and the
 switch may have been meant. Right after the launcher's own sign-in the line
 is left out, since the sign-in already said it.
+
+## 2026-11-14: The old-folder notice is a Herdr notification from the launcher
+
+The line a session on an account's old folder printed (#14) went to stderr
+right before Claude Code took over the screen, so it was easy to miss, and
+the list row dropped it while the account was at its limit (#17). Now the
+launcher also sends a Herdr notification for every session that starts on
+the old folder (the owner's choice over once a day or once per account),
+under the same condition as labelling the pane: inside Herdr, at a
+terminal, not a start nested inside another Claude Code session. The row
+shows the notice in front of the limit text, since the limit also shows in
+its own column.
+
+The launcher runs exactly once per session and knows the folder before
+Claude Code starts, so the notice arrives before the first edit prompt and
+needs no record of who was told. Sending it from the status line was
+rejected: it would need a claim per session in `accounts.json` so that
+refreshes and two runs at once do not repeat it, and it would come only
+after Claude Code's first status line. The `notify` setting is not
+consulted; it is about fallback only.
+
+Whether memory edits through an account's links still ask on the new
+folder is not changed here: Claude Code checks both the requested and the
+resolved path of a write through a link, and every way around it found so
+far is undocumented or gives up shared memory. It is checked by hand, and a
+remaining prompt becomes its own issue.
 
 ## 2026-11-14: Removing an account signs it out in the background, with a time limit
 

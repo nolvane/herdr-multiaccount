@@ -16,9 +16,11 @@ notify = true
 # account, because that account has room again.
 remind = true
 
-# Seconds between limit checks (Claude Code's /usage) while the list is
-# open, at least 30. 0 turns them off.
-check_limits = 60
+# Seconds a limit reading stays current while the list is open, at least
+# 30: an account is checked (Claude Code's /usage) only when its last
+# reading, from /usage or a session's status line, is older. 0 turns the
+# checks off.
+check_limits = 300
 
 # Where the list opens: "overlay" (over the current tab), "split" (next to
 # the focused pane) or "tab" (a tab of its own).
