@@ -107,6 +107,39 @@ pub fn parse_status(text: &str) -> Info {
 /// folder. `None` when Claude Code could not be asked.
 pub fn status_text(home: Option<&std::path::Path>) -> Option<String> {
     let claude = launch::find_claude()?;
+    let out = status_command(&claude, home).output().ok()?;
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    (!text.trim().is_empty()).then_some(text)
+}
+
+/// What `claude auth status` said within a time limit.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Answer {
+    /// Its text; empty when it printed nothing or could not be started.
+    Text(String),
+    /// It did not end within the limit and was stopped.
+    TimedOut,
+}
+
+/// `claude auth status --text` for an account folder, with a time limit.
+pub fn status_within(
+    claude: &std::path::Path,
+    home: &std::path::Path,
+    limit: std::time::Duration,
+) -> Answer {
+    match launch::run_within(&mut status_command(claude, Some(home)), limit) {
+        Ok(Some(text)) => Answer::Text(text),
+        Ok(None) => Answer::TimedOut,
+        Err(_) => Answer::Text(String::new()),
+    }
+}
+
+/// The `claude auth status --text` command: only the folder's own login
+/// counts, never a credential from the environment.
+fn status_command(
+    claude: &std::path::Path,
+    home: Option<&std::path::Path>,
+) -> std::process::Command {
     let mut cmd = std::process::Command::new(claude);
     // Clean first, so CLAUDE_CONFIG_DIR set below stays.
     launch::clean_env(&mut cmd);
@@ -124,9 +157,7 @@ pub fn status_text(home: Option<&std::path::Path>) -> Option<String> {
         Some(h) => cmd.env("CLAUDE_CONFIG_DIR", h),
         None => cmd.env_remove("CLAUDE_CONFIG_DIR"),
     };
-    let out = cmd.output().ok()?;
-    let text = String::from_utf8_lossy(&out.stdout).to_string();
-    (!text.trim().is_empty()).then_some(text)
+    cmd
 }
 
 /// Whether the main login is the machine-wide Anthropic profile. A claude.ai

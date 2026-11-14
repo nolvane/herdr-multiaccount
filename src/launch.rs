@@ -401,6 +401,44 @@ pub fn clean_env(cmd: &mut Command) {
     cmd.env_remove(ENV_SET);
 }
 
+/// Runs `cmd` and returns what it printed, or `None` when it did not end
+/// within `limit`: it is killed then, so a `claude` that hangs (on the
+/// network or the keychain) never holds its caller for good. Standard input
+/// and error are left as `cmd` sets them; standard output is read here.
+pub fn run_within(
+    cmd: &mut Command,
+    limit: std::time::Duration,
+) -> std::io::Result<Option<String>> {
+    use std::io::Read;
+    let mut child = cmd.stdout(std::process::Stdio::piped()).spawn()?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| std::io::Error::other("no output"))?;
+    let reader = std::thread::spawn(move || {
+        let mut s = String::new();
+        let _ = stdout.read_to_string(&mut s);
+        s
+    });
+    let deadline = std::time::Instant::now() + limit;
+    loop {
+        match child.try_wait()? {
+            Some(_) => break,
+            None if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(50))
+            }
+            None => {
+                let _ = child.kill();
+                let _ = child.wait();
+                // The reader is left behind: something the child started may
+                // still hold its output open.
+                return Ok(None);
+            }
+        }
+    }
+    Ok(Some(reader.join().unwrap_or_default()))
+}
+
 /// The line a session on `dir` prints when that is the old folder `home`
 /// an older version made: Claude asks before every edit in ~/.claude there.
 pub fn start_note(dir: &std::path::Path, home: &std::path::Path, name: &str) -> Option<String> {
@@ -645,6 +683,24 @@ mod tests {
     use serde_json::json;
 
     const NOW: i64 = 1_794_225_600;
+
+    #[test]
+    fn run_within_stops_what_does_not_end() {
+        let started = std::time::Instant::now();
+        let out = run_within(
+            Command::new("sh").args(["-c", "sleep 30"]),
+            std::time::Duration::from_millis(300),
+        )
+        .unwrap();
+        assert_eq!(out, None);
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        let out = run_within(
+            Command::new("sh").args(["-c", "echo ready"]),
+            std::time::Duration::from_secs(10),
+        )
+        .unwrap();
+        assert_eq!(out.as_deref(), Some("ready\n"));
+    }
 
     fn store() -> Store {
         let mut s = Store::default();

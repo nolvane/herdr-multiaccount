@@ -55,6 +55,13 @@ All notable changes to this project are documented here. The format follows
 - `o` in the sign-in dialog says when the browser opener could not be
   started, and opened links no longer leave an ended opener process behind
   while the list is open.
+- Removing a subscription account no longer freezes the list while it is
+  signed out: the sign-out runs in the background, the account's row says
+  "signing out…" until it is gone, and closing the list meanwhile keeps the
+  account for another try. A `claude` that does not answer within 30
+  seconds is stopped, and the list shows the command that signs it out by
+  hand. The same holds when an account added for a sign-in that did not
+  finish is dropped again.
 
 ## [1.0.0] - 2026-11-09
 

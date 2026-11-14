@@ -649,3 +649,29 @@ picking the account, so a limit fallback never lands on a signed-out
 account either; it still asks Claude Code once per start for a subscription
 (the cost #22 is about). Ask-then-fall-back was the owner's choice over
 falling back silently or only asking.
+
+## 2026-11-14: Removing an account signs it out in the background, with a time limit
+
+Removing a subscription (and dropping one added for a sign-in that did not
+finish) ran `claude auth status`, `claude auth logout` and `claude auth
+status` again for each folder on the thread that draws the list, with no
+time limit, so the list froze for seconds, or for good when `claude` hung
+(#16). Now:
+
+- the sign-out runs in a thread, like the account checks and limit
+  readings; the account stays in `accounts.json` with "signing out…" on its
+  row until the answer comes, and only then is its folder removed and the
+  account retired, on the list's own thread as before. Closing the list
+  meanwhile leaves the account in place, so `d` can remove it again;
+- each `claude auth` call of a sign-out is stopped after 30 seconds
+  (`launch::run_within`, the spawn-and-poll loop `probe.rs` had, now shared
+  with it). A check that did not answer counts as still signed in, so the
+  notice with the by-hand command shows rather than a removal that may have
+  left a login behind;
+- a notice that comes while another dialog is open waits until it is
+  closed.
+
+Running the whole removal in the thread was rejected: the list's state and
+its writes to `accounts.json` stay on one thread. Other `claude auth status`
+calls (the Console-profile check, the launcher's start check) keep running
+as before.
