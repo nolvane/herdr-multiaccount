@@ -663,22 +663,23 @@ Now folders that only hold Claude Code's caches (`mirror::is_cache`:
 `paste-cache` and `image-cache`, pasted text and images) are merged at the
 next start, under the account folder's lock: a plain file `~/.claude`'s
 folder lacks is moved there (a hard link, or a copy on another disk, never
-replacing anything), the same file is dropped, and a file of the same name
+replacing anything or leaving half a file), the same file is dropped, and a file of the same name
 with other content goes to `backups/` first so `~/.claude`'s version stays.
 Once the folder is empty it becomes a link. Links and subfolders inside it
 are never followed or moved; the folder then stays and is reported. A
 failure while merging never stops the session. Every other real folder
 (`skills`, `projects` and the rest) is still left alone, since merging could
 mix two setups; its start line now says how to share it by hand. The scope,
-caches only, was the owner's choice.
+caches only, was the owner's choice. In `~/.claude` it only adds files,
+never replaces one.
 
 ## 2026-11-14: A login shared after `/login` is named at start
 
 A `/login` inside a session on a subscription account signs that account's
 folder in to whatever account is chosen; the plugin does not block or wrap
 Claude Code's own command. When the folder then holds the same login as
-another entry (`login::same_as`), each session started on it (not the
-starts nested inside one) prints one line
+another entry (`login::same_as`), each session started on it at a terminal
+(not starts nested inside a session or run by scripts) prints one line
 naming that entry and `l` to sign it in again, and starts anyway; the list
 already marks both rows `same login as …`. Refusing to start was rejected
 (owner's choice): the login works, its limits are shared as twins, and the

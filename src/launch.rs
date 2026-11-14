@@ -418,15 +418,6 @@ pub fn separate_note(name: &str, account: &str, dir: &std::path::Path) -> String
     )
 }
 
-/// The start line for an account whose folder holds the same login as
-/// other entries, such as after a `/login` inside one of its sessions.
-pub fn twin_note(name: &str, same: &[String]) -> Option<String> {
-    (!same.is_empty()).then(|| format!(
-        "{name} holds the same login as {}, so this session runs on that login (a /login inside a session, or the browser at sign-in, can do that). If {name} should have its own, open the accounts list (Herdr: the Multiaccount action) and press l on {name} to sign it in again.",
-        same.join(", ")
-    ))
-}
-
 /// Variables to set and variables to remove for a session.
 pub type SessionEnv = (Vec<(String, String)>, Vec<&'static str>);
 
@@ -524,7 +515,8 @@ pub fn run(args: Vec<String>, moved: bool) -> i32 {
     };
     let config = Config::load(&paths::config_dir());
     let store = Store::load();
-    let usage = load_usage(&store);
+    let twins = login::twins(&store, &login::all(&store));
+    let usage = load_usage_with(&store, &twins);
     let (wanted, source) = wanted(&store);
     let check = |id: &str| usable(&store, id);
     // Each account is asked about at most once per start.
@@ -609,14 +601,20 @@ pub fn run(args: Vec<String>, moved: bool) -> i32 {
     }
 
     // A /login inside one of its sessions puts another login into the
-    // account's folder; it starts anyway, but says so. Not again in starts
-    // nested inside such a session (headless runs, subagents).
+    // account's folder; it starts anyway, but says so. Only to a person at
+    // the terminal: not in starts nested inside a session (headless runs,
+    // subagents) or run by scripts.
     if let Some(account) = store.account(&choice.id) {
         if account.kind == Kind::Subscription
             && choice.source != Source::Inherited
+            && std::io::stderr().is_terminal()
             && signed_in_now.as_deref() != Some(&choice.id)
         {
-            if let Some(note) = twin_note(&account.name, &login::same_as(&store, account)) {
+            let same: Vec<String> = twins
+                .get(&choice.id)
+                .map(|ids| ids.iter().map(|id| store.name_of(id)).collect())
+                .unwrap_or_default();
+            if let Some(note) = login::shared_login_note(&account.name, &same) {
                 eprintln!("herdr-multiaccount: {note}");
             }
         }
@@ -1082,17 +1080,5 @@ mod tests {
         assert!(line.contains("/x/homes/work/.claude/skills"), "{line}");
         assert!(line.contains("into ~/.claude/skills"), "{line}");
         assert!(line.contains("the next start links it"), "{line}");
-    }
-
-    #[test]
-    fn a_login_shared_with_another_entry_is_named_at_start() {
-        assert_eq!(twin_note("Work", &[]), None);
-        let line = twin_note("Work", &["Main login".to_string()]).unwrap();
-        assert!(
-            line.contains("Work holds the same login as Main login"),
-            "{line}"
-        );
-        assert!(line.contains("/login"), "{line}");
-        assert!(line.contains("press l on Work"), "{line}");
     }
 }

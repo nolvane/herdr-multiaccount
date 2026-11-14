@@ -112,7 +112,8 @@ pub fn is_cache(name: &str) -> bool {
 pub struct Report {
     /// Links made this time.
     pub linked: usize,
-    /// Files that had been replaced by a copy and were linked again.
+    /// Files that had been replaced by a copy, and cache folders that had
+    /// turned into real folders, linked again.
     pub healed: Vec<String>,
     /// Entries that are folders of their own and stay so.
     pub separate: Vec<String>,
@@ -253,8 +254,10 @@ pub fn sync_dirs(main: &Path, home: &Path, id: &str, backups: &Path) -> std::io:
             Ok(m) if m.is_dir() && is_cache(name) && target.is_dir() => {
                 // Healing a cache never stops a session from starting; what
                 // could not be merged stays and is reported.
-                if heal_cache(&link, &target, backups, &format!("{id}-{name}")).unwrap_or(false) {
-                    relink(&target, &link)?;
+                let healed = heal_cache(&link, &target, backups, &format!("{id}-{name}"))
+                    .unwrap_or(false)
+                    && relink(&target, &link).is_ok();
+                if healed {
                     report.healed.push(name.clone());
                 } else {
                     report.separate.push(name.clone());
@@ -298,7 +301,9 @@ fn heal_cache(copy: &Path, shared: &Path, backups: &Path, label: &str) -> std::i
         match std::fs::symlink_metadata(&to) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => move_file(&from, &to)?,
             Ok(m) if m.is_file() => {
-                if std::fs::read(&from)? != std::fs::read(&to)? {
+                let differs = m.len() != entry.metadata()?.len()
+                    || std::fs::read(&from)? != std::fs::read(&to)?;
+                if differs {
                     backup(
                         backups,
                         &from,
@@ -318,18 +323,25 @@ fn heal_cache(copy: &Path, shared: &Path, backups: &Path, label: &str) -> std::i
     Ok(true)
 }
 
-/// Moves a file to a path where nothing is, also onto another disk.
+/// Moves a file to a path where nothing is, also onto another disk. Never
+/// replaces what is there, and never leaves half a file behind.
 fn move_file(from: &Path, to: &Path) -> std::io::Result<()> {
-    if std::fs::hard_link(from, to).is_err() {
-        // Another disk: a copy that never replaces what appeared meanwhile.
-        use std::os::unix::fs::OpenOptionsExt;
-        let mode = paths::mode_of(&std::fs::metadata(from)?) & 0o666;
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(mode)
-            .open(to)?;
-        std::io::Write::write_all(&mut f, &std::fs::read(from)?)?;
+    match std::fs::hard_link(from, to) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::CrossesDevices => {
+            // A full copy under a temporary name first, then linked into
+            // place (which fails rather than replace a file).
+            let name = to
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let tmp = to.with_file_name(format!(".{name}.tmp.{}", std::process::id()));
+            let _ = std::fs::remove_file(&tmp);
+            let copied = std::fs::copy(from, &tmp).and_then(|_| std::fs::hard_link(&tmp, to));
+            let _ = std::fs::remove_file(&tmp);
+            copied?;
+        }
+        Err(e) => return Err(e),
     }
     std::fs::remove_file(from)
 }
