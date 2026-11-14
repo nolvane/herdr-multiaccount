@@ -290,6 +290,11 @@ pub fn sync_dirs(main: &Path, home: &Path, id: &str, backups: &Path) -> std::io:
 /// `copy` are never followed or moved. True when `copy` ended up empty and
 /// was removed, so the link can take its place.
 fn heal_cache(copy: &Path, shared: &Path, backups: &Path, label: &str) -> std::io::Result<bool> {
+    // Two names for one folder (a link or a mount): every file would look
+    // like its own twin and be removed. Leave it alone.
+    if copy.canonicalize()? == shared.canonicalize()? {
+        return Ok(false);
+    }
     for entry in std::fs::read_dir(copy)? {
         let entry = entry?;
         if !entry.file_type()?.is_file() {
@@ -796,6 +801,29 @@ mod tests {
         // The next start finds the link and has nothing to say.
         let r = sync_dirs(&main, &home, "x", &backups).unwrap();
         assert_eq!(r, Report::default());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_cache_folder_that_is_also_the_shared_one_loses_nothing() {
+        // ~/.claude's paste-cache is itself a link into the account's
+        // copy: both names are one folder, so nothing may be "merged".
+        let root = scratch("cache-same");
+        let main = root.join("main");
+        let home = root.join("home");
+        let backups = root.join("backups");
+        std::fs::create_dir_all(home.join("paste-cache")).unwrap();
+        std::fs::write(home.join("paste-cache/code"), "pasted").unwrap();
+        std::fs::create_dir_all(&main).unwrap();
+        std::os::unix::fs::symlink(home.join("paste-cache"), main.join("paste-cache")).unwrap();
+
+        let r = sync_dirs(&main, &home, "x", &backups).unwrap();
+        assert!(r.healed.is_empty(), "{r:?}");
+        assert!(!is_link(&home.join("paste-cache")));
+        assert_eq!(
+            std::fs::read_to_string(home.join("paste-cache/code")).unwrap(),
+            "pasted"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
