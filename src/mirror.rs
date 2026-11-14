@@ -101,6 +101,13 @@ pub fn is_own(name: &str) -> bool {
         || name.contains(".tmp")
 }
 
+/// Folders that only hold Claude Code's caches (pasted text and images):
+/// when one turned into a real folder in an account folder, its files are
+/// merged into `~/.claude`'s and the link is made again (`heal_cache`).
+pub fn is_cache(name: &str) -> bool {
+    ["paste-cache", "image-cache"].contains(&name)
+}
+
 #[derive(Debug, Default, PartialEq)]
 pub struct Report {
     /// Links made this time.
@@ -243,6 +250,16 @@ pub fn sync_dirs(main: &Path, home: &Path, id: &str, backups: &Path) -> std::io:
                 relink(&target, &link)?;
                 report.linked += 1;
             }
+            Ok(m) if m.is_dir() && is_cache(name) && target.is_dir() => {
+                // Healing a cache never stops a session from starting; what
+                // could not be merged stays and is reported.
+                if heal_cache(&link, &target, backups, &format!("{id}-{name}")).unwrap_or(false) {
+                    relink(&target, &link)?;
+                    report.healed.push(name.clone());
+                } else {
+                    report.separate.push(name.clone());
+                }
+            }
             Ok(_) => report.separate.push(name.clone()),
         }
     }
@@ -261,6 +278,60 @@ pub fn sync_dirs(main: &Path, home: &Path, id: &str, backups: &Path) -> std::io:
         }
     }
     Ok(report)
+}
+
+/// Moves the plain files of a real cache folder `copy` into `~/.claude`'s
+/// folder `shared`: a file `shared` lacks is moved there, the same file is
+/// dropped, and a file of the same name with other content goes to
+/// `backups/` first, so `shared` keeps its version. Links and folders inside
+/// `copy` are never followed or moved. True when `copy` ended up empty and
+/// was removed, so the link can take its place.
+fn heal_cache(copy: &Path, shared: &Path, backups: &Path, label: &str) -> std::io::Result<bool> {
+    for entry in std::fs::read_dir(copy)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let from = entry.path();
+        let file = entry.file_name();
+        let to = shared.join(&file);
+        match std::fs::symlink_metadata(&to) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => move_file(&from, &to)?,
+            Ok(m) if m.is_file() => {
+                if std::fs::read(&from)? != std::fs::read(&to)? {
+                    backup(
+                        backups,
+                        &from,
+                        &format!("{label}-{}", file.to_string_lossy()),
+                    )?;
+                }
+                std::fs::remove_file(&from)?;
+            }
+            // Something else of that name in ~/.claude: leave both.
+            _ => {}
+        }
+    }
+    if std::fs::read_dir(copy)?.next().is_some() {
+        return Ok(false);
+    }
+    std::fs::remove_dir(copy)?;
+    Ok(true)
+}
+
+/// Moves a file to a path where nothing is, also onto another disk.
+fn move_file(from: &Path, to: &Path) -> std::io::Result<()> {
+    if std::fs::hard_link(from, to).is_err() {
+        // Another disk: a copy that never replaces what appeared meanwhile.
+        use std::os::unix::fs::OpenOptionsExt;
+        let mode = paths::mode_of(&std::fs::metadata(from)?) & 0o666;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(mode)
+            .open(to)?;
+        std::io::Write::write_all(&mut f, &std::fs::read(from)?)?;
+    }
+    std::fs::remove_file(from)
 }
 
 /// Brings the folder sessions of the account run on in step; returns it.
@@ -676,7 +747,128 @@ mod tests {
         std::fs::write(home.join("skills").join("x"), "x").unwrap();
         let r = sync_dirs(&main, &home, "x", &root.join("backups")).unwrap();
         assert_eq!(r.separate, vec!["skills".to_string()]);
+        assert_eq!(std::fs::read_to_string(home.join("skills/x")).unwrap(), "x");
+        assert!(!is_link(&home.join("skills")));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_real_cache_folder_is_merged_and_linked() {
+        let root = scratch("cache");
+        let main = root.join("main");
+        let home = root.join("home");
+        let backups = root.join("backups");
+        std::fs::create_dir_all(main.join("paste-cache")).unwrap();
+        std::fs::write(main.join("paste-cache/same"), "same").unwrap();
+        std::fs::write(main.join("paste-cache/clash"), "main").unwrap();
+        std::fs::create_dir_all(home.join("paste-cache")).unwrap();
+        std::fs::write(home.join("paste-cache/same"), "same").unwrap();
+        std::fs::write(home.join("paste-cache/clash"), "account").unwrap();
+        std::fs::write(home.join("paste-cache/only-here"), "pasted").unwrap();
+
+        let r = sync_dirs(&main, &home, "x", &backups).unwrap();
+        assert!(r.separate.is_empty(), "{r:?}");
+        assert_eq!(r.healed, vec!["paste-cache".to_string()]);
+        assert!(is_link(&home.join("paste-cache")));
+        let read = |p: &str| std::fs::read_to_string(main.join("paste-cache").join(p)).unwrap();
+        assert_eq!(read("only-here"), "pasted");
+        assert_eq!(read("same"), "same");
+        assert_eq!(read("clash"), "main", "~/.claude's version stays");
+        let saved: Vec<String> = std::fs::read_dir(&backups)
+            .unwrap()
+            .flatten()
+            .map(|e| std::fs::read_to_string(e.path()).unwrap())
+            .collect();
+        assert_eq!(saved, vec!["account".to_string()], "only the clash");
+
+        // The next start finds the link and has nothing to say.
+        let r = sync_dirs(&main, &home, "x", &backups).unwrap();
+        assert_eq!(r, Report::default());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_cache_folder_made_before_claude_had_one_heals_once_it_has() {
+        let root = scratch("cache-later");
+        let main = root.join("main");
+        let home = root.join("home");
+        let backups = root.join("backups");
+        std::fs::create_dir_all(&main).unwrap();
+        std::fs::write(main.join("settings.json"), "{}").unwrap();
+        // A session starts while ~/.claude has no paste-cache yet ...
+        sync_dirs(&main, &home, "x", &backups).unwrap();
+        // ... and Claude Code makes one in the account folder (a /login
+        // pastes its code there).
+        std::fs::create_dir_all(home.join("paste-cache")).unwrap();
+        std::fs::write(home.join("paste-cache/code"), "pasted").unwrap();
+        let r = sync_dirs(&main, &home, "x", &backups).unwrap();
+        assert!(r.separate.is_empty(), "nothing to link it to yet");
+        assert!(!is_link(&home.join("paste-cache")));
+        // Later ~/.claude gets its own.
+        std::fs::create_dir_all(main.join("paste-cache")).unwrap();
+        std::fs::write(main.join("paste-cache/other"), "main").unwrap();
+        let r = sync_dirs(&main, &home, "x", &backups).unwrap();
+        assert!(r.separate.is_empty(), "{r:?}");
+        assert!(is_link(&home.join("paste-cache")));
+        assert_eq!(
+            std::fs::read_to_string(main.join("paste-cache/code")).unwrap(),
+            "pasted"
+        );
+        assert!(!backups.exists(), "no clash, no backup");
+        for _ in 0..2 {
+            let r = sync_dirs(&main, &home, "x", &backups).unwrap();
+            assert!(r.separate.is_empty() && r.healed.is_empty(), "{r:?}");
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_cache_folder_with_more_than_plain_files_stays() {
+        let root = scratch("cache-mixed");
+        let main = root.join("main");
+        let home = root.join("home");
+        let backups = root.join("backups");
+        let outside = root.join("outside");
+        std::fs::create_dir_all(main.join("paste-cache")).unwrap();
+        std::fs::create_dir_all(main.join("image-cache")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("keep"), "keep").unwrap();
+        std::fs::create_dir_all(home.join("paste-cache/sub")).unwrap();
+        std::fs::write(home.join("paste-cache/sub/a"), "a").unwrap();
+        std::fs::write(home.join("paste-cache/plain"), "plain").unwrap();
+        std::fs::create_dir_all(home.join("image-cache")).unwrap();
+        std::os::unix::fs::symlink(&outside, home.join("image-cache/link")).unwrap();
+
+        let r = sync_dirs(&main, &home, "x", &backups).unwrap();
+        assert_eq!(
+            r.separate,
+            vec!["image-cache".to_string(), "paste-cache".to_string()]
+        );
+        // Plain files still went over; the rest is left as it was.
+        assert_eq!(
+            std::fs::read_to_string(main.join("paste-cache/plain")).unwrap(),
+            "plain"
+        );
+        assert_eq!(
+            std::fs::read_to_string(home.join("paste-cache/sub/a")).unwrap(),
+            "a"
+        );
+        assert!(is_link(&home.join("image-cache/link")));
+        assert!(!main.join("image-cache/link").exists());
+        assert_eq!(
+            std::fs::read_to_string(outside.join("keep")).unwrap(),
+            "keep"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn only_cache_folders_are_merged() {
+        assert!(is_cache("paste-cache"));
+        assert!(is_cache("image-cache"));
+        for name in ["skills", "projects", "plugins", "todos", "file-history"] {
+            assert!(!is_cache(name), "{name}");
+        }
     }
 
     #[test]
