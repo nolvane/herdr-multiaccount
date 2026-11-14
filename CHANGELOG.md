@@ -24,6 +24,11 @@ All notable changes to this project are documented here. The format follows
 
 ### Changed
 
+- `claude` starts about two seconds sooner on a claude.ai account while the
+  accounts list is open (or was in the last 11 minutes): it reuses the
+  list's sign-in check instead of asking Claude Code again. A check that
+  found the account signed out is never reused, and signing an account in
+  or removing it in the list throws its check away at once.
 - Setup writes the status line command in `~/.claude/settings.json` with
   `$HOME` in place of your home folder, so the file holds no user name.
   A command from an earlier setup keeps working; running setup again moves

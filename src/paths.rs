@@ -6,6 +6,7 @@
 //! <config>/config.toml       settings (optional, by hand)
 //! <config>/accounts.json     accounts, active account, spaces
 //! <config>/usage/<id>.json   last usage reading per account
+//! <config>/signin/<id>.json  the list's last sign-in check per subscription
 //! <config>/homes/<id>/.claude/ an account's Claude Code folder (links to ~/.claude)
 //! <config>/homes/<id>/       its old folder from version 1.0.0, until it signs in again
 //! <config>/homes/<id>.new    the account signed in in its new folder
@@ -47,6 +48,11 @@ pub fn accounts_file() -> PathBuf {
 
 pub fn usage_dir() -> PathBuf {
     config_dir().join("usage")
+}
+
+/// The list's last sign-in check per subscription, for the launcher.
+pub fn checks_dir() -> PathBuf {
+    config_dir().join("signin")
 }
 
 pub fn homes_dir() -> PathBuf {
