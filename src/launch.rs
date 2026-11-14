@@ -405,8 +405,36 @@ pub fn clean_env(cmd: &mut Command) {
 /// an older version made: Claude asks before every edit in ~/.claude there.
 pub fn start_note(dir: &std::path::Path, home: &std::path::Path, name: &str) -> Option<String> {
     (dir == home).then(|| format!(
-        "{name} still uses the folder an older version made, so Claude asks before every edit in ~/.claude. Open the accounts list (Herdr: the Multiaccount action) and press l on {name} to sign in again."
+        "{name} still uses the folder an older version made, so Claude asks before every edit in ~/.claude (skills, CLAUDE.md, memory). Open the accounts list (Herdr: the Multiaccount action) and press l on {name} to sign in again."
     ))
+}
+
+/// The Herdr notification (title, body) for a session that starts on the
+/// old folder `home` of an account: shown before Claude Code starts, so the
+/// first edit prompt of the session is no surprise. The main login and API
+/// key accounts have no such folder.
+pub fn old_folder_notice(
+    kind: Kind,
+    dir: &std::path::Path,
+    home: &std::path::Path,
+    name: &str,
+) -> Option<(String, String)> {
+    (kind == Kind::Subscription && dir == home).then(|| {
+        (
+            format!("{name} still uses its old folder"),
+            format!(
+                "Claude asks before every edit in ~/.claude (skills, CLAUDE.md, memory) in this session. To stop it, open the accounts list (the Multiaccount action) and press l on {name} to sign in again."
+            ),
+        )
+    })
+}
+
+/// Whether a start labels its pane and tells about its account in Herdr:
+/// only the session the user started in a Herdr pane, never one Claude Code
+/// starts inside it (a subagent, a headless run), which belongs to a session
+/// that was told already.
+pub fn tells_in_herdr(inside: bool, source: &Source, terminal: bool) -> bool {
+    inside && may_ask(terminal, source)
 }
 
 /// Variables to set and variables to remove for a session.
@@ -593,24 +621,42 @@ pub fn run(args: Vec<String>, moved: bool) -> i32 {
     // A named account is for this start only; sessions inside it inherit
     // the account through ENV_ID and may still fall back.
     cmd.env_remove(ENV_USE);
-    match session_env(&store, &choice.id) {
+    // The folder the session runs on, as the environment hands it over.
+    let config_dir = match session_env(&store, &choice.id) {
         Ok((set, remove)) => {
             for v in remove {
                 cmd.env_remove(v);
             }
+            let dir = set
+                .iter()
+                .find(|(k, _)| k == "CLAUDE_CONFIG_DIR")
+                .map(|(_, v)| PathBuf::from(v));
             for (k, v) in set {
                 cmd.env(k, v);
             }
+            dir
         }
         Err(e) => {
             eprintln!("herdr-multiaccount: {e}");
             return 1;
         }
-    }
+    };
 
     // Label the pane in Herdr's sidebar: only for the session the user
     // started there, not for ones Claude Code starts inside it.
-    if herdr::inside() && choice.source != Source::Inherited && std::io::stdin().is_terminal() {
+    if tells_in_herdr(
+        herdr::inside(),
+        &choice.source,
+        std::io::stdin().is_terminal(),
+    ) {
+        // Once for every session on the old folder, before its first prompt.
+        let notice = store
+            .account(&choice.id)
+            .zip(config_dir)
+            .and_then(|(a, dir)| old_folder_notice(a.kind, &dir, &mirror::home_of(&a.id), &a.name));
+        if let Some((title, body)) = notice {
+            herdr::notify(&title, &body);
+        }
         if let Ok(pane) = std::env::var("HERDR_PANE_ID") {
             herdr::tag_pane(
                 &pane,
@@ -1037,5 +1083,74 @@ mod tests {
             "{note}"
         );
         assert_eq!(start_note(&home.join(".claude"), home, "Work"), None);
+        assert!(note.contains("(skills, CLAUDE.md, memory)"), "{note}");
+    }
+
+    #[test]
+    fn a_session_on_the_old_folder_is_told_in_herdr() {
+        let home = std::path::Path::new("/x/homes/work");
+        let (title, body) = old_folder_notice(Kind::Subscription, home, home, "Work").unwrap();
+        assert!(title.contains("Work"), "names the account: {title}");
+        for part in [
+            "~/.claude",
+            "skills",
+            "CLAUDE.md",
+            "memory",
+            "press l on Work",
+        ] {
+            assert!(body.contains(part), "{part}: {body}");
+        }
+        assert!(body.contains("accounts list"), "{body}");
+    }
+
+    #[test]
+    fn no_herdr_notice_off_the_old_folder() {
+        let home = std::path::Path::new("/x/homes/work");
+        let new = home.join(mirror::NEW);
+        assert_eq!(
+            old_folder_notice(Kind::Subscription, &new, home, "Work"),
+            None
+        );
+        // The main login and API keys have no folder of the plugin's.
+        let main = std::path::Path::new("/x/homes/main");
+        assert_eq!(old_folder_notice(Kind::Main, main, main, "Main"), None);
+        let key = std::path::Path::new("/x/homes/key");
+        assert_eq!(old_folder_notice(Kind::ApiKey, key, key, "Key"), None);
+    }
+
+    #[test]
+    fn only_the_session_the_user_started_tells_in_herdr() {
+        assert!(tells_in_herdr(true, &Source::Active, true));
+        assert!(tells_in_herdr(true, &Source::Explicit, true));
+        assert!(tells_in_herdr(true, &Source::Space("Work".into()), true));
+        // A start inside a running session (a subagent, a headless run)
+        // belongs to a session that was told already.
+        assert!(!tells_in_herdr(true, &Source::Inherited, true));
+        assert!(!tells_in_herdr(true, &Source::Active, false));
+        assert!(!tells_in_herdr(false, &Source::Active, true));
+    }
+
+    #[test]
+    fn signing_in_again_ends_the_herdr_notice() {
+        let root = std::env::temp_dir().join(format!("hm-old-notice-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let home = root.join("homes").join("work");
+        std::fs::create_dir_all(&home).unwrap();
+        let signed_in = r#"{"oauthAccount":{"emailAddress":"alex@example.com"}}"#;
+        // Signed in only on the old folder by version 1.0.0.
+        std::fs::write(home.join(".claude.json"), signed_in).unwrap();
+        let dir = mirror::folder_in(&home);
+        assert!(old_folder_notice(Kind::Subscription, &dir, &home, "Work").is_some());
+        // Signed in again with l: the new folder, and no notice.
+        let new = home.join(mirror::NEW);
+        std::fs::create_dir_all(&new).unwrap();
+        std::fs::write(new.join(".claude.json"), signed_in).unwrap();
+        let dir = mirror::folder_in(&home);
+        assert_eq!(dir, new);
+        assert_eq!(
+            old_folder_notice(Kind::Subscription, &dir, &home, "Work"),
+            None
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -649,3 +649,29 @@ picking the account, so a limit fallback never lands on a signed-out
 account either; it still asks Claude Code once per start for a subscription
 (the cost #22 is about). Ask-then-fall-back was the owner's choice over
 falling back silently or only asking.
+
+## 2026-11-14: The old-folder notice is a Herdr notification from the launcher
+
+The line a session on an account's old folder printed (#14) went to stderr
+right before Claude Code took over the screen, so it was easy to miss, and
+the list row dropped it while the account was at its limit (#17). Now the
+launcher also sends a Herdr notification for every session that starts on
+the old folder (the owner's choice over once a day or once per account),
+under the same condition as labelling the pane: inside Herdr, at a
+terminal, not a start nested inside another Claude Code session. The row
+shows the notice in front of the limit text, since the limit also shows in
+its own column.
+
+The launcher runs exactly once per session and knows the folder before
+Claude Code starts, so the notice arrives before the first edit prompt and
+needs no record of who was told. Sending it from the status line was
+rejected: it would need a claim per session in `accounts.json` so that
+refreshes and two runs at once do not repeat it, and it would come only
+after Claude Code's first status line. The `notify` setting is not
+consulted; it is about fallback only.
+
+Whether memory edits through an account's links still ask on the new
+folder is not changed here: Claude Code checks both the requested and the
+resolved path of a write through a link, and every way around it found so
+far is undocumented or gives up shared memory. It is checked by hand, and a
+remaining prompt becomes its own issue.
