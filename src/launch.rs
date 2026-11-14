@@ -283,20 +283,31 @@ pub fn usable(store: &Store, id: &str) -> bool {
 }
 
 /// Whether an account's folder is signed in with a login of its own, so a
-/// session runs on it (asks Claude Code: up to a second or two). Without a
-/// login of its own, Claude Code would quietly use the main login, or ask to
-/// sign in where the browser may pick the wrong account. API key accounts
-/// and the main login need no check here.
+/// session runs on it. Without a login of its own, Claude Code would quietly
+/// use the main login, or ask to sign in where the browser may pick the
+/// wrong account. Asks Claude Code (up to a second or two) unless the list
+/// found the folder signed in a few minutes ago. API key accounts and the
+/// main login need no check here.
 pub fn signed_in(store: &Store, id: &str) -> bool {
     match store.account(id).map(|a| a.kind) {
         Some(Kind::Subscription) => {
             let dir = mirror::folder(id);
-            mirror::has_login(&dir)
-                && info::takes_sessions(info::status_text(Some(&dir)).as_deref())
+            folder_signed_in(
+                mirror::has_login(&dir),
+                info::fresh_check(&paths::checks_dir(), id, &dir, time::now()),
+                || info::status_text(Some(&dir)),
+            )
         }
         Some(_) => true,
         None => false,
     }
+}
+
+/// The sign-in check of a subscription's folder: it needs a login in its
+/// config (`has_login`), then either the list's fresh "signed in" (`fresh`)
+/// or Claude Code's own answer (`live`, asked only without a fresh one).
+fn folder_signed_in(has_login: bool, fresh: bool, live: impl FnOnce() -> Option<String>) -> bool {
+    has_login && (fresh || info::takes_sessions(live().as_deref()))
 }
 
 /// Asks a yes/no question on the terminal; anything but yes is no. Reads
@@ -333,6 +344,8 @@ fn sign_in_here(store: &Store, id: &str) -> bool {
     let Some(account) = store.account(id) else {
         return false;
     };
+    // No result from before this sign-in may stand in for the check after it.
+    info::forget_check(&paths::checks_dir(), id);
     match crate::signin::in_terminal(account) {
         Ok(true) => {}
         Ok(false) => {
@@ -641,7 +654,7 @@ pub fn run(args: Vec<String>, moved: bool) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::Account;
+    use crate::store::{Account, MAIN_ID};
     use serde_json::json;
 
     const NOW: i64 = 1_794_225_600;
@@ -985,6 +998,46 @@ mod tests {
             None,
             "no reminder to go back to an account that is signed out too"
         );
+    }
+
+    #[test]
+    fn a_fresh_check_by_the_list_spares_claude_codes_own() {
+        let asked = std::cell::Cell::new(0);
+        let live = |answer: &'static str| {
+            let asked = &asked;
+            move || {
+                asked.set(asked.get() + 1);
+                Some(answer.to_string())
+            }
+        };
+        let signed_out = "Not logged in. Run claude auth login.\n";
+        let signed_in = "Login method: Claude Max Account\nEmail: alex@example.com\n";
+        // Fresh "signed in" from the list: Claude Code is not asked.
+        assert!(folder_signed_in(true, true, live(signed_out)));
+        assert_eq!(asked.get(), 0);
+        // None (old, missing, other folder, signed out): asked live.
+        assert!(folder_signed_in(true, false, live(signed_in)));
+        assert!(!folder_signed_in(true, false, live(signed_out)));
+        assert_eq!(asked.get(), 2);
+        // The folder's config lost its login (`/logout` in a session): no
+        // reuse and no live check, it is signed out.
+        assert!(!folder_signed_in(false, true, live(signed_in)));
+        assert_eq!(asked.get(), 2);
+    }
+
+    #[test]
+    fn main_and_api_key_accounts_are_not_checked() {
+        let mut s = store();
+        s.accounts.push(Account {
+            id: "key".into(),
+            name: "Key".into(),
+            kind: Kind::ApiKey,
+            sso: false,
+            fallback: true,
+        });
+        assert!(signed_in(&s, MAIN_ID));
+        assert!(signed_in(&s, "key"));
+        assert!(!signed_in(&s, "nobody"));
     }
 
     #[test]

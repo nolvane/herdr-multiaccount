@@ -33,7 +33,7 @@ it is built this way: [docs/decisions.md](docs/decisions.md).
 | `sessions.rs` | The account and the conversation of each running session, per Herdr pane |
 | `relocate.rs` | Moving a running session to another account (`m` in the Agents tab) |
 | `carry.rs` | The start options and model a moved session keeps |
-| `info.rs` | Who an account is signed in as (`claude auth status`) |
+| `info.rs` | Who an account is signed in as (`claude auth status`), and the list's noted check the launcher reuses |
 | `herdr.rs`, `pane.rs` | Herdr's command line: spaces, panes, labels, the open action |
 
 ## Conventions

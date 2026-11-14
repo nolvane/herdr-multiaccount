@@ -1,6 +1,8 @@
 //! Who an account is signed in as: Claude Code's own `claude auth status`,
 //! run with the account's folder, and the plan from the account's
-//! `.claude.json`. Read only, for the list.
+//! `.claude.json`. Read only, for the list; the list notes each
+//! subscription's result (`save_check`) so the launcher can skip asking
+//! Claude Code again for a few minutes (`fresh_check`).
 
 use crate::launch;
 use crate::mirror;
@@ -8,6 +10,7 @@ use crate::paths;
 use crate::secret;
 use crate::store::{Account, Kind};
 use serde_json::Value;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Info {
@@ -127,6 +130,68 @@ pub fn status_text(home: Option<&std::path::Path>) -> Option<String> {
     let out = cmd.output().ok()?;
     let text = String::from_utf8_lossy(&out.stdout).to_string();
     (!text.trim().is_empty()).then_some(text)
+}
+
+/// How long the list's sign-in check of a subscription stands in for the
+/// launcher's own: the list's 10-minute refresh plus the time the refresh
+/// itself takes, so a start right before the next result still uses it.
+pub const CHECK_FRESH_SECS: i64 = 11 * 60;
+
+/// The file with the list's last sign-in check of account `id` in `dir`.
+/// `None` for an id that is not a plain account id, so nothing is ever read
+/// or written outside `dir`.
+fn check_file(dir: &Path, id: &str) -> Option<PathBuf> {
+    crate::store::valid_id(id).then(|| dir.join(format!("{id}.json")))
+}
+
+/// Notes the list's sign-in check of a subscription: the folder it asked
+/// Claude Code about, when the check started, and whether that folder had a
+/// login of its own.
+pub fn save_check(dir: &Path, id: &str, folder: &Path, signed_in: bool, at: i64) {
+    let Some(file) = check_file(dir, id) else {
+        return;
+    };
+    let text = serde_json::json!({
+        "folder": folder.to_string_lossy(),
+        "checked_at": at,
+        "signed_in": signed_in,
+    })
+    .to_string();
+    let _ = paths::write_atomic(&file, format!("{text}\n").as_bytes());
+}
+
+/// Throws away the list's sign-in check of `id`, before anything that can
+/// change its login.
+pub fn forget_check(dir: &Path, id: &str) {
+    if let Some(file) = check_file(dir, id) {
+        let _ = std::fs::remove_file(file);
+    }
+}
+
+/// Whether the list found `folder` signed in with a login of its own at
+/// most [`CHECK_FRESH_SECS`] before `now`. Anything else (no file, an older
+/// or damaged one, another folder, "signed out", a time ahead of `now`) is
+/// no: the caller asks Claude Code. A cached "signed out" is never used, so
+/// a sign-in done outside the list is never hidden.
+pub fn fresh_check(dir: &Path, id: &str, folder: &Path, now: i64) -> bool {
+    let Some(file) = check_file(dir, id) else {
+        return false;
+    };
+    let Ok(text) = std::fs::read_to_string(file) else {
+        return false;
+    };
+    let Ok(v) = serde_json::from_str::<Value>(&text) else {
+        return false;
+    };
+    let (Some(at), Some(dir_of_check), Some(true)) = (
+        v["checked_at"].as_i64(),
+        v["folder"].as_str(),
+        v["signed_in"].as_bool(),
+    ) else {
+        return false;
+    };
+    let age = now - at;
+    Path::new(dir_of_check) == folder && (0..=CHECK_FRESH_SECS).contains(&age)
 }
 
 /// Whether the main login is the machine-wide Anthropic profile. A claude.ai
@@ -279,6 +344,116 @@ mod tests {
         );
         assert!(odd.signed_in);
         assert!(!parse_status("").signed_in);
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("hm-info-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    const NOW: i64 = 1_794_225_600;
+
+    #[test]
+    fn a_fresh_signed_in_check_is_reused() {
+        let d = scratch("fresh");
+        let folder = d.join("homes/work/.claude");
+        save_check(&d, "work", &folder, true, NOW - 300);
+        assert!(fresh_check(&d, "work", &folder, NOW));
+        // Up to the refresh plus its run time.
+        assert!(fresh_check(
+            &d,
+            "work",
+            &folder,
+            NOW - 300 + CHECK_FRESH_SECS
+        ));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn an_old_or_missing_check_is_not_reused() {
+        let d = scratch("old");
+        let folder = d.join("homes/work/.claude");
+        assert!(!fresh_check(&d, "work", &folder, NOW), "never checked");
+        save_check(&d, "work", &folder, true, NOW - CHECK_FRESH_SECS - 1);
+        assert!(!fresh_check(&d, "work", &folder, NOW), "too old");
+        // A time ahead of now (the clock was set back) is not trusted.
+        save_check(&d, "work", &folder, true, NOW + 60);
+        assert!(!fresh_check(&d, "work", &folder, NOW));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_signed_out_check_is_never_reused() {
+        let d = scratch("out");
+        let folder = d.join("homes/work/.claude");
+        save_check(&d, "work", &folder, false, NOW - 10);
+        assert!(!fresh_check(&d, "work", &folder, NOW));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_check_of_another_folder_is_not_reused() {
+        let d = scratch("other");
+        // Checked on the old folder; sessions now use the new one.
+        save_check(&d, "work", &d.join("homes/work"), true, NOW - 10);
+        assert!(!fresh_check(&d, "work", &d.join("homes/work/.claude"), NOW));
+        // Nor one of another account.
+        let folder = d.join("homes/work/.claude");
+        save_check(&d, "home", &folder, true, NOW - 10);
+        assert!(!fresh_check(&d, "personal", &folder, NOW));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_damaged_check_leads_to_the_live_one() {
+        let d = scratch("damaged");
+        let folder = d.join("homes/work/.claude");
+        for text in [
+            "",
+            "{",
+            "not json",
+            r#"{"folder": 3, "checked_at": 1794225590, "signed_in": true}"#,
+            r#"{"checked_at": 1794225590, "signed_in": true}"#,
+            r#"{"folder": "x", "checked_at": "soon", "signed_in": true}"#,
+            r#"{"folder": "x", "checked_at": 1794225590, "signed_in": "yes"}"#,
+        ] {
+            std::fs::write(d.join("work.json"), text).unwrap();
+            assert!(!fresh_check(&d, "work", &folder, NOW), "{text}");
+        }
+        // A folder in place of the file.
+        let _ = std::fs::remove_file(d.join("work.json"));
+        std::fs::create_dir_all(d.join("work.json")).unwrap();
+        assert!(!fresh_check(&d, "work", &folder, NOW));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn forgetting_a_check_removes_it() {
+        let d = scratch("forget");
+        let folder = d.join("homes/work/.claude");
+        save_check(&d, "work", &folder, true, NOW - 10);
+        forget_check(&d, "work");
+        assert!(!d.join("work.json").exists());
+        assert!(!fresh_check(&d, "work", &folder, NOW));
+        // Nothing there: nothing happens.
+        forget_check(&d, "work");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn checks_stay_inside_their_folder() {
+        let d = scratch("inside");
+        let folder = d.join("x");
+        for id in ["../escape", "a/b", "", "Main"] {
+            save_check(&d, id, &folder, true, NOW);
+            assert!(!fresh_check(&d, id, &folder, NOW), "{id}");
+            forget_check(&d, id);
+        }
+        assert!(!d.parent().unwrap().join("escape.json").exists());
+        assert_eq!(std::fs::read_dir(&d).unwrap().count(), 0);
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]
