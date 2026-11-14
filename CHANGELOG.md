@@ -16,6 +16,11 @@ All notable changes to this project are documented here. The format follows
   warns when one is working or waiting for an answer, names the worktree
   spaces that close with a repository's main checkout, and says when the
   list closes too. The space's account choice is forgotten.
+- An account that still runs on its 1.0.0 folder is hard to miss: inside
+  Herdr every session started on it shows a notification before Claude Code
+  starts, naming the account, what Claude asks about (skills, `CLAUDE.md`,
+  memory) and `l` to stop it. Its row keeps the notice also while the
+  account is at its limit.
 
 ### Changed
 
