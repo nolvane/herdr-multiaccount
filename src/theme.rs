@@ -83,6 +83,13 @@ pub fn plain(text: &str) -> String {
     text.replace(KEY_MARK, "")
 }
 
+/// A name followed by a text of the list's own that names a key, such as
+/// "notes" + " changed since …. Press `d` again": the name is taken as it
+/// is (`plain`), only `rest` is marked (`keys`).
+pub fn named(name: &str, rest: &str) -> String {
+    format!("{}{}", plain(name), keys(rest))
+}
+
 /// Text colour that reads on a coloured background.
 pub fn on(bg: Color) -> Color {
     match bg {

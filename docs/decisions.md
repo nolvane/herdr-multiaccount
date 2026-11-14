@@ -679,9 +679,13 @@ pane label or an error's text, which may hold backticks of their own.
 - The mark has no width, and the drawn spans hold no mark, so `wrap`,
   `shorten` and every click area stay as they were. The popups measure
   their grey button by display width, not by bytes.
-- Notes in the footer go through `App::flash`, which takes any mark out,
-  since they often hold a name or an error; `App::flash_keys` is for the
-  list's own notes that name a key, with names put in through
-  `theme::plain`. The same-login note marks `l` only for the list; the
-  launcher prints it plain to the terminal, and a Herdr notification
+- Notes in the footer go through `App::flash`, and a refused move's
+  message through `App::move_refused`; both take any mark out, since they
+  often hold a name or an error. `flash_keys` and `move_refused_keys` are
+  for the list's own texts that name a key, built with `theme::named`
+  (the name as it is, only the rest marked). A finished move's report and
+  "Signed in as …" drop marks too. The same-login note is marked; the
+  launcher prints it through `theme::plain`, and a Herdr notification
   never gets a mark.
+- A key with a space in it ("`any other key`") that a wrap splits stays a
+  key on both lines (`wrap_with_keys`).

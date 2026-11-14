@@ -263,9 +263,8 @@ pub enum Mode {
 
 type HerdrState = (Option<Vec<Workspace>>, Option<Vec<Pane>>);
 
-/// How the list works, shown on first open and under `?`.
-/// The note on how the list works, first as a message, then in the help.
-/// Keys stand between backticks (`theme::keys`).
+/// How the list works, shown on first open and under `?`. Keys stand
+/// between backticks (`theme::keys`).
 pub const INTRO: [&str; 6] = [
     "Main login is the login Claude Code already has in ~/.claude, the one /login sets. This list never changes it; to switch it, run /login in Claude Code.",
     "Every other account sits next to it in a folder of its own with its own login, and shares your settings, skills, plugins and history.",
@@ -832,10 +831,9 @@ impl App {
         let group = Self::space_group(&now, &first.id);
         if let Some(new) = group.iter().find(|w| !named.iter().any(|n| n.id == w.id)) {
             self.flash_keys(
-                format!(
-                    "{}{}",
-                    theme::plain(&Self::space_name(new)),
-                    theme::keys(" opened since; nothing was closed. Press `d` again")
+                theme::named(
+                    &Self::space_name(new),
+                    " opened since; nothing was closed. Press `d` again",
                 ),
                 crate::theme::YELLOW,
             );
@@ -856,10 +854,9 @@ impl App {
             .any(|p| !counted.contains(&p.id) || (Self::busy(p) && !warned.contains(&p.id)));
         if changed {
             self.flash_keys(
-                format!(
-                    "{}{}",
-                    theme::plain(label),
-                    theme::keys(" changed since the question; nothing was closed. Press `d` again")
+                theme::named(
+                    label,
+                    " changed since the question; nothing was closed. Press `d` again",
                 ),
                 crate::theme::YELLOW,
             );
@@ -901,14 +898,16 @@ impl App {
                         s.assign(id, name, Some(account));
                     }
                 });
-            let label = theme::plain(label);
             self.flash_keys(
                 if back {
-                    format!("Herdr could not close {label}")
+                    format!("Herdr could not close {}", theme::plain(label))
                 } else {
                     format!(
-                        "Herdr could not close {label}{}",
-                        theme::keys(", and its account choice is lost: choose it again with `⏎`")
+                        "Herdr could not close {}",
+                        theme::named(
+                            label,
+                            ", and its account choice is lost: choose it again with `⏎`"
+                        )
                     )
                 },
                 crate::theme::RED,
@@ -1144,7 +1143,13 @@ impl App {
 
     /// The user answered yes and waits for an outcome: a refusal gets the
     /// dialog a failed move gets, not a note in the footer.
+    /// `why` often holds a name or an error, so any key mark is taken out.
     fn move_refused(&mut self, label: &str, why: String) {
+        self.move_refused_keys(label, theme::plain(&why));
+    }
+
+    /// `move_refused` for a reason of the list's own that names a key.
+    fn move_refused_keys(&mut self, label: &str, why: String) {
         self.mode = Mode::Message {
             title: format!("{label} was not moved"),
             lines: vec![why],
@@ -1176,14 +1181,11 @@ impl App {
         let Some(held) = (self.conversation_of)(&s.pane)
             .filter(|h| h.session_id == s.session_id && h.pid == s.pid)
         else {
-            self.move_refused(
+            self.move_refused_keys(
                 &label,
-                format!(
-                    "{}{}",
-                    theme::plain(&label),
-                    theme::keys(
-                        " holds another conversation now. Press `m` again to move that one."
-                    )
+                theme::named(
+                    &label,
+                    " holds another conversation now. Press `m` again to move that one.",
                 ),
             );
             return;
@@ -1191,12 +1193,11 @@ impl App {
         // The question named the model; a /model since then would move it
         // on another. A model noted only since is the one it runs on.
         if s.carry.model.is_some() && held.carry.model != s.carry.model {
-            self.move_refused(
+            self.move_refused_keys(
                 &label,
-                format!(
-                    "{}{}",
-                    theme::plain(&label),
-                    theme::keys("'s model changed since the question. Press `m` again to move it on the new one.")
+                theme::named(
+                    &label,
+                    "'s model changed since the question. Press `m` again to move it on the new one.",
                 ),
             );
             return;
@@ -1277,9 +1278,10 @@ impl App {
                 relocate::State::Done(Err(e)) => (format!("{} was not moved", p.label), e),
                 _ => relocate::stopped_text(p),
             };
+            // The report holds names and errors: no key marks.
             self.mode = Mode::Message {
                 title,
-                lines: vec![line],
+                lines: vec![theme::plain(&line)],
                 good: false,
             };
         }
@@ -1721,6 +1723,7 @@ impl App {
                 .clone()
                 .or(info.organization.clone())
                 .unwrap_or_else(|| "an account".into());
+            let who = theme::plain(&who);
             let mut lines = vec![format!(
                 "Signed in as {who}{}.",
                 info.plan
@@ -1735,7 +1738,7 @@ impl App {
                 .map(|a| crate::login::same_as(&self.store, a))
                 .unwrap_or_default();
             if !same.is_empty() {
-                lines.push(crate::login::same_login_note(&same, &theme::keys("`l`")));
+                lines.push(crate::login::same_login_note(&same));
             }
             if was_old && !info.old_folder {
                 lines.push(
@@ -1965,8 +1968,8 @@ impl App {
             return;
         }
         if !self.setup.shell {
-            self.flash(
-                "Set up first (S): the claude function picks the account",
+            self.flash_keys(
+                theme::keys("Set up first (`S`): the claude function picks the account"),
                 crate::theme::YELLOW,
             );
             return;
@@ -5720,6 +5723,26 @@ mod tests {
         assert_eq!(flash_text(&a), "Renamed to ad");
         let (rows, buf) = drawn(&mut a, 160, 30);
         looks(&rows, &buf, "Renamed to ad");
+        // Setup named in a note.
+        let mut a = app();
+        a.in_herdr = true;
+        a.setup = setup::State {
+            shell: false,
+            statusline: true,
+        };
+        press(&mut a, KeyCode::Char('c'));
+        let (rows, buf) = drawn(&mut a, 160, 30);
+        looks_from(&rows, &buf, "Set up first (`S`): the claude", 29);
+        // A session label with a mark of its own in a refused move: plain.
+        let mut a = movable();
+        a.panes[0].label = format!("Fix{}the{}bug", theme::KEY_MARK, theme::KEY_MARK);
+        set_fresh(Some(a.panes.clone()));
+        press(&mut a, KeyCode::Char('m'));
+        press(&mut a, KeyCode::Enter);
+        set_fresh(Some(vec![shell("w91:p1", "w91:t1")]));
+        press(&mut a, KeyCode::Char('y'));
+        let (rows, buf) = drawn(&mut a, 120, 40);
+        looks(&rows, &buf, "Fixthebug has ended.");
         // Setup named in a message.
         let mut a = movable();
         a.conversation_of = knows_nothing;
@@ -5737,14 +5760,15 @@ mod tests {
         // The note after a sign-in with another account's login: marked for
         // the list, plain for a terminal, names as they are.
         let names = vec!["`d`".to_string()];
-        let note = crate::login::same_login_note(&names, &theme::keys("`l`"));
+        let note = crate::login::same_login_note(&names);
         assert!(note.contains("`d`"), "{note}");
         assert!(
             note.contains(&theme::keys("press `l` to sign in")),
             "{note}"
         );
-        let terminal = crate::login::same_login_note(&names, "l");
-        assert!(!terminal.contains(theme::KEY_MARK), "{terminal}");
+        // What the launcher prints (`launch.rs`).
+        let terminal = theme::plain(&note);
+        assert!(terminal.contains("as `d`. If") && terminal.contains("press l to"));
         let mut a = app();
         a.mode = Mode::Message {
             title: "Work is signed in".into(),
@@ -5881,9 +5905,56 @@ mod tests {
 
     #[test]
     fn only_keys_and_titles_are_bold_accent() {
-        // Every main view, with notices, a note and the help: a bold accent
-        // cell below the header is a key the text names.
-        let allowed = "⏎acmxd?qrSlFK JShift+↑↓nEspyog";
+        // Every main view (with the setup notice, a signed-out account, the
+        // active one and a note naming a key) and the help: below the header
+        // and outside a dialog's top border, each stretch of bold accent
+        // cells is one of the keys the list names, never a word.
+        let keys = [
+            "⏎",
+            "a",
+            "c",
+            "?",
+            "q",
+            "r",
+            "S",
+            "l",
+            "x",
+            "d",
+            "m",
+            "F",
+            "f",
+            "n",
+            "y",
+            "i",
+            "K J  Shift+↑ ↓",
+            "⏎  Space",
+            "n  Esc",
+            "Esc",
+            "↑ ↓  j k",
+            "← →  Tab  1 2 3",
+            "any other key",
+        ];
+        let runs = |rows: &[String], buf: &ratatui::buffer::Buffer| {
+            let mut out = vec![];
+            for (y, row) in rows.iter().enumerate().skip(1) {
+                if row.contains('╭') {
+                    continue;
+                }
+                let mut run = String::new();
+                for (x, c) in row.chars().enumerate() {
+                    if is_key(buf, x as u16, y as u16) {
+                        run.push(c);
+                    } else if !run.is_empty() {
+                        out.push((y, std::mem::take(&mut run)));
+                    }
+                }
+                if !run.is_empty() {
+                    out.push((y, run));
+                }
+            }
+            out
+        };
+        let mut seen = 0;
         for section in Section::ORDER {
             let mut a = movable();
             a.section = section;
@@ -5892,19 +5963,32 @@ mod tests {
                 statusline: false,
             };
             a.info.insert("work".into(), Info::default());
+            a.flash_keys(
+                theme::named(
+                    "notes",
+                    " opened since; nothing was closed. Press `d` again",
+                ),
+                theme::YELLOW,
+            );
             let (rows, buf) = drawn(&mut a, 160, 40);
-            for y in 1..40u16 {
-                for x in 0..160u16 {
-                    if is_key(&buf, x, y) {
-                        let s = buf[(x, y)].symbol();
-                        assert!(
-                            allowed.contains(s),
-                            "{s:?} at {x},{y}: {}",
-                            rows[y as usize]
-                        );
-                    }
-                }
+            for (y, run) in runs(&rows, &buf) {
+                assert!(
+                    keys.contains(&run.trim()),
+                    "{run:?} on row {y}: {}",
+                    rows[y]
+                );
+                seen += 1;
             }
         }
+        let (_, rows, _, t) = help_on(160, 60, opens);
+        for (y, run) in runs(&rows, t.backend().buffer()) {
+            assert!(
+                keys.contains(&run.trim()),
+                "{run:?} on row {y}: {}",
+                rows[y]
+            );
+            seen += 1;
+        }
+        assert!(seen > 30, "{seen} keys seen");
     }
 }

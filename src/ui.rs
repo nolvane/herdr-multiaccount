@@ -35,6 +35,24 @@ pub fn with_keys(text: impl AsRef<str>, style: Style) -> Vec<Span<'static>> {
         .collect()
 }
 
+/// `text` wrapped to `width`, with its keys drawn as keys. A key that the
+/// wrap splits (one with a space in it) stays a key on both lines.
+fn wrap_with_keys(text: &str, width: usize, style: Style) -> Vec<Line<'static>> {
+    let mut open = false;
+    wrap(text, width)
+        .into_iter()
+        .map(|l| {
+            let l = if open {
+                format!("{}{l}", theme::KEY_MARK)
+            } else {
+                l
+            };
+            open = l.matches(theme::KEY_MARK).count() % 2 == 1;
+            Line::from(with_keys(l, style))
+        })
+        .collect()
+}
+
 /// `with_keys` for a text in one colour.
 pub fn keyed(text: impl AsRef<str>, color: ratatui::style::Color) -> Vec<Span<'static>> {
     with_keys(text, Style::new().fg(color))
@@ -1312,9 +1330,7 @@ fn draw_message(frame: &mut Frame, app: &mut App, title: &str, text: &[String], 
         } else {
             Style::new().fg(if good { MUTED } else { YELLOW })
         };
-        for l in wrap(t, width.saturating_sub(6) as usize) {
-            lines.push(Line::from(with_keys(l, style)));
-        }
+        lines.extend(wrap_with_keys(t, width.saturating_sub(6) as usize, style));
     }
     let area = centered(frame.area(), width, lines.len() as u16 + 5);
     let inner = dialog(frame, area, title);
@@ -1460,9 +1476,11 @@ fn draw_help(frame: &mut Frame, app: &mut App) {
             if i > 0 {
                 out.push(Line::from(""));
             }
-            for l in wrap(&theme::keys(p), width) {
-                out.push(Line::from(keyed(l, MUTED)));
-            }
+            out.extend(wrap_with_keys(
+                &theme::keys(p),
+                width,
+                Style::new().fg(MUTED),
+            ));
         }
         out
     };
@@ -1610,6 +1628,32 @@ mod tests {
         assert_eq!(spans[1].style.fg, Some(ACCENT));
         assert_eq!(spans[2].style, grey);
         assert_eq!(keyed("no keys", MUTED).len(), 1);
+    }
+
+    #[test]
+    fn a_key_split_by_the_wrap_stays_a_key_on_both_lines() {
+        let lines = wrap_with_keys(
+            &theme::keys("press `any other key` to stay here"),
+            12,
+            Style::new().fg(MUTED),
+        );
+        let looks: Vec<Vec<(String, bool)>> = lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| (s.content.to_string(), s.style.fg == Some(ACCENT)))
+                    .collect()
+            })
+            .collect();
+        assert_eq!(
+            looks,
+            vec![
+                vec![("press ".into(), false), ("any".into(), true)],
+                vec![("other key".into(), true), (" to".into(), false)],
+                vec![("stay here".into(), false)],
+            ]
+        );
     }
 
     #[test]

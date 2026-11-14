@@ -68,12 +68,12 @@ pub fn same_as(store: &Store, account: &Account) -> Vec<String> {
 
 /// The warning after a sign-in that ended up with another account's login:
 /// the browser often signs in with whatever account it already has open.
-/// `l` is the key as it should stand there: marked for the list
-/// (`theme::keys`), plain for a terminal.
-pub fn same_login_note(names: &[String], l: &str) -> String {
-    format!(
-        "That is the same login as {}. If you meant another account, sign out in the browser (or use a private window) and press {l} to sign in again.",
-        crate::theme::plain(&names.join(", "))
+/// Its key `l` is marked for the list (`theme::keys`); a terminal gets it
+/// through `theme::plain`.
+pub fn same_login_note(names: &[String]) -> String {
+    crate::theme::named(
+        &format!("That is the same login as {}", names.join(", ")),
+        ". If you meant another account, sign out in the browser (or use a private window) and press `l` to sign in again.",
     )
 }
 
