@@ -868,8 +868,11 @@ settings as a project's. Whether this removes the EPERM can only be
 confirmed on the Mac where it happened.
 
 In the same change, a failed sign-in opens a dialog with everything Claude
-Code printed after the sign-in link (the footer note kept 120 characters
-of the last line), and the list reads `accounts.json` with
+Code printed (the footer note kept 120 characters of the last line). Not
+only what followed the link: standard output and error are read apart, so
+an error can arrive before the link, and an error can hold a link of its
+own. The message dialog scrolls when it is taller than the pane. The
+list reads `accounts.json` with
 `Store::try_load`: a file it cannot read keeps the accounts shown, with a
 note, instead of falling back to the main login alone. An account added
 for a sign-in that fails is still removed (the owner's decision on #25),

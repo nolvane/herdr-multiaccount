@@ -401,7 +401,13 @@ pub struct App {
 
 impl App {
     pub fn new(config: Config, dir: PathBuf) -> App {
-        let (store, unread) = match Store::try_load() {
+        // Tests start from the default store, never the real file.
+        let loaded = if cfg!(test) {
+            Ok(Store::default())
+        } else {
+            Store::try_load()
+        };
+        let (store, unread) = match loaded {
             Ok(store) => (store, None),
             Err(e) => (Store::default(), Some(e)),
         };
@@ -478,7 +484,7 @@ impl App {
             store_error: None,
         };
         if let Some(e) = unread {
-            app.store_unreadable(e);
+            app.store_unreadable(e, false);
         }
         app
     }
@@ -503,7 +509,7 @@ impl App {
                 self.store = store;
                 self.store_error = None;
             }
-            Err(e) => self.store_unreadable(e),
+            Err(e) => self.store_unreadable(e, true),
         }
         self.twins = crate::login::twins(&self.store, &crate::login::all(&self.store));
         self.usage = launch::load_usage_with(&self.store, &self.twins);
@@ -517,13 +523,22 @@ impl App {
         self.next_files = Instant::now() + Duration::from_secs(3);
     }
 
-    /// Says in the footer that `accounts.json` could not be read: when it
-    /// starts, when the reason changes, and again once another note is
-    /// gone, as long as it lasts.
-    fn store_unreadable(&mut self, e: std::io::Error) {
-        let text = format!(
-            "accounts.json could not be read ({e}); the list shows the accounts from before"
-        );
+    /// Says in the footer that `accounts.json` could not be read (`kept`:
+    /// the list keeps the accounts it showed; otherwise it just opened):
+    /// when it starts, when the reason changes, and again once another
+    /// note is gone, as long as it lasts.
+    fn store_unreadable(&mut self, e: std::io::Error, kept: bool) {
+        let text = if kept && self.store_error.is_none() {
+            format!(
+                "accounts.json could not be read ({e}); the list shows the accounts from before"
+            )
+        } else if kept {
+            // Still unreadable: the same words as before, so the note is
+            // not shown again and again.
+            self.store_error.clone().unwrap_or_default()
+        } else {
+            format!("accounts.json could not be read ({e}); only the main login shows until it can")
+        };
         if self.store_error.as_deref() != Some(&text) || self.flash.is_none() {
             self.flash(text.clone(), crate::theme::RED);
         }
@@ -2034,17 +2049,17 @@ impl App {
                 lines,
                 good: same.is_empty(),
             };
-        } else if s.cancelled {
-            if s.new_account {
-                self.drop_new_account(&s.id);
-            }
-            self.mode = Mode::Normal;
-            self.flash(format!("{}: sign-in cancelled", s.name), crate::theme::RED);
         } else {
             if s.new_account {
                 self.drop_new_account(&s.id);
             }
-            self.mode = sign_in_failed(&s, ok);
+            if s.cancelled {
+                self.mode = Mode::Normal;
+                self.flash(format!("{}: sign-in cancelled", s.name), crate::theme::RED);
+            } else {
+                let kept = !s.new_account && self.store.account(&s.id).is_some();
+                self.mode = sign_in_failed(&s, ok, kept);
+            }
         }
     }
 
@@ -2541,14 +2556,15 @@ impl App {
                 }
                 _ => {}
             },
-            Mode::Message { .. } => {
-                if matches!(
-                    k.code,
-                    KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') | KeyCode::Char(' ')
-                ) {
+            Mode::Message { .. } => match k.code {
+                KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') | KeyCode::Char(' ') => {
                     self.mode = Mode::Normal;
                 }
-            }
+                // A message taller than the pane (Claude Code's error).
+                KeyCode::Up | KeyCode::Char('k') => self.scroll_message(-1),
+                KeyCode::Down | KeyCode::Char('j') => self.scroll_message(1),
+                _ => {}
+            },
             Mode::SignIn { mut code } => match k.code {
                 KeyCode::Esc => {
                     if let Some(s) = self.signin.as_mut() {
@@ -2792,6 +2808,12 @@ impl App {
                         self.scroll_confirm(by, c);
                     }
                 }
+                MouseEventKind::ScrollDown if matches!(self.mode, Mode::Message { .. }) => {
+                    self.scroll_message(1)
+                }
+                MouseEventKind::ScrollUp if matches!(self.mode, Mode::Message { .. }) => {
+                    self.scroll_message(-1)
+                }
                 MouseEventKind::ScrollDown => {
                     if let Mode::Pick(mut p) = self.mode.clone() {
                         p.sel = (p.sel + 1).min(p.items.len().saturating_sub(1));
@@ -2814,6 +2836,13 @@ impl App {
         }
     }
 
+    /// Scrolls a message taller than the pane (with the question's
+    /// scroll state: only one of them is open at a time).
+    fn scroll_message(&mut self, by: i32) {
+        self.confirm_scroll =
+            (self.confirm_scroll as i32 + by).clamp(0, self.confirm_max as i32) as u16;
+    }
+
     /// Scrolls a question taller than the pane; it stays open.
     fn scroll_confirm(&mut self, by: i32, c: Confirm) {
         self.confirm_scroll =
@@ -2827,7 +2856,9 @@ impl App {
 
     /// The note on how the list works, once, on first open.
     fn show_intro(&mut self) {
-        if self.store.intro_seen || !matches!(self.mode, Mode::Normal) {
+        // Not while accounts.json cannot be read: it could not note it.
+        if self.store.intro_seen || self.store_error.is_some() || !matches!(self.mode, Mode::Normal)
+        {
             return;
         }
         if self.update(|s| s.intro_seen = true) {
@@ -3028,30 +3059,34 @@ fn sign_out_folder(claude: &std::path::Path, dir: &std::path::Path, limit: Durat
 }
 
 /// The dialog for a sign-in that ended without a login (not cancelled):
-/// Claude Code's whole message, and what became of the account. `ok`:
-/// Claude Code reported success, but the folder has no login of its own.
-fn sign_in_failed(s: &SignIn, ok: bool) -> Mode {
+/// everything Claude Code printed, and what became of the account. `ok`:
+/// Claude Code reported success, but no login of the folder's own was
+/// found afterwards. `kept`: the account is still in the list.
+fn sign_in_failed(s: &SignIn, ok: bool, kept: bool) -> Mode {
     let mut lines = vec![if ok {
-        "Claude Code said the sign-in worked, but the account's folder has no login of its own afterwards.".to_string()
+        "Claude Code said the sign-in worked, but the account's login could not be confirmed afterwards.".to_string()
     } else {
-        "Claude Code's sign-in ended without a login. It said:".to_string()
+        "Claude Code's sign-in ended without a login. It printed:".to_string()
     }];
-    let said = s.said();
     if !ok {
-        lines.push(if said.is_empty() {
+        let printed = s.printed();
+        lines.push(if printed.is_empty() {
             "(nothing)".into()
         } else {
-            theme::plain(&said)
+            theme::plain(&printed)
         });
     }
-    lines.push(if s.new_account {
-        theme::named(
+    if s.new_account {
+        lines.push(theme::named(
             &s.name,
             " was added for this sign-in, so it is removed from the list again. Add it with `a` to try once more.",
-        )
-    } else {
-        theme::named(&s.name, " stays in the list: `l` signs it in again.")
-    });
+        ));
+    } else if kept {
+        lines.push(theme::named(
+            &s.name,
+            " stays in the list: `l` signs it in again.",
+        ));
+    }
     Mode::Message {
         title: format!("{} was not signed in", s.name),
         lines,
@@ -6401,9 +6436,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir.parent().unwrap());
     }
 
-    /// What a failed sign-in prints: the link, then a Node error over
-    /// several lines (on one stream, so the order is certain).
-    const EPERM_SIGN_IN: &str = "{ printf 'Opening browser to sign in\\nIf the browser did not open, visit: https://claude.example/oauth?x=1\\n'; printf 'Error: EPERM: operation not permitted, scandir /Users/alex/gone\\n    at Object.readdirSync (node:fs:1507:3)\\n    at main (cli.js:12:5)\\n'; } >&2; exit 1";
+    /// What a failed sign-in prints: the link on standard output, then a
+    /// Node error over several lines on standard error (the two are read
+    /// apart, so their order in the output is not certain).
+    const EPERM_SIGN_IN: &str = "printf 'Opening browser to sign in\\nIf the browser did not open, visit: https://claude.example/oauth?x=1\\n'; printf 'Error: EPERM: operation not permitted, scandir /Users/alex/gone\\n    at Object.readdirSync (node:fs:1507:3)\\n    at main (cli.js:12:5)\\n' >&2; exit 1";
 
     /// Runs a scripted sign-in to its end, as the list's loop would.
     fn sign_in_with(a: &mut App, script: &str, id: &str, new_account: bool) {
@@ -6436,8 +6472,9 @@ mod tests {
             ] {
                 assert!(text.contains(part), "{part:?} missing: {text}");
             }
-            // Only what came after the link.
-            assert!(!text.contains("Opening browser"), "{text}");
+            // Everything Claude Code printed, whatever order the two
+            // streams arrived in.
+            assert!(text.contains("Opening browser to sign in"), "{text}");
             assert!(text.contains("stays in the list"), "{text}");
             // The drawn dialog keeps the error's lines apart.
             let screen = screen_of(&mut a, 100, 30).join("\n");
@@ -6448,7 +6485,7 @@ mod tests {
             assert!(
                 screen
                     .lines()
-                    .any(|l| l.contains("at Object.readdirSync") && !l.contains("Error")),
+                    .any(|l| l.contains("     at Object.readdirSync") && !l.contains("Error")),
                 "{screen}"
             );
             // The account is still there, shown and stored.
@@ -6458,6 +6495,25 @@ mod tests {
             press(&mut a, close);
             assert_eq!(a.mode, Mode::Normal);
         }
+    }
+
+    /// #25: a message taller than the pane scrolls, so its last lines can
+    /// be read.
+    #[test]
+    fn a_long_sign_in_error_scrolls() {
+        let mut a = app();
+        let script = "i=0; while [ $i -lt 40 ]; do echo \"    at frame$i (cli.js:$i:1)\" >&2; i=$((i+1)); done; exit 1";
+        sign_in_with(&mut a, script, "personal", false);
+        let screen = screen_of(&mut a, 80, 20).join("\n");
+        assert!(screen.contains("more lines"), "{screen}");
+        assert!(!screen.contains("stays in the list"), "{screen}");
+        for _ in 0..a.confirm_max {
+            press(&mut a, KeyCode::Char('j'));
+        }
+        let screen = screen_of(&mut a, 80, 20).join("\n");
+        assert!(screen.contains("stays in the list"), "{screen}");
+        assert!(screen.contains("scroll · end"), "{screen}");
+        assert!(matches!(a.mode, Mode::Message { .. }));
     }
 
     /// #25, decision A: an account added for the sign-in is removed again,
@@ -6486,7 +6542,7 @@ mod tests {
     fn a_cancelled_sign_in_is_only_a_footer_note() {
         let mut a = app();
         a.signin = Some(SignIn::scripted(
-            "printf 'visit: https://claude.example/oauth\\nPaste code here if prompted > '; sleep 30",
+            "printf 'visit: https://claude.example/oauth\\nPaste code here if prompted > '; exec sleep 30",
             "personal",
             "Personal",
             false,

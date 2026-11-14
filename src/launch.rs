@@ -389,7 +389,7 @@ fn sign_in_here(store: &Store, id: &str) -> bool {
 }
 
 /// The real `claude` on `PATH` (the shell function is not on `PATH`, and
-/// this binary never is called `claude`).
+/// this binary never is called `claude`), as an absolute path.
 pub fn find_claude() -> Option<PathBuf> {
     let me = std::env::current_exe()
         .ok()
@@ -407,7 +407,9 @@ pub fn find_claude() -> Option<PathBuf> {
         if candidate.canonicalize().ok() == me {
             continue;
         }
-        return Some(candidate);
+        // Absolute, since the plugin's own `claude` calls run in another
+        // folder (`in_work_dir`) than a relative PATH entry is meant for.
+        return Some(std::path::absolute(&candidate).unwrap_or(candidate));
     }
     // The installers' places, for shells whose PATH misses them.
     [".local/bin/claude", ".claude/local/claude"]

@@ -30,6 +30,9 @@ pub struct SignIn {
     pub code_sent: bool,
     /// Ended by `cancel` (`Esc`), not by Claude Code.
     pub cancelled: bool,
+    /// Claude Code ended (whether it reported success, and when), while
+    /// its last output may still be on the way.
+    exited: Option<(bool, Instant)>,
 }
 
 /// Text without terminal escape codes (colours, and the link markers that
@@ -209,6 +212,7 @@ impl SignIn {
             started: Instant::now(),
             code_sent: false,
             cancelled: false,
+            exited: None,
         })
     }
 
@@ -256,24 +260,27 @@ impl SignIn {
             started: Instant::now(),
             code_sent: false,
             cancelled: false,
+            exited: None,
         }
     }
 
-    /// Takes in new output and notices when Claude Code is done.
+    /// Takes in new output and notices when Claude Code is done: once it
+    /// ended and its output is in (both pipes closed, or half a second
+    /// later, since something it started may keep them open). Never waits.
     pub fn poll(&mut self) {
-        let _ = self.take_output();
-        if self.finished.is_none() {
+        let closed = self.take_output();
+        if self.finished.is_some() {
+            return;
+        }
+        if self.exited.is_none() {
             if let Ok(Some(status)) = self.child.try_wait() {
-                // Late output still in the pipes: until both are closed,
-                // at most half a second (something Claude Code started may
-                // keep them open).
-                let until = Instant::now() + std::time::Duration::from_millis(500);
-                while !self.take_output() && Instant::now() < until {
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                }
-                self.finished = Some(
-                    status.success() && self.output.to_lowercase().contains("login successful"),
-                );
+                self.exited = Some((status.success(), Instant::now()));
+            }
+        }
+        if let Some((success, at)) = self.exited {
+            if closed || at.elapsed() >= std::time::Duration::from_millis(500) {
+                self.finished =
+                    Some(success && self.output.to_lowercase().contains("login successful"));
             }
         }
     }
@@ -311,24 +318,26 @@ impl SignIn {
         ok
     }
 
+    /// Stops the sign-in. One that Claude Code already ended is left to
+    /// `poll`, so its own end (and message) counts, not a cancel.
     pub fn cancel(&mut self) {
-        if self.finished.is_none() {
-            let _ = self.child.kill();
-            let _ = self.child.wait();
-            self.finished = Some(false);
-            self.cancelled = true;
+        if self.finished.is_some() {
+            return;
         }
+        if self.exited.is_some() || matches!(self.child.try_wait(), Ok(Some(_))) {
+            return;
+        }
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        self.finished = Some(false);
+        self.cancelled = true;
     }
 
-    /// What Claude Code printed after the sign-in link (all of it when it
-    /// showed none), line by line, for a sign-in that failed.
-    pub fn said(&self) -> String {
-        let after = self
-            .url
-            .as_deref()
-            .and_then(|u| self.output.rfind(u).map(|i| i + u.len()))
-            .unwrap_or(0);
-        let lines: Vec<&str> = self.output[after..].lines().map(str::trim_end).collect();
+    /// Everything Claude Code printed, line by line, for a sign-in that
+    /// failed. Standard output and error are read apart, so their order is
+    /// not certain: nothing is left out on that account.
+    pub fn printed(&self) -> String {
+        let lines: Vec<&str> = self.output.lines().map(str::trim_end).collect();
         lines.join("\n").trim_matches('\n').to_string()
     }
 }

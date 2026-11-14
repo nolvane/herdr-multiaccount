@@ -1331,6 +1331,7 @@ fn draw_sign_in(frame: &mut Frame, app: &mut App, code: &str) {
 
 fn draw_message(frame: &mut Frame, app: &mut App, title: &str, text: &[String], good: bool) {
     let width = 78u16.min(frame.area().width.saturating_sub(2)).max(24);
+    let room_w = width.saturating_sub(6) as usize;
     let mut lines: Vec<Line> = Vec::new();
     for (i, t) in text.iter().enumerate() {
         if i > 0 {
@@ -1341,27 +1342,59 @@ fn draw_message(frame: &mut Frame, app: &mut App, title: &str, text: &[String], 
         } else {
             Style::new().fg(if good { MUTED } else { YELLOW })
         };
-        // A text's own line breaks stay (Claude Code's message over
-        // several lines).
+        // A text's own line breaks and indents stay (Claude Code's
+        // message over several lines, a stack's indented lines).
         for part in t.split('\n') {
-            let wrapped = wrap_with_keys(part, width.saturating_sub(6) as usize, style);
+            let indent = (part.len() - part.trim_start().len()).min(8);
+            let wrapped = wrap_with_keys(part, room_w.saturating_sub(indent), style);
             if wrapped.is_empty() {
                 lines.push(Line::from(""));
             }
-            lines.extend(wrapped);
+            lines.extend(wrapped.into_iter().map(|l| {
+                let mut spans = vec![Span::raw(" ".repeat(indent))];
+                spans.extend(l.spans);
+                Line::from(spans)
+            }));
         }
     }
-    let area = centered(frame.area(), width, lines.len() as u16 + 5);
+    let n = lines.len() as u16;
+    let mut area = centered(frame.area(), width, n + 5);
+    if area.height < n + 5 {
+        // A short pane: the whole height, over the tabs and the footer.
+        area.y = frame.area().y;
+        area.height = frame.area().height;
+    }
     let inner = dialog(frame, area, title);
+    // On a short pane the blank lines around the text go first.
+    let (top, rest) = if inner.height < n + 3 { (0, 1) } else { (1, 3) };
+    // Taller than the pane: the text scrolls, with a line that says so
+    // (the scroll state is the question's: one dialog is open at a time).
+    let room = inner.height.saturating_sub(rest);
+    let hint = n > room && room >= 2;
+    let visible = if hint { room - 1 } else { room };
+    let shown = format!("{title}\n{}", text.join("\n"));
+    if app.confirm_of != shown {
+        app.confirm_of = shown;
+        app.confirm_scroll = 0;
+    }
+    app.confirm_max = n.saturating_sub(visible);
+    app.confirm_scroll = app.confirm_scroll.min(app.confirm_max);
     frame.render_widget(
-        Paragraph::new(Text::from(lines)),
-        Rect::new(
-            inner.x,
-            inner.y + 1,
-            inner.width,
-            inner.height.saturating_sub(3),
-        ),
+        Paragraph::new(Text::from(lines)).scroll((app.confirm_scroll, 0)),
+        Rect::new(inner.x, inner.y + top, inner.width, visible),
     );
+    if hint {
+        let left = app.confirm_max - app.confirm_scroll;
+        let hint = if left == 0 {
+            theme::keys("`↑ ↓` scroll · end")
+        } else {
+            theme::keys(&format!("`↑ ↓` scroll · {left} more lines"))
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(keyed(hint, FAINT))),
+            Rect::new(inner.x, inner.y + top + visible, inner.width, 1),
+        );
+    }
     let y = inner.y + inner.height.saturating_sub(1);
     frame.render_widget(
         Paragraph::new(Line::from(vec![Span::styled(

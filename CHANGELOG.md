@@ -61,11 +61,11 @@ All notable changes to this project are documented here. The format follows
   now run in the plugin's own `probe/` folder, as the limit checks do, so a
   folder that was removed or that macOS blocks no longer makes them fail
   until the list is restarted (#25).
-- A sign-in that fails opens a dialog with Claude Code's whole message,
-  line by line, instead of a cut-off footer note, and says what became of
-  the account: an existing one stays in the list, one added for the
-  sign-in is removed again. Cancelling with `Esc` stays a footer note
-  (#25).
+- A sign-in that fails opens a dialog with everything Claude Code printed,
+  line by line (it scrolls when it is taller than the pane), instead of a
+  cut-off footer note, and says what became of the account: an existing
+  one stays in the list, one added for the sign-in is removed again.
+  Cancelling with `Esc` stays a footer note (#25).
 - While `accounts.json` cannot be read, the list keeps the accounts it
   shows and says so in the footer, instead of showing only the main login
   (#25).
