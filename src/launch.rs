@@ -357,7 +357,7 @@ fn sign_in_here(store: &Store, id: &str) -> bool {
     mirror::mark_moved(&mirror::home_of(id));
     let same = login::same_as(store, account);
     if !same.is_empty() {
-        eprintln!("herdr-multiaccount: {}", login::same_login_note(&same));
+        eprintln!("herdr-multiaccount: {}", login::same_login_note(&same, "l"));
     }
     true
 }

@@ -26,6 +26,12 @@ All notable changes to this project are documented here. The format follows
   again. The question names what carries over, and scrolls when it is
   taller than the pane.
 - The Sessions tab is called Agents, the word Herdr's sidebar uses.
+- Every key the list names is bold and in the accent colour, as in the
+  other Herdr plugins: in the footer, the dialogs' footers, the `?` help,
+  on grey buttons and inside a sentence ("not signed in · `l` signs in").
+  What a key does stays in a quieter colour; the word "active" and the
+  headings in the help turn white, so the accent colour in a text means a
+  key (#18).
 
 ### Fixed
 

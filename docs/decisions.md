@@ -649,3 +649,39 @@ picking the account, so a limit fallback never lands on a signed-out
 account either; it still asks Claude Code once per start for a subscription
 (the cost #22 is about). Ask-then-fall-back was the owner's choice over
 falling back silently or only asking.
+
+## 2026-11-14: A key has one look, also inside a sentence
+
+Every key the list names is bold and in the accent colour (`key_style` in
+`ui.rs`): in the footer and the `r` in front of the status, the footers of
+the picker, the text field and the sign-in dialog, the help's key column,
+on grey buttons (the no button, "any other key stays", the popups' "Esc
+later" and "Esc close"), and inside a sentence (the status line's "`l`
+signs in", the setup notice's `S`, notes and messages that name a key,
+the note on how the list works). What a key does stands beside it in a
+quieter colour. The word "active" in the status line and the help's
+headings turn white, so the accent colour in a text means a key; the
+accent `●` in front of the row still marks the active account. Titles
+(the list's, a dialog's, the reminder popup's) keep their bold accent, as
+in herdr-routines: they stand alone in a border or at the top of a box
+(the owner's answer on #18). Coloured block buttons (`y yes`, `y close`,
+`⏎ ok`, `⏎ Go to session`) stay one block, since an accent key on green,
+red or accent would not read.
+
+A key inside a sentence is written between backticks in the source
+("`l` signs in"); `theme::keys` turns each backtick into U+2060 (word
+joiner), and `with_keys` draws what stands between two of them as a key.
+Only texts written in the code go through `theme::keys`, never a name, a
+pane label or an error's text, which may hold backticks of their own.
+
+- The same building blocks and look as herdr-routines (its decision of
+  2026-11-11) and herdr-git-panel, so the plugins look alike.
+- The mark has no width, and the drawn spans hold no mark, so `wrap`,
+  `shorten` and every click area stay as they were. The popups measure
+  their grey button by display width, not by bytes.
+- Notes in the footer go through `App::flash`, which takes any mark out,
+  since they often hold a name or an error; `App::flash_keys` is for the
+  list's own notes that name a key, with names put in through
+  `theme::plain`. The same-login note marks `l` only for the list; the
+  launcher prints it plain to the terminal, and a Herdr notification
+  never gets a mark.
