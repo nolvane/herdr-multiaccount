@@ -392,15 +392,23 @@ pub struct App {
     pub signer: Signer,
     pub folder_remover: FolderRemover,
     pub usage_remover: UsageRemover,
+    /// Reads `accounts.json`; tests read their own store.
+    pub store_loader: fn() -> std::io::Result<Store>,
+    /// Why `accounts.json` could not be read at the last try, while it
+    /// cannot.
+    store_error: Option<String>,
 }
 
 impl App {
     pub fn new(config: Config, dir: PathBuf) -> App {
-        let store = Store::load();
+        let (store, unread) = match Store::try_load() {
+            Ok(store) => (store, None),
+            Err(e) => (Store::default(), Some(e)),
+        };
         let twins = crate::login::twins(&store, &crate::login::all(&store));
         let usage = launch::load_usage_with(&store, &twins);
         let moves_dir = dir.join(relocate::MOVING);
-        App {
+        let mut app = App {
             config,
             dir,
             store,
@@ -466,7 +474,13 @@ impl App {
             usage_remover: |id| {
                 let _ = std::fs::remove_file(paths::usage_dir().join(format!("{id}.json")));
             },
+            store_loader: Store::try_load,
+            store_error: None,
+        };
+        if let Some(e) = unread {
+            app.store_unreadable(e);
         }
+        app
     }
 
     // ---- data -------------------------------------------------------
@@ -482,7 +496,15 @@ impl App {
     /// Accounts.json and the usage readings, which the status line writes.
     fn reload_files(&mut self) {
         let keep = self.selected().map(|a| a.id.clone());
-        self.store = Store::load();
+        // A file that cannot be read never empties the list: it keeps the
+        // accounts it shows (changes are refused anyway, `Store::update`).
+        match (self.store_loader)() {
+            Ok(store) => {
+                self.store = store;
+                self.store_error = None;
+            }
+            Err(e) => self.store_unreadable(e),
+        }
         self.twins = crate::login::twins(&self.store, &crate::login::all(&self.store));
         self.usage = launch::load_usage_with(&self.store, &self.twins);
         if let Some(id) = keep {
@@ -493,6 +515,19 @@ impl App {
         self.sel = self.sel.min(self.store.accounts.len().saturating_sub(1));
         self.read_at = Instant::now();
         self.next_files = Instant::now() + Duration::from_secs(3);
+    }
+
+    /// Says in the footer that `accounts.json` could not be read: when it
+    /// starts, when the reason changes, and again once another note is
+    /// gone, as long as it lasts.
+    fn store_unreadable(&mut self, e: std::io::Error) {
+        let text = format!(
+            "accounts.json could not be read ({e}); the list shows the accounts from before"
+        );
+        if self.store_error.as_deref() != Some(&text) || self.flash.is_none() {
+            self.flash(text.clone(), crate::theme::RED);
+        }
+        self.store_error = Some(text);
     }
 
     fn start_herdr(&mut self) {
@@ -693,7 +728,7 @@ impl App {
             self.mark_tried(id, at);
         }
         let interval = self.config.check_limits as i64;
-        let cwd = paths::config_dir().join("probe");
+        let cwd = launch::work_dir();
         let (tx, rx) = channel();
         std::thread::spawn(move || {
             for (login, id, home) in targets {
@@ -1948,6 +1983,12 @@ impl App {
             return;
         };
         let s = self.signin.take().expect("checked above");
+        self.sign_in_ended(s, ok);
+        self.start_info();
+    }
+
+    /// Shows how a sign-in ended (`ok`: Claude Code reported success).
+    fn sign_in_ended(&mut self, s: SignIn, ok: bool) {
         let account = self.store.account(&s.id).cloned();
         let was_old = self.info.get(&s.id).is_some_and(|i| i.old_folder);
         // A sign-in that failed needs no check (Claude Code may hang).
@@ -1993,26 +2034,18 @@ impl App {
                 lines,
                 good: same.is_empty(),
             };
+        } else if s.cancelled {
+            if s.new_account {
+                self.drop_new_account(&s.id);
+            }
+            self.mode = Mode::Normal;
+            self.flash(format!("{}: sign-in cancelled", s.name), crate::theme::RED);
         } else {
             if s.new_account {
                 self.drop_new_account(&s.id);
             }
-            let reason = if s.code_sent || !s.last_line().is_empty() {
-                s.last_line()
-            } else {
-                String::new()
-            };
-            self.mode = Mode::Normal;
-            self.flash(
-                if reason.is_empty() || reason.to_lowercase().contains("paste code") {
-                    format!("{}: sign-in cancelled", s.name)
-                } else {
-                    format!("{}: not signed in ({reason})", s.name)
-                },
-                crate::theme::RED,
-            );
+            self.mode = sign_in_failed(&s, ok);
         }
-        self.start_info();
     }
 
     fn sign_in_again(&mut self) {
@@ -2343,7 +2376,7 @@ impl App {
                     Err(e) => self.flash(e, crate::theme::RED),
                 }
                 self.setup = setup::state();
-                self.store = Store::load();
+                self.reload_files();
             }
         }
     }
@@ -2985,12 +3018,45 @@ fn sign_out_folder(claude: &std::path::Path, dir: &std::path::Path, limit: Durat
     // Clean first: it may remove CLAUDE_CONFIG_DIR, and without it the main
     // login would be signed out.
     launch::clean_env(&mut cmd);
+    launch::in_work_dir(&mut cmd);
     cmd.args(["auth", "logout"])
         .env("CLAUDE_CONFIG_DIR", dir)
         .stdin(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
     let _ = launch::run_within(&mut cmd, limit);
     own_login(dir) == Some(false)
+}
+
+/// The dialog for a sign-in that ended without a login (not cancelled):
+/// Claude Code's whole message, and what became of the account. `ok`:
+/// Claude Code reported success, but the folder has no login of its own.
+fn sign_in_failed(s: &SignIn, ok: bool) -> Mode {
+    let mut lines = vec![if ok {
+        "Claude Code said the sign-in worked, but the account's folder has no login of its own afterwards.".to_string()
+    } else {
+        "Claude Code's sign-in ended without a login. It said:".to_string()
+    }];
+    let said = s.said();
+    if !ok {
+        lines.push(if said.is_empty() {
+            "(nothing)".into()
+        } else {
+            theme::plain(&said)
+        });
+    }
+    lines.push(if s.new_account {
+        theme::named(
+            &s.name,
+            " was added for this sign-in, so it is removed from the list again. Add it with `a` to try once more.",
+        )
+    } else {
+        theme::named(&s.name, " stays in the list: `l` signs it in again.")
+    });
+    Mode::Message {
+        title: format!("{} was not signed in", s.name),
+        lines,
+        good: false,
+    }
 }
 
 /// The notice when a removed account's login could not be signed out, with
@@ -3107,6 +3173,7 @@ mod tests {
         a.signer = answered_signer;
         a.folder_remover = |_| Ok(vec![]);
         a.usage_remover = |_| {};
+        a.store_loader = || Ok(stored());
         STORED.with(|s| *s.borrow_mut() = a.store.clone());
         a
     }
@@ -6314,6 +6381,152 @@ mod tests {
             &dir,
             Duration::from_secs(1)
         ));
+    }
+
+    /// #25: `auth status` and `auth logout` run in the plugin's own
+    /// folder, never where the list was opened.
+    #[test]
+    fn status_and_logout_run_in_the_work_folder() {
+        let (claude, dir) = fake_claude(
+            "cwd",
+            &format!("pwd -P > \"$CLAUDE_CONFIG_DIR/status-cwd\"; {SIGNED_IN}"),
+            "pwd -P > \"$CLAUDE_CONFIG_DIR/logout-cwd\"; touch \"$CLAUDE_CONFIG_DIR/out\"",
+        );
+        assert!(sign_out_folder(&claude, &dir, Duration::from_secs(10)));
+        let work = launch::work_dir().canonicalize().unwrap();
+        for f in ["status-cwd", "logout-cwd"] {
+            let cwd = std::fs::read_to_string(dir.join(f)).unwrap();
+            assert_eq!(cwd.trim(), work.to_string_lossy(), "{f}");
+        }
+        let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+    }
+
+    /// What a failed sign-in prints: the link, then a Node error over
+    /// several lines (on one stream, so the order is certain).
+    const EPERM_SIGN_IN: &str = "{ printf 'Opening browser to sign in\\nIf the browser did not open, visit: https://claude.example/oauth?x=1\\n'; printf 'Error: EPERM: operation not permitted, scandir /Users/alex/gone\\n    at Object.readdirSync (node:fs:1507:3)\\n    at main (cli.js:12:5)\\n'; } >&2; exit 1";
+
+    /// Runs a scripted sign-in to its end, as the list's loop would.
+    fn sign_in_with(a: &mut App, script: &str, id: &str, new_account: bool) {
+        let name = a.store.name_of(id);
+        let mut s = SignIn::scripted(script, id, &name, new_account);
+        a.mode = Mode::SignIn {
+            code: String::new(),
+        };
+        let ok = s.until_finished();
+        a.sign_in_ended(s, ok);
+    }
+
+    /// #25: a failed sign-in opens a dialog with Claude Code's whole
+    /// message, and an existing account stays in the list.
+    #[test]
+    fn a_failed_sign_in_shows_the_whole_error_and_keeps_the_account() {
+        for close in [KeyCode::Enter, KeyCode::Esc] {
+            let mut a = app();
+            sign_in_with(&mut a, EPERM_SIGN_IN, "personal", false);
+            let Mode::Message { title, lines, good } = &a.mode else {
+                panic!("no dialog: {:?}", a.mode)
+            };
+            assert_eq!(title, "Personal was not signed in");
+            assert!(!good);
+            let text = lines.join("\n");
+            for part in [
+                "Error: EPERM: operation not permitted, scandir /Users/alex/gone",
+                "    at Object.readdirSync (node:fs:1507:3)",
+                "    at main (cli.js:12:5)",
+            ] {
+                assert!(text.contains(part), "{part:?} missing: {text}");
+            }
+            // Only what came after the link.
+            assert!(!text.contains("Opening browser"), "{text}");
+            assert!(text.contains("stays in the list"), "{text}");
+            // The drawn dialog keeps the error's lines apart.
+            let screen = screen_of(&mut a, 100, 30).join("\n");
+            assert!(
+                screen.contains("Error: EPERM: operation not permitted"),
+                "{screen}"
+            );
+            assert!(
+                screen
+                    .lines()
+                    .any(|l| l.contains("at Object.readdirSync") && !l.contains("Error")),
+                "{screen}"
+            );
+            // The account is still there, shown and stored.
+            assert!(a.store.account("personal").is_some());
+            assert!(stored().account("personal").is_some());
+            assert!(a.signing_out.is_empty());
+            press(&mut a, close);
+            assert_eq!(a.mode, Mode::Normal);
+        }
+    }
+
+    /// #25, decision A: an account added for the sign-in is removed again,
+    /// and the dialog says so.
+    #[test]
+    fn a_failed_sign_in_of_a_new_account_says_it_is_removed() {
+        let mut a = app_with("fresh", "Fresh");
+        sign_in_with(&mut a, EPERM_SIGN_IN, "fresh", true);
+        let Mode::Message { title, lines, .. } = a.mode.clone() else {
+            panic!("no dialog: {:?}", a.mode)
+        };
+        assert_eq!(title, "Fresh was not signed in");
+        let text = lines.join("\n");
+        assert!(text.contains("Error: EPERM"), "{text}");
+        assert!(text.contains("removed from the list again"), "{text}");
+        assert!(a.is_signing_out("fresh"));
+        answer_sign_out("fresh", vec![]);
+        press(&mut a, KeyCode::Enter);
+        until_signed_out(&mut a);
+        assert!(stored().account("fresh").is_none());
+        assert!(stored().retired.iter().any(|r| r == "fresh"));
+    }
+
+    /// #25: cancelling a sign-in with Esc stays a note in the footer.
+    #[test]
+    fn a_cancelled_sign_in_is_only_a_footer_note() {
+        let mut a = app();
+        a.signin = Some(SignIn::scripted(
+            "printf 'visit: https://claude.example/oauth\\nPaste code here if prompted > '; sleep 30",
+            "personal",
+            "Personal",
+            false,
+        ));
+        a.mode = Mode::SignIn {
+            code: String::new(),
+        };
+        press(&mut a, KeyCode::Esc);
+        let mut s = a.signin.take().unwrap();
+        let ok = s.until_finished();
+        assert!(!ok);
+        a.sign_in_ended(s, ok);
+        assert_eq!(a.mode, Mode::Normal);
+        let flash = a.flash.as_ref().map(|f| f.0.clone()).unwrap_or_default();
+        assert_eq!(flash, "Personal: sign-in cancelled");
+        assert!(a.store.account("personal").is_some());
+    }
+
+    /// #25: while `accounts.json` cannot be read, the list keeps its
+    /// accounts, says so, and writes nothing.
+    #[test]
+    fn an_unreadable_accounts_file_keeps_the_list() {
+        let mut a = app_with("work", "Work");
+        let before = stored();
+        a.store_loader = || Err(std::io::Error::other("permission denied"));
+        a.reload_files();
+        assert!(a.store.account("work").is_some());
+        assert_eq!(a.store.accounts.len(), before.accounts.len());
+        let flash = a.flash.as_ref().map(|f| f.0.clone()).unwrap_or_default();
+        assert!(
+            flash.contains("accounts.json could not be read")
+                && flash.contains("permission denied"),
+            "{flash}"
+        );
+        assert_eq!(stored().accounts.len(), before.accounts.len());
+        // Readable again: the list follows the file.
+        a.store_loader = || Ok(stored());
+        a.flash = None;
+        a.reload_files();
+        assert!(a.store.account("work").is_some());
     }
 
     #[test]

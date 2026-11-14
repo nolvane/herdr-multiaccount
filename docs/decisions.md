@@ -851,3 +851,26 @@ setup run by hand (`S`, `herdr-multiaccount setup`) moves an absolute-path
 command of the plugin to the `$HOME` form, after the usual backup: the
 owner's choice over leaving old commands alone or rewriting them when the
 plugin starts.
+
+## 2026-11-14: Claude Code's own commands run in the plugin's folder
+
+A sign-in with `l` failed with Claude Code's "EPERM" on reading a folder,
+and worked again after the list was restarted (#25). Claude Code reads its
+working folder when it starts, and `claude auth login`, `auth status` and
+`auth logout` inherited the list's: a folder removed since the list opened,
+or one macOS privacy protection blocks, fits both. Every `claude` the
+plugin starts for itself now runs in `<config>/probe`
+(`launch::work_dir`), the folder the limit check already had, so Claude
+Code sees one folder of the plugin's, not two. Sessions keep the folder
+they are started in. Rejected: the account's own folder as the working
+folder, since Claude Code would then read the account's linked `.claude`
+settings as a project's. Whether this removes the EPERM can only be
+confirmed on the Mac where it happened.
+
+In the same change, a failed sign-in opens a dialog with everything Claude
+Code printed after the sign-in link (the footer note kept 120 characters
+of the last line), and the list reads `accounts.json` with
+`Store::try_load`: a file it cannot read keeps the accounts shown, with a
+note, instead of falling back to the main login alone. An account added
+for a sign-in that fails is still removed (the owner's decision on #25),
+and the dialog says so.

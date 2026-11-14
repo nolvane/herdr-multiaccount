@@ -1341,7 +1341,15 @@ fn draw_message(frame: &mut Frame, app: &mut App, title: &str, text: &[String], 
         } else {
             Style::new().fg(if good { MUTED } else { YELLOW })
         };
-        lines.extend(wrap_with_keys(t, width.saturating_sub(6) as usize, style));
+        // A text's own line breaks stay (Claude Code's message over
+        // several lines).
+        for part in t.split('\n') {
+            let wrapped = wrap_with_keys(part, width.saturating_sub(6) as usize, style);
+            if wrapped.is_empty() {
+                lines.push(Line::from(""));
+            }
+            lines.extend(wrapped);
+        }
     }
     let area = centered(frame.area(), width, lines.len() as u16 + 5);
     let inner = dialog(frame, area, title);

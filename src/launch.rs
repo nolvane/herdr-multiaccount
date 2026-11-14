@@ -416,6 +416,32 @@ pub fn find_claude() -> Option<PathBuf> {
         .find(|p| p.is_file())
 }
 
+/// The folder every `claude` the plugin starts for itself works in (the
+/// limit check, sign-in, `auth status`, `auth logout`), made if needed.
+/// Claude Code reads its working folder when it starts, so these never
+/// depend on where the list was opened: that folder may have been removed
+/// since, or macOS may block it. Sessions keep the folder they start in.
+/// In tests a temporary folder, never the real config directory.
+pub fn work_dir() -> PathBuf {
+    let dir = if cfg!(test) {
+        std::env::temp_dir().join(format!("hm-work-{}", std::process::id()))
+    } else {
+        paths::config_dir().join("probe")
+    };
+    let _ = std::fs::create_dir_all(&dir);
+    dir
+}
+
+/// Runs `cmd` in [`work_dir`] (where it inherits the caller's folder only
+/// when that one could not be made).
+pub fn in_work_dir(cmd: &mut Command) -> &mut Command {
+    let dir = work_dir();
+    if dir.is_dir() {
+        cmd.current_dir(dir);
+    }
+    cmd
+}
+
 /// Takes back what an outer start of this plugin set, so the account is
 /// decided afresh.
 pub fn clean_env(cmd: &mut Command) {

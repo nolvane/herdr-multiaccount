@@ -56,6 +56,19 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- Signing an account in with `l` no longer depends on the folder the list
+  was opened in: Claude Code's sign-in, its login check and its sign-out
+  now run in the plugin's own `probe/` folder, as the limit checks do, so a
+  folder that was removed or that macOS blocks no longer makes them fail
+  until the list is restarted (#25).
+- A sign-in that fails opens a dialog with Claude Code's whole message,
+  line by line, instead of a cut-off footer note, and says what became of
+  the account: an existing one stays in the list, one added for the
+  sign-in is removed again. Cancelling with `Esc` stays a footer note
+  (#25).
+- While `accounts.json` cannot be read, the list keeps the accounts it
+  shows and says so in the footer, instead of showing only the main login
+  (#25).
 - `claude` no longer leaves you without a way in when the account it would
   use is signed out: at a terminal it offers Claude Code's own sign-in for
   that account; otherwise, or after a no, the session moves to the next
