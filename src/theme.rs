@@ -64,6 +64,32 @@ impl Icons {
     }
 }
 
+/// Stands before and after a key in a text of the list's own, so the key
+/// is drawn bold and in the accent colour wherever the text ends up (see
+/// `keys`). It has no width: wrapping and measuring a text do not see it.
+pub const KEY_MARK: char = '\u{2060}';
+
+/// Marks the keys in a text of the list's own: they are written between
+/// backticks, as in "`l` signs in". Only for texts written here, never for
+/// a name, an error or anything else that came from outside, which may
+/// hold backticks of its own.
+pub fn keys(text: &str) -> String {
+    text.replace('`', "\u{2060}")
+}
+
+/// A name or other text from outside without any key mark, so no part of
+/// it is drawn as a key when it stands in a text that names one.
+pub fn plain(text: &str) -> String {
+    text.replace(KEY_MARK, "")
+}
+
+/// A name followed by a text of the list's own that names a key, such as
+/// "notes" + " changed since …. Press `d` again": the name is taken as it
+/// is (`plain`), only `rest` is marked (`keys`).
+pub fn named(name: &str, rest: &str) -> String {
+    format!("{}{}", plain(name), keys(rest))
+}
+
 /// Text colour that reads on a coloured background.
 pub fn on(bg: Color) -> Color {
     match bg {
@@ -100,5 +126,15 @@ mod tests {
         assert_eq!(level(75.0), YELLOW);
         assert_eq!(level(95.0), RED);
         assert_eq!(on(Color::Rgb(255, 255, 255)), Color::Rgb(0x16, 0x17, 0x22));
+    }
+
+    #[test]
+    fn a_key_mark_takes_no_room_and_names_lose_theirs() {
+        use unicode_width::UnicodeWidthStr;
+        let marked = keys("`l` signs in");
+        assert_eq!(marked, "\u{2060}l\u{2060} signs in");
+        assert_eq!(marked.width(), "l signs in".width());
+        assert_eq!(plain(&marked), "l signs in");
+        assert_eq!(plain("`x`"), "`x`", "a backtick in a name stays");
     }
 }
