@@ -115,10 +115,11 @@ pub fn status_text(home: Option<&std::path::Path>) -> Option<String> {
 /// What `claude auth status` said within a time limit.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Answer {
-    /// Its text; empty when it printed nothing or could not be started.
+    /// Its text (empty when it printed nothing).
     Text(String),
-    /// It did not end within the limit and was stopped.
-    TimedOut,
+    /// It could not be started, or did not end within the limit and was
+    /// stopped.
+    NoAnswer,
 }
 
 /// `claude auth status --text` for an account folder, with a time limit.
@@ -129,8 +130,7 @@ pub fn status_within(
 ) -> Answer {
     match launch::run_within(&mut status_command(claude, Some(home)), limit) {
         Ok(Some(text)) => Answer::Text(text),
-        Ok(None) => Answer::TimedOut,
-        Err(_) => Answer::Text(String::new()),
+        _ => Answer::NoAnswer,
     }
 }
 

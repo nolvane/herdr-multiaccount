@@ -668,8 +668,16 @@ time limit, so the list froze for seconds, or for good when `claude` hung
   with it). A check that did not answer counts as still signed in, so the
   notice with the by-hand command shows rather than a removal that may have
   left a login behind;
-- a notice that comes while another dialog is open waits until it is
-  closed.
+- while it runs, the account takes nothing else in the list (no `⏎`, `c`,
+  `f`, `n`, `l` or `d`, no moved session, no space, no limit reading), so
+  nothing new starts on a folder about to go;
+- the answer is taken only while no dialog is open, like the end of a move:
+  the notice never replaces a question, and closing the list meanwhile
+  leaves the account in place instead of a notice nobody saw;
+- each call runs in its own process group, which is stopped as a whole at
+  the limit, and a `claude` that cannot be started counts as no answer;
+- a sign-in that failed no longer asks `claude auth status` before the
+  half-added account is dropped.
 
 Running the whole removal in the thread was rejected: the list's state and
 its writes to `accounts.json` stay on one thread. Other `claude auth status`

@@ -402,41 +402,63 @@ pub fn clean_env(cmd: &mut Command) {
 }
 
 /// Runs `cmd` and returns what it printed, or `None` when it did not end
-/// within `limit`: it is killed then, so a `claude` that hangs (on the
-/// network or the keychain) never holds its caller for good. Standard input
-/// and error are left as `cmd` sets them; standard output is read here.
+/// within `limit`: it is stopped then, with everything it started (its own
+/// process group), so a `claude` that hangs (on the network or the
+/// keychain) never holds its caller for good. Standard input and error are
+/// left as `cmd` sets them; standard output is read here.
 pub fn run_within(
     cmd: &mut Command,
     limit: std::time::Duration,
 ) -> std::io::Result<Option<String>> {
     use std::io::Read;
-    let mut child = cmd.stdout(std::process::Stdio::piped()).spawn()?;
-    let mut stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| std::io::Error::other("no output"))?;
-    let reader = std::thread::spawn(move || {
+    use std::os::unix::process::CommandExt;
+    let deadline = std::time::Instant::now() + limit;
+    let mut child = cmd
+        .stdout(std::process::Stdio::piped())
+        .process_group(0)
+        .spawn()?;
+    let stop = |child: &mut std::process::Child| {
+        // The whole group: a wrapper script's `claude` too.
+        let _ = Command::new("kill")
+            .args(["-KILL", "--", &format!("-{}", child.id())])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        let _ = child.kill();
+        let _ = child.wait();
+    };
+    let Some(mut stdout) = child.stdout.take() else {
+        stop(&mut child);
+        return Err(std::io::Error::other("no output"));
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
         let mut s = String::new();
         let _ = stdout.read_to_string(&mut s);
-        s
+        let _ = tx.send(s);
     });
-    let deadline = std::time::Instant::now() + limit;
     loop {
-        match child.try_wait()? {
-            Some(_) => break,
-            None if std::time::Instant::now() < deadline => {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if std::time::Instant::now() < deadline => {
                 std::thread::sleep(std::time::Duration::from_millis(50))
             }
-            None => {
-                let _ = child.kill();
-                let _ = child.wait();
-                // The reader is left behind: something the child started may
-                // still hold its output open.
+            Ok(None) => {
+                stop(&mut child);
                 return Ok(None);
+            }
+            Err(e) => {
+                stop(&mut child);
+                return Err(e);
             }
         }
     }
-    Ok(Some(reader.join().unwrap_or_default()))
+    // Something it started may still hold its output open: wait for the
+    // text only until the limit.
+    let left = deadline.saturating_duration_since(std::time::Instant::now());
+    Ok(rx
+        .recv_timeout(left.max(std::time::Duration::from_millis(100)))
+        .ok())
 }
 
 /// The line a session on `dir` prints when that is the old folder `home`
@@ -700,6 +722,21 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out.as_deref(), Some("ready\n"));
+        // It ends, but leaves something behind that holds its output open.
+        let started = std::time::Instant::now();
+        let out = run_within(
+            Command::new("sh").args(["-c", "sleep 30 & echo ready"]),
+            std::time::Duration::from_millis(500),
+        )
+        .unwrap();
+        assert_eq!(out, None);
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        // What cannot start is an error, not an answer.
+        assert!(run_within(
+            &mut Command::new("/nonexistent/claude"),
+            std::time::Duration::from_secs(1)
+        )
+        .is_err());
     }
 
     fn store() -> Store {
