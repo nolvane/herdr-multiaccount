@@ -116,9 +116,19 @@ pub fn twins(store: &Store, logins: &HashMap<String, Login>) -> HashMap<String, 
     out
 }
 
-/// When a reading was last taken for an account.
-fn read_at(u: &Usage) -> i64 {
-    u.updated_at.max(u.probed_at).unwrap_or(i64::MIN)
+/// How fresh the limits an account shows are, for picking among twins;
+/// `None` when it has none to share. A known limits time
+/// (`Usage::limits_read_at`: the newest `/usage` check or status line answer
+/// that brought limits) beats a reading without one. Files written before
+/// that time was stored have only `updated_at`, which every status line call
+/// moves forward, also one that brings no limits; among such readings alone
+/// it still decides.
+fn read_at(u: &Usage) -> Option<(bool, i64)> {
+    match u.limits_read_at() {
+        Some(t) => Some((true, t)),
+        None if u.has_windows() => u.updated_at.map(|t| (false, t)),
+        None => None,
+    }
 }
 
 /// Gives every account the limits of the freshest reading among its twins.
@@ -132,7 +142,7 @@ pub fn share_limits(usage: &mut HashMap<String, Usage>, twins: &HashMap<String, 
             .map(|i| before.get(i).unwrap_or(&empty))
             .max_by_key(|u| read_at(u))
             .unwrap_or(&empty);
-        if read_at(freshest) == i64::MIN {
+        if read_at(freshest).is_none() {
             continue;
         }
         let u = usage.entry(id.clone()).or_default();
@@ -230,5 +240,102 @@ mod tests {
             !usage.contains_key("c"),
             "no reading anywhere: nothing to share"
         );
+    }
+
+    const T: i64 = 1_794_225_600;
+
+    /// A status line call of session `s1` with limits and a session cost.
+    fn answer(five: f64, usd: f64) -> serde_json::Value {
+        json!({
+            "session_id": "s1",
+            "cost": {"total_cost_usd": usd},
+            "rate_limits": {
+                "five_hour": {"used_percentage": five, "resets_at": T + 3600},
+                "seven_day": {"used_percentage": five, "resets_at": T + 86_400}
+            }
+        })
+    }
+
+    /// A `/usage` check of B at `T` that reads 90 percent.
+    fn checked() -> Usage {
+        use crate::probe::{Probed, Reading};
+        let mut b = Usage::default();
+        let p = Probed {
+            used: 90.0,
+            resets_at: Some(T + 3600),
+        };
+        b.record_probe(
+            &Reading {
+                five_hour: Some(p),
+                seven_day: Some(p),
+            },
+            T,
+        );
+        b
+    }
+
+    fn shared(a: Usage, b: Usage) -> HashMap<String, Usage> {
+        let mut usage: HashMap<String, Usage> = [("a".to_string(), a), ("b".to_string(), b)].into();
+        let t: HashMap<String, Vec<String>> = [
+            ("a".to_string(), vec!["b".to_string()]),
+            ("b".to_string(), vec!["a".to_string()]),
+        ]
+        .into();
+        share_limits(&mut usage, &t);
+        usage
+    }
+
+    #[test]
+    fn a_call_without_limits_does_not_hide_a_twins_check() {
+        // A's session answered before B's check, then made a call without
+        // limits after it (a new session before its first answer).
+        let mut a = Usage::default();
+        a.record(&answer(10.0, 1.0), T - 100);
+        a.record(&json!({"session_id": "s2"}), T + 10);
+        let usage = shared(a, checked());
+        assert_eq!(usage["a"].five_hour.unwrap().used, 90.0);
+        assert_eq!(usage["b"].five_hour.unwrap().used, 90.0);
+        // A brand new account whose first call has no limits yet.
+        let mut fresh = Usage::default();
+        fresh.record(&json!({"session_id": "s1"}), T + 10);
+        let usage = shared(fresh, checked());
+        assert_eq!(usage["a"].five_hour.unwrap().used, 90.0);
+        assert_eq!(usage["b"].five_hour.unwrap().used, 90.0);
+    }
+
+    #[test]
+    fn an_idle_refresh_does_not_hide_a_twins_check() {
+        let mut a = Usage::default();
+        a.record(&answer(10.0, 1.0), T - 100);
+        // Idle: the same answer again, same cost.
+        a.record(&answer(10.0, 1.0), T + 30);
+        let usage = shared(a, checked());
+        assert_eq!(usage["a"].five_hour.unwrap().used, 90.0);
+        assert_eq!(usage["b"].seven_day.unwrap().used, 90.0);
+    }
+
+    #[test]
+    fn a_newer_answer_beats_a_twins_check() {
+        let mut a = Usage::default();
+        a.record(&answer(10.0, 1.0), T - 100);
+        a.record(&answer(95.0, 1.5), T + 30);
+        let usage = shared(a, checked());
+        assert_eq!(usage["a"].five_hour.unwrap().used, 95.0);
+        assert_eq!(usage["b"].five_hour.unwrap().used, 95.0);
+    }
+
+    #[test]
+    fn a_reading_without_a_limits_time_loses_to_one_with_it() {
+        // Written before limits times were stored: windows and `updated_at`
+        // only, which a later call without limits moved past B's check.
+        let mut old = Usage::default();
+        old.record(
+            &json!({"rate_limits": {"five_hour": {"used_percentage": 10.0, "resets_at": T + 3600}}}),
+            T + 10,
+        );
+        assert_eq!(old.limits_read_at(), None);
+        let usage = shared(old, checked());
+        assert_eq!(usage["a"].five_hour.unwrap().used, 90.0);
+        assert_eq!(usage["b"].five_hour.unwrap().used, 90.0);
     }
 }

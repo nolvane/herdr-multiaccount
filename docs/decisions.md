@@ -301,6 +301,18 @@ reminder and the list all see the same numbers); costs stay per entry. The
 list says "same login as …" on both. API key accounts have no login and are
 never twins.
 
+Changed on 2026-11-14 (#28): "freshest" meant the newest `updated_at` or
+`probed_at`, but `updated_at` moves on every status line call, also one that
+brings no limits or only repeats an idle session's last answer, so old
+numbers could hide a twin's new `/usage` check. Twins now rank by
+`Usage::limits_read_at` (the newest check or status line answer that brought
+limits). A reading without that time (a file from before it was stored)
+ranks below every reading with one, and among such readings `updated_at`
+still decides; an account without any windows shares nothing. Falling back
+to `updated_at` per account was rejected: the list checks one account per
+login, so the other twin would never get a limits time of its own and could
+hide the checks for good.
+
 ## 2026-11-09: Hardening after a source-only security audit
 
 A source-only security audit (quick profile) found no confirmed vulnerability and three leads. These changes close them
