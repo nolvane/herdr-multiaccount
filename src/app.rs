@@ -2038,6 +2038,11 @@ impl App {
     /// well, and shows how it ended.
     fn poll_sign_in(&mut self) {
         if let Some(c) = &self.sign_in_check {
+            // Only while its dialog is in front, so the close question
+            // asked over it stays.
+            if !matches!(self.mode, Mode::SignIn { .. }) {
+                return;
+            }
             let info = match c.rx.try_recv() {
                 Ok(info) => info,
                 Err(std::sync::mpsc::TryRecvError::Empty) => return,
@@ -2983,6 +2988,9 @@ impl App {
                 self.event(event::read()?);
             }
         }
+        // A check that waits on a `claude` that hangs would outlive the
+        // list: its thread, which stops it at the limit, ends here.
+        launch::stop_running();
         Ok(())
     }
 }
@@ -7309,8 +7317,12 @@ mod tests {
     }
 
     /// `app_with` and a sign-in of that account that has just ended (`ok`).
+    /// Only that account is in the list, so the refresh after the sign-in
+    /// looks at no folder an account of the real config directory may have.
     fn ended_sign_in(id: &str, name: &str, ok: bool) -> App {
         let mut a = app_with(id, name);
+        a.store.accounts.retain(|x| x.id == id);
+        a.sel = 0;
         let account = a.store.account(id).cloned().unwrap();
         a.sign_in_starter = |a, _| {
             let mut s = SignIn::showing("https://example.com/sign-in");
@@ -7402,9 +7414,14 @@ mod tests {
         press(&mut a, KeyCode::Char('n'));
         assert!(matches!(a.mode, Mode::SignIn { .. }), "back to the dialog");
         press(&mut a, KeyCode::Char('q'));
+        // An answer that comes meanwhile never replaces the question.
+        *ANSWER.lock().unwrap() = Some(Info::default());
+        std::thread::sleep(Duration::from_millis(200));
+        a.poll_sign_in();
+        assert_eq!(a.mode, Mode::AskQuit);
+        assert!(a.checking_sign_in());
         press(&mut a, KeyCode::Char('y'));
         assert!(a.quit);
         assert!(started.elapsed() < Duration::from_secs(5));
-        *ANSWER.lock().unwrap() = Some(Info::default());
     }
 }

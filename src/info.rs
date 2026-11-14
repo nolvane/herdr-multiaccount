@@ -546,24 +546,21 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let d = scratch(name);
         let claude = d.join("claude");
-        std::fs::write(&claude, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::write(
+            &claude,
+            format!("#!/bin/sh\ncase \"$1\" in\n  none) ;;\n  *) {body} ;;\nesac\n"),
+        )
+        .unwrap();
         std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).unwrap();
         // Another test thread may still hold the file open while it starts
-        // a process ("text file busy"): wait until it starts (and stop it).
+        // a process ("text file busy"): wait until it runs (`none` does
+        // nothing).
         for _ in 0..100 {
-            match std::process::Command::new(&claude)
-                .stdout(std::process::Stdio::null())
-                .spawn()
-            {
+            match std::process::Command::new(&claude).arg("none").status() {
                 Err(e) if e.raw_os_error() == Some(26) => {
                     std::thread::sleep(std::time::Duration::from_millis(20))
                 }
-                Ok(mut child) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    break;
-                }
-                Err(_) => break,
+                _ => break,
             }
         }
         claude

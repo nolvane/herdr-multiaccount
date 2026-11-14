@@ -104,7 +104,8 @@ All notable changes to this project are documented here. The format follows
   the sign-in…" and keeps redrawing, `q` closes it without waiting, and
   `Esc` cancels the check before a sign-in. Every `claude auth status` that
   does not answer within 30 seconds is stopped and counts as no answer, as
-  before (no Console profile, not signed in), also in the launcher.
+  before (no Console profile, not signed in), also in the launcher; one
+  still running when the list closes is stopped then.
 
 ## [1.0.0] - 2026-11-09
 

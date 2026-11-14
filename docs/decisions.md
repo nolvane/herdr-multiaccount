@@ -878,6 +878,12 @@ sign-in ended. The list froze for about a second, or for good when
   sign-in…" in place of its waiting line (no code field and no `Esc`, since
   the sign-in itself has ended; `q` still closes the list). A sign-in that
   failed asks nothing, as before.
+- an answer that comes while the close question is asked over one of these
+  dialogs waits until the question is answered, as the sign-out's does;
+- a list that closes while such a call runs stops it (`launch::stop_running`,
+  which stops every process group `run_within` still has running): the
+  thread that would stop it at its limit ends with the list, and a call in
+  a process group of its own gets no hangup from the closed pane.
 
 Staying in the normal view with only a footer line while the
 Console-profile check runs was rejected: its answer would either replace a

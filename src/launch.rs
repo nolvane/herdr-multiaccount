@@ -427,6 +427,42 @@ pub fn clean_env(cmd: &mut Command) {
     cmd.env_remove(ENV_SET);
 }
 
+/// The process groups `run_within` has running, so a list that closes can
+/// stop them (`stop_running`): they run in groups of their own, which a
+/// closed pane's hangup does not reach.
+static RUNNING: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+
+/// Takes a group off `RUNNING` when its `run_within` returns, on every
+/// path.
+struct Running(u32);
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        if let Ok(mut r) = RUNNING.lock() {
+            r.retain(|id| *id != self.0);
+        }
+    }
+}
+
+/// Stops the process group `id` and everything in it.
+fn stop_group(id: u32) {
+    let _ = Command::new("kill")
+        .args(["-KILL", "--", &format!("-{id}")])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+}
+
+/// Stops every call of `run_within` that still runs, for a list that
+/// closes while a check waits on a `claude` that hangs: its thread ends
+/// with the list and could no longer stop it at the limit.
+pub fn stop_running() {
+    let ids = RUNNING.lock().map(|r| r.clone()).unwrap_or_default();
+    for id in ids {
+        stop_group(id);
+    }
+}
+
 /// Runs `cmd` and returns what it printed, or `None` when it did not end
 /// within `limit`: it is stopped then, with everything it started (its own
 /// process group), so a `claude` that hangs (on the network or the
@@ -443,13 +479,13 @@ pub fn run_within(
         .stdout(std::process::Stdio::piped())
         .process_group(0)
         .spawn()?;
+    if let Ok(mut r) = RUNNING.lock() {
+        r.push(child.id());
+    }
+    let _running = Running(child.id());
     let stop = |child: &mut std::process::Child| {
         // The whole group: a wrapper script's `claude` too.
-        let _ = Command::new("kill")
-            .args(["-KILL", "--", &format!("-{}", child.id())])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
+        stop_group(child.id());
         let _ = child.kill();
         let _ = child.wait();
     };
@@ -864,6 +900,39 @@ mod tests {
             std::time::Duration::from_secs(1)
         )
         .is_err());
+    }
+
+    #[test]
+    fn a_closing_list_can_stop_what_still_runs() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut cmd = Command::new("sh");
+            cmd.args(["-c", "sleep 30"]);
+            let _ = tx.send(run_within(&mut cmd, std::time::Duration::from_secs(60)));
+        });
+        // Its group is noted while it runs. Only this one is stopped here:
+        // `stop_running` would stop other tests' calls too.
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let id = loop {
+            let mine = RUNNING.lock().unwrap().iter().copied().find(|id| {
+                let out = Command::new("ps")
+                    .args(["-o", "args=", "-p", &id.to_string()])
+                    .output()
+                    .unwrap();
+                String::from_utf8_lossy(&out.stdout).trim() == "sh -c sleep 30"
+            });
+            if let Some(id) = mine {
+                break id;
+            }
+            assert!(std::time::Instant::now() < until, "never noted");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        let started = std::time::Instant::now();
+        stop_group(id);
+        assert!(rx.recv_timeout(std::time::Duration::from_secs(10)).is_ok());
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        // And taken off the list once it returned.
+        assert!(!RUNNING.lock().unwrap().contains(&id));
     }
 
     /// Whether `pid` still runs: a zombie (state Z), which nobody may reap
