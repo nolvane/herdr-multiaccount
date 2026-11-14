@@ -206,8 +206,8 @@ nothing; Claude Code asks with its own login, as when you type `/usage`, and
 the list reads the percentages and reset times from what it prints. It
 checks only an account whose last reading is older than `check_limits`
 (5 minutes by default; `0` turns the checks off): a running session whose
-status line reported the limits in that time, or a check from another open
-list, counts as a reading, and accounts signed in with the same login are
+status line brought the limits with an answer in that time, or a check from
+another open list, counts as a reading, and accounts signed in with the same login are
 checked once. While the list is not in front in Herdr (another tab or space
 is shown), no checks start; when it comes back, accounts with old readings
 are checked at once. `r` checks every account right away.

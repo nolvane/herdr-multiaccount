@@ -28,8 +28,9 @@ All notable changes to this project are documented here. The format follows
 - The Sessions tab is called Agents, the word Herdr's sidebar uses.
 - The open list starts far fewer Claude Code processes for its limit
   checks: it checks an account only when its last reading is older than
-  `check_limits`, now 300 seconds by default (was 60). A running session's
-  status line report, a check from another open list and a check of an
+  `check_limits`, now 300 seconds by default (was 60). A session that
+  answered in that time (its status line brings the limits), a check from
+  another open list and a check of an
   account with the same login count as a reading. No checks start while
   the list is not in front in Herdr; `r` still checks every account.
 

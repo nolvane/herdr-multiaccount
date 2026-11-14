@@ -537,12 +537,24 @@ impl App {
     /// freshest reading of the account and its twins (same login) counts,
     /// whether the status line or `/usage` (from any open list) took it.
     fn limits_due(&self, id: &str, now: i64) -> bool {
-        let twins = self.twins.get(id).into_iter().flatten();
-        std::iter::once(id)
-            .chain(twins.map(String::as_str))
+        self.one_login(id)
+            .iter()
             .filter_map(|i| self.usage.get(i).and_then(Usage::limits_read_at))
             .max()
             .is_none_or(|t| now - t >= self.config.check_limits as i64)
+    }
+
+    /// Notes a check of an account as tried for its whole login.
+    fn mark_tried(&mut self, id: &str, at: Instant) {
+        for i in self.one_login(id) {
+            self.probe_tried.insert(i, at);
+        }
+    }
+
+    /// An account and the others signed in with the same login.
+    fn one_login(&self, id: &str) -> Vec<String> {
+        let twins = self.twins.get(id).into_iter().flatten().cloned();
+        std::iter::once(id.to_string()).chain(twins).collect()
     }
 
     /// The accounts to check now: those whose limits are due and that this
@@ -584,16 +596,25 @@ impl App {
         if targets.is_empty() {
             return;
         }
-        for (id, _) in &targets {
-            self.probe_tried.insert(id.clone(), at);
+        // A check counts as tried for the whole login, so a failing one is
+        // not tried again at once through a twin.
+        let targets: Vec<_> = targets
+            .into_iter()
+            .map(|(id, home)| (self.one_login(&id), id, home))
+            .collect();
+        for (_, id, _) in &targets {
+            self.mark_tried(id, at);
         }
         let interval = self.config.check_limits as i64;
         let cwd = paths::config_dir().join("probe");
         let (tx, rx) = channel();
         std::thread::spawn(move || {
-            for (id, home) in targets {
+            for (login, id, home) in targets {
                 // Another open list may have read it in the meantime.
-                let read = Usage::load(&id).limits_read_at();
+                let read = login
+                    .iter()
+                    .filter_map(|i| Usage::load(i).limits_read_at())
+                    .max();
                 if !force && read.is_some_and(|t| time::now() - t < interval) {
                     continue;
                 }
@@ -1771,6 +1792,8 @@ impl App {
                 );
             }
             self.info.insert(s.id.clone(), info);
+            // Its readings may be from the login it had before.
+            self.force_probe = true;
             self.mode = Mode::Message {
                 title: format!("{} is signed in", s.name),
                 lines,
@@ -5586,9 +5609,17 @@ mod tests {
     fn a_fresh_status_line_reading_skips_the_check() {
         let (mut a, now) = probing(Some(400));
         assert_eq!(a.config.check_limits, 300);
-        // A running session on Work reported its limits a minute ago.
-        let mut u = full_at(40.0, now - 60);
-        u.probed_at = Some(now - 400);
+        // A running session on Work reported its limits with an answer a
+        // minute ago.
+        let mut u = Usage {
+            probed_at: Some(now - 400),
+            ..Usage::default()
+        };
+        u.record(
+            &serde_json::json!({"session_id": "s1", "cost": {"total_cost_usd": 0.4},
+                "rate_limits": {"five_hour": {"used_percentage": 40.0, "resets_at": now + 3600}}}),
+            now - 60,
+        );
         a.usage.insert("work".into(), u);
         assert_eq!(round(&a, now), vec!["personal"]);
         // Once that report is older than the interval, Work is due again.
@@ -5623,13 +5654,17 @@ mod tests {
         // A check this list just tried (and that failed: no new reading) is
         // not tried again before the interval is over.
         a.usage.get_mut("work").unwrap().probed_at = Some(now - 600);
-        a.probe_tried.insert("work".into(), Instant::now());
+        let tried = Instant::now();
+        a.probe_tried.insert("work".into(), tried);
         assert!(round(&a, now).is_empty());
-        let long_ago = Instant::now().checked_sub(Duration::from_secs(301));
-        if let Some(t) = long_ago {
-            a.probe_tried.insert("work".into(), t);
-            assert_eq!(round(&a, now), vec!["work"]);
-        }
+        let later = |s| {
+            a.probe_round(now, tried + Duration::from_secs(s))
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect::<Vec<_>>()
+        };
+        assert!(later(299).is_empty());
+        assert_eq!(later(301), vec!["work"]);
         // `r` checks every account, fresh or not.
         a.probe_tried.clear();
         a.usage.get_mut("work").unwrap().probed_at = Some(now - 1);
@@ -5652,6 +5687,12 @@ mod tests {
         a.twins.insert("personal".into(), vec!["work".into()]);
         a.twins.insert("work".into(), vec!["personal".into()]);
         assert_eq!(round(&a, now), vec!["personal"], "one login, one check");
+        // A check of one counts as tried for both: a failing login is not
+        // tried again at once through its twin.
+        a.mark_tried("personal", Instant::now());
+        assert!(round(&a, now).is_empty());
+        a.probe_tried.clear();
+        assert_eq!(a.one_login("personal"), vec!["personal", "work"]);
         // A fresh reading of one counts for the other.
         a.usage.get_mut("personal").unwrap().probed_at = Some(now - 5);
         assert!(round(&a, now).is_empty());

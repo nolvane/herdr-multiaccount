@@ -38,9 +38,10 @@ pub struct Usage {
     pub updated_at: Option<i64>,
     /// When `/usage` was last read for this account.
     pub probed_at: Option<i64>,
-    /// When the status line last brought a usage window (a call without
-    /// `rate_limits`, such as before a session's first answer, does not
-    /// count).
+    /// When the status line last brought usage windows from a new answer.
+    /// A call without `rate_limits` (before a session's first answer) does
+    /// not count, nor does an idle session repeating the windows of its
+    /// last answer: only a call whose session cost changed is a new answer.
     pub limits_at: Option<i64>,
     pub five_hour: Option<Window>,
     pub seven_day: Option<Window>,
@@ -180,9 +181,21 @@ impl Usage {
     pub fn record(&mut self, input: &Value, now: i64) {
         self.updated_at = Some(now);
         let rl = &input["rate_limits"];
-        if ["five_hour", "seven_day", "spend_limit"]
-            .iter()
-            .any(|k| window(&rl[*k]).is_some())
+        let session = input["session_id"].as_str().unwrap_or("");
+        let cost = input["cost"]["total_cost_usd"].as_f64();
+        // Claude Code learns the windows with each answer; a call that
+        // repeats the last session cost repeats the last answer's windows.
+        let answered = !session.is_empty()
+            && cost.is_some_and(|usd| {
+                self.sessions
+                    .iter()
+                    .find(|s| s.0 == session)
+                    .is_none_or(|s| s.1 != usd)
+            });
+        if answered
+            && ["five_hour", "seven_day", "spend_limit"]
+                .iter()
+                .any(|k| window(&rl[*k]).is_some())
         {
             self.limits_at = Some(now);
         }
@@ -210,8 +223,6 @@ impl Usage {
                     .or(old.and_then(|o| o.period)),
             });
         }
-        let session = input["session_id"].as_str().unwrap_or("");
-        let cost = input["cost"]["total_cost_usd"].as_f64();
         if let (false, Some(usd)) = (session.is_empty(), cost) {
             match self.sessions.iter_mut().find(|s| s.0 == session) {
                 Some(s) => s.1 = usd,
@@ -442,13 +453,22 @@ mod tests {
         assert_eq!(u.limits_at, None);
         assert_eq!(u.limits_read_at(), None);
         u.record(&input(10.0, 20.0), NOW + 5);
-        assert_eq!(u.limits_at, Some(NOW + 5));
+        assert_eq!(u.limits_at, Some(NOW + 5), "the first answer's limits");
         u.record(&json!({"session_id": "s1"}), NOW + 9);
         assert_eq!(u.limits_at, Some(NOW + 5), "a call without limits keeps it");
-        u.probed_at = Some(NOW + 7);
-        assert_eq!(u.limits_read_at(), Some(NOW + 7));
+        // An idle session refreshes its status line with the windows of its
+        // last answer: same cost, so no new reading.
+        u.record(&input(10.0, 20.0), NOW + 40);
+        assert_eq!(u.limits_at, Some(NOW + 5));
+        // The next answer costs more.
+        let mut next = input(12.0, 21.0);
+        next["cost"]["total_cost_usd"] = json!(1.5);
+        u.record(&next, NOW + 50);
+        assert_eq!(u.limits_at, Some(NOW + 50));
+        u.probed_at = Some(NOW + 70);
+        assert_eq!(u.limits_read_at(), Some(NOW + 70));
         let back = Usage::from_json(&u.to_json());
-        assert_eq!(back.limits_at, Some(NOW + 5));
+        assert_eq!(back.limits_at, Some(NOW + 50));
     }
 
     #[test]
