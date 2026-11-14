@@ -21,7 +21,7 @@ use ratatui::crossterm::event::{
 use ratatui::layout::Rect;
 use ratatui::style::Color;
 use ratatui::DefaultTerminal;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver};
 use std::time::{Duration, Instant};
@@ -77,6 +77,12 @@ pub type SpaceCloser = fn(&str, bool) -> bool;
 /// Changes `accounts.json` under its lock (`Store::update`); a field so
 /// tests never write the real config directory.
 pub type StoreUpdate = for<'a> fn(Box<dyn FnOnce(&mut Store) + 'a>) -> std::io::Result<Store>;
+/// Signs an account's folders out (`sign_out`), removes its folders
+/// (`mirror::remove`) and starts a sign-in (`SignIn::start`); fields so
+/// tests run without Claude Code or the real config directory.
+pub type SignOut = fn(&Account) -> Vec<PathBuf>;
+pub type FolderRemover = fn(&str) -> std::io::Result<Vec<String>>;
+pub type SignInStarter = fn(&Account, bool) -> Result<SignIn, String>;
 /// The conversation a pane holds now and its Claude Code process
 /// (`real_conversation`), and the start of the move (`relocate::perform`,
 /// which notes it in the folder given and starts its process); fields so
@@ -292,8 +298,20 @@ pub struct App {
     pub twins: HashMap<String, Vec<String>>,
     pub info: HashMap<String, Info>,
     pub info_loading: bool,
-    info_rx: Option<Receiver<(String, Info)>>,
+    /// Results of the sign-in refresh: the account, what was found, and
+    /// for a subscription the folder that was checked.
+    info_rx: Option<Receiver<(String, Info, Option<PathBuf>)>>,
     info_left: usize,
+    /// When the running refresh started (Unix seconds).
+    info_started: i64,
+    /// Accounts whose noted check was thrown away since the refresh
+    /// started: its results for them are not noted.
+    info_forgotten: HashSet<String>,
+    /// Where the noted checks are, for the launcher (`<config>/signin`).
+    pub checks_dir: PathBuf,
+    pub sign_out: SignOut,
+    pub folder_remover: FolderRemover,
+    pub sign_in_starter: SignInStarter,
     herdr_rx: Option<Receiver<HerdrState>>,
     pub workspaces: Vec<Workspace>,
     pub panes: Vec<Pane>,
@@ -366,6 +384,12 @@ impl App {
             info_loading: false,
             info_rx: None,
             info_left: 0,
+            info_started: 0,
+            info_forgotten: HashSet::new(),
+            checks_dir: paths::checks_dir(),
+            sign_out,
+            folder_remover: mirror::remove,
+            sign_in_starter: SignIn::start,
             herdr_rx: None,
             workspaces: vec![],
             panes: vec![],
@@ -475,14 +499,26 @@ impl App {
     pub fn start_info(&mut self) {
         self.next_info = Instant::now() + Duration::from_secs(600);
         let (tx, rx) = channel();
-        self.info_left = self.store.accounts.len();
+        self.begin_info();
         for account in self.store.accounts.clone() {
             let tx = tx.clone();
             std::thread::spawn(move || {
-                let _ = tx.send((account.id.clone(), info::read(&account)));
+                // Before `info::read`, which asks about this same folder: a
+                // sign-in that moves the account to its new folder throws
+                // the note away anyway (`forget_check`).
+                let folder =
+                    (account.kind == Kind::Subscription).then(|| mirror::folder(&account.id));
+                let _ = tx.send((account.id.clone(), info::read(&account), folder));
             });
         }
         self.info_rx = Some(rx);
+    }
+
+    /// The bookkeeping of a new sign-in refresh, before its threads run.
+    fn begin_info(&mut self) {
+        self.info_left = self.store.accounts.len();
+        self.info_started = time::now();
+        self.info_forgotten.clear();
         self.info_loading = true;
     }
 
@@ -490,7 +526,14 @@ impl App {
         let Some(rx) = &self.info_rx else {
             return;
         };
-        while let Ok((id, info)) = rx.try_recv() {
+        let mut received = vec![];
+        while let Ok(r) = rx.try_recv() {
+            received.push(r);
+        }
+        for (id, info, folder) in received {
+            if let Some(folder) = folder {
+                self.note_check(&id, &folder, info.own_login());
+            }
             self.info.insert(id, info);
             self.info_left = self.info_left.saturating_sub(1);
         }
@@ -498,6 +541,23 @@ impl App {
             self.info_rx = None;
             self.info_loading = false;
         }
+    }
+
+    /// Notes a subscription's sign-in check for the launcher, unless its
+    /// login may have changed since the check started: a sign-in runs for
+    /// it, or the check was thrown away since (`forget_check`).
+    fn note_check(&mut self, id: &str, folder: &std::path::Path, signed_in: bool) {
+        if self.info_forgotten.contains(id) || self.signin.as_ref().is_some_and(|s| s.id == id) {
+            return;
+        }
+        info::save_check(&self.checks_dir, id, folder, signed_in, self.info_started);
+    }
+
+    /// Throws away the noted sign-in check of `id` before anything that can
+    /// change its login, and keeps a refresh that runs from noting it again.
+    fn forget_check(&mut self, id: &str) {
+        info::forget_check(&self.checks_dir, id);
+        self.info_forgotten.insert(id.to_string());
     }
 
     /// The accounts whose limits `/usage` can show: signed-in
@@ -1630,7 +1690,9 @@ impl App {
     }
 
     fn start_sign_in(&mut self, account: &Account, new_account: bool) {
-        match SignIn::start(account, new_account) {
+        // Whatever the sign-in ends in, the next start checks live.
+        self.forget_check(&account.id);
+        match (self.sign_in_starter)(account, new_account) {
             Ok(s) => {
                 self.signin = Some(s);
                 self.mode = Mode::SignIn {
@@ -1654,11 +1716,12 @@ impl App {
     /// The sign-in may have stored a login before it was stopped, so the
     /// folder is signed out first, and its id is never used again.
     fn drop_new_account(&mut self, id: &str) {
+        self.forget_check(id);
         let failed = match self.store.account(id).cloned() {
-            Some(a) if a.kind == Kind::Subscription => sign_out(&a),
+            Some(a) if a.kind == Kind::Subscription => (self.sign_out)(&a),
             _ => vec![],
         };
-        let _ = mirror::remove(id);
+        let _ = (self.folder_remover)(id);
         self.update(|s| {
             s.accounts.retain(|a| a.id != id);
             if !s.retired.iter().any(|r| r == id) {
@@ -1827,8 +1890,9 @@ impl App {
                 }
             }
             Kind::Subscription => {
-                still_signed_in = sign_out(&a);
-                match mirror::remove(id) {
+                self.forget_check(id);
+                still_signed_in = (self.sign_out)(&a);
+                match (self.folder_remover)(id) {
                     Ok(kept) if !kept.is_empty() => {
                         self.flash(
                             format!("Removed {}; kept in backups: {}", a.name, kept.join(", ")),
@@ -2720,6 +2784,10 @@ mod tests {
         a.own_pane = None;
         a.store_update = stores;
         a.space_closer = |_, _| panic!("a test closed a space without a fake closer");
+        a.checks_dir = checks_dir();
+        a.sign_out = |_| panic!("a test signed out without a fake");
+        a.folder_remover = |_| panic!("a test removed a folder without a fake");
+        a.sign_in_starter = |_, _| Err("no sign-in in tests".into());
         a.store = Store::default();
         a.store.accounts.push(Account {
             id: "personal".into(),
@@ -2777,6 +2845,191 @@ mod tests {
             Mode::Input(i) => assert_eq!(i.purpose, InputFor::NewAccount(AddKind::ApiKey)),
             m => panic!("unexpected {m:?}"),
         }
+    }
+
+    /// A folder of its own for each test's noted sign-in checks.
+    fn checks_dir() -> PathBuf {
+        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let d = std::env::temp_dir().join(format!("hm-signin-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        d
+    }
+
+    fn signed_in_info() -> Info {
+        Info {
+            signed_in: true,
+            claude_ai: true,
+            ..Info::default()
+        }
+    }
+
+    /// Hands `results` to the list as a finished sign-in refresh (without
+    /// its threads, which would ask Claude Code about the real folders).
+    fn refresh(a: &mut App, results: Vec<(&str, Info, Option<PathBuf>)>) {
+        let (tx, rx) = channel();
+        a.info_loading = true;
+        a.info_left = results.len();
+        for (id, info, folder) in results {
+            tx.send((id.to_string(), info, folder)).unwrap();
+        }
+        a.info_rx = Some(rx);
+        a.receive_info();
+    }
+
+    thread_local! {
+        /// Whether the noted check was still there when the fake sign-out ran.
+        static CHECK_AT_SIGN_OUT: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+        static CHECKS_OF_TEST: std::cell::RefCell<PathBuf> = const { std::cell::RefCell::new(PathBuf::new()) };
+    }
+
+    fn sign_out_noting(a: &Account) -> Vec<PathBuf> {
+        let there = CHECKS_OF_TEST.with(|d| d.borrow().join(format!("{}.json", a.id)).exists());
+        CHECK_AT_SIGN_OUT.with(|c| c.set(Some(there)));
+        vec![]
+    }
+
+    /// A list whose refresh found "personal" signed in in `folder`.
+    fn with_noted_check() -> (App, PathBuf) {
+        let mut a = app();
+        let folder = a.checks_dir.join("homes/personal/.claude");
+        a.begin_info();
+        refresh(
+            &mut a,
+            vec![("personal", signed_in_info(), Some(folder.clone()))],
+        );
+        assert!(info::fresh_check(
+            &a.checks_dir,
+            "personal",
+            &folder,
+            time::now()
+        ));
+        CHECKS_OF_TEST.with(|d| *d.borrow_mut() = a.checks_dir.clone());
+        CHECK_AT_SIGN_OUT.with(|c| c.set(None));
+        (a, folder)
+    }
+
+    #[test]
+    fn the_refresh_notes_subscriptions_for_the_launcher() {
+        let mut a = app();
+        a.store.accounts.push(Account {
+            id: "key".into(),
+            name: "Key".into(),
+            kind: Kind::ApiKey,
+            sso: false,
+            fallback: true,
+        });
+        let folder = a.checks_dir.join("homes/personal/.claude");
+        a.begin_info();
+        refresh(
+            &mut a,
+            vec![
+                ("personal", signed_in_info(), Some(folder.clone())),
+                ("main", signed_in_info(), None),
+                ("key", signed_in_info(), None),
+            ],
+        );
+        assert!(info::fresh_check(
+            &a.checks_dir,
+            "personal",
+            &folder,
+            time::now()
+        ));
+        // The main login and API keys are not checked by the launcher.
+        assert!(!a.checks_dir.join("main.json").exists());
+        assert!(!a.checks_dir.join("key.json").exists());
+        assert!(!a.info_loading);
+        // A later refresh that finds it signed out replaces the old result.
+        refresh(
+            &mut a,
+            vec![("personal", Info::default(), Some(folder.clone()))],
+        );
+        assert!(!info::fresh_check(
+            &a.checks_dir,
+            "personal",
+            &folder,
+            time::now()
+        ));
+        let _ = std::fs::remove_dir_all(&a.checks_dir);
+    }
+
+    #[test]
+    fn signing_in_throws_the_noted_check_away() {
+        // The sign-in cannot even start.
+        let (mut a, folder) = with_noted_check();
+        let account = a.store.account("personal").cloned().unwrap();
+        a.start_sign_in(&account, false);
+        assert_eq!(a.mode, Mode::Normal);
+        assert!(!a.checks_dir.join("personal.json").exists());
+        // A refresh that was running does not write it back.
+        refresh(
+            &mut a,
+            vec![("personal", signed_in_info(), Some(folder.clone()))],
+        );
+        assert!(!info::fresh_check(
+            &a.checks_dir,
+            "personal",
+            &folder,
+            time::now()
+        ));
+        let _ = std::fs::remove_dir_all(&a.checks_dir);
+
+        // A sign-in that runs: a refresh that starts meanwhile does not
+        // note the account either.
+        let (mut a, folder) = with_noted_check();
+        a.sign_in_starter = |a, _| {
+            let mut s = SignIn::showing("https://example.com/sign-in");
+            s.id = a.id.clone();
+            Ok(s)
+        };
+        a.start_sign_in(&account, false);
+        assert!(matches!(a.mode, Mode::SignIn { .. }));
+        assert!(!a.checks_dir.join("personal.json").exists());
+        a.begin_info();
+        refresh(
+            &mut a,
+            vec![("personal", signed_in_info(), Some(folder.clone()))],
+        );
+        assert!(!a.checks_dir.join("personal.json").exists());
+        if let Some(s) = a.signin.as_mut() {
+            s.cancel();
+        }
+        let _ = std::fs::remove_dir_all(&a.checks_dir);
+    }
+
+    #[test]
+    fn removing_throws_the_noted_check_away_before_signing_out() {
+        let (mut a, folder) = with_noted_check();
+        a.sign_out = sign_out_noting;
+        // Stops before anything else is removed, so the test touches no
+        // real file.
+        a.folder_remover = |_| Err(std::io::Error::other("test"));
+        a.remove("personal");
+        assert_eq!(CHECK_AT_SIGN_OUT.with(|c| c.get()), Some(false));
+        assert!(!a.checks_dir.join("personal.json").exists());
+        refresh(
+            &mut a,
+            vec![("personal", signed_in_info(), Some(folder.clone()))],
+        );
+        assert!(!a.checks_dir.join("personal.json").exists());
+        let _ = std::fs::remove_dir_all(&a.checks_dir);
+    }
+
+    #[test]
+    fn dropping_a_half_added_account_throws_its_check_away() {
+        let (mut a, folder) = with_noted_check();
+        a.sign_out = sign_out_noting;
+        a.folder_remover = |_| Ok(vec![]);
+        a.drop_new_account("personal");
+        assert_eq!(CHECK_AT_SIGN_OUT.with(|c| c.get()), Some(false));
+        assert!(a.store.account("personal").is_none());
+        assert!(!a.checks_dir.join("personal.json").exists());
+        refresh(
+            &mut a,
+            vec![("personal", signed_in_info(), Some(folder.clone()))],
+        );
+        assert!(!a.checks_dir.join("personal.json").exists());
+        let _ = std::fs::remove_dir_all(&a.checks_dir);
     }
 
     #[test]

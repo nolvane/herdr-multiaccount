@@ -649,3 +649,27 @@ picking the account, so a limit fallback never lands on a signed-out
 account either; it still asks Claude Code once per start for a subscription
 (the cost #22 is about). Ask-then-fall-back was the owner's choice over
 falling back silently or only asking.
+
+## 2026-11-14: The launcher reuses the list's sign-in check
+
+Asking `claude auth status` cost about 2.3 s before every start on a
+subscription (#22). The list already asks every 10 minutes, so its result
+for each subscription is noted in `signin/<id>.json`: the folder it asked
+about, when the check started, and whether that folder had a login of its
+own. The launcher (also for each fallback candidate) skips its own check
+only when the note says signed in, is at most 11 minutes old (the refresh
+plus its own run time, so there is no gap at each refresh), names the
+folder the session would use, and that folder's `.claude.json` still holds
+a login. Anything else, a damaged note included, is checked live as
+before. A noted "signed out" is never reused, so an account signed in
+outside the list is never refused for an old result.
+
+The note is deleted before the list starts a sign-in, removes an account or
+drops a half-added one, and before the launcher's own sign-in. A refresh
+the same list already runs does not write it back (nor while its sign-in
+runs); after its own sign-in the launcher always checks live, since a list
+open elsewhere may write a note meanwhile. The list and the launcher can
+reach the config directory through different paths (a link above it), so
+the folders are also compared resolved. Only the
+list writes notes: the launcher writing its own live result would make
+starts fast with the list closed too, but the issue left that out.
