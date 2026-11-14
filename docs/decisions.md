@@ -851,3 +851,37 @@ setup run by hand (`S`, `herdr-multiaccount setup`) moves an absolute-path
 command of the plugin to the `$HOME` form, after the usual backup: the
 owner's choice over leaving old commands alone or rewriting them when the
 plugin starts.
+
+## 2026-11-14: Sign-in checks in the background, and a limit for every `claude auth status`
+
+Two calls of `claude auth status` still ran on the thread that draws the
+list, with no time limit (#32): the check whether the main login is a
+Console profile before a claude.ai sign-in (`a` → subscription, `l` on a
+subscription), and the check of who an account is signed in as when its
+sign-in ended. The list froze for about a second, or for good when
+`claude` hung. Now:
+
+- `info::status_text` runs through `launch::run_within` with a 30-second
+  limit (`info::STATUS_LIMIT`, the same as each call of a sign-out). No
+  answer is `None`, as before, so every caller keeps its meaning: no
+  Console profile, not signed in, and for the launcher's start check
+  "could not ask, start anyway". The launcher's start check gets the limit
+  too, since it uses the same function; what it decides does not change;
+- the Console-profile check runs in a thread, like the sign-out of #16. A
+  small dialog ("Checking the main login…") stays in front until it
+  answers; `Esc` cancels it, `q` asks to close the list as anywhere. Then
+  the list goes on as before: today's note for a Console main login, else
+  the name field or the sign-in. A check that ends without an answer counts
+  as no Console profile;
+- after a sign-in that ended well, the check of who it signed in as runs in
+  a thread too, and the sign-in dialog stays open with "Checking the
+  sign-in…" in place of its waiting line (no code field and no `Esc`, since
+  the sign-in itself has ended; `q` still closes the list). A sign-in that
+  failed asks nothing, as before.
+
+Staying in the normal view with only a footer line while the
+Console-profile check runs was rejected: its answer would either replace a
+dialog opened meanwhile or have to wait for it, and nothing would show why
+`a` did not go on. Both checks are fields of the list (`profile_checker`,
+`info_reader`, as `signer` is), so the tests never reach Claude Code; the
+sign-in refresh uses `info_reader` too.

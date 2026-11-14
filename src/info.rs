@@ -106,12 +106,25 @@ pub fn parse_status(text: &str) -> Info {
     info
 }
 
+/// How long a `claude auth status` may take before it is stopped and
+/// counts as no answer: the same as each call of a sign-out.
+pub const STATUS_LIMIT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// `claude auth status --text` for the main login (`None`) or an account
-/// folder. `None` when Claude Code could not be asked.
+/// folder. `None` when Claude Code could not be asked or did not answer
+/// within [`STATUS_LIMIT`].
 pub fn status_text(home: Option<&std::path::Path>) -> Option<String> {
     let claude = launch::find_claude()?;
-    let out = status_command(&claude, home).output().ok()?;
-    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    status_text_within(&claude, home, STATUS_LIMIT)
+}
+
+/// [`status_text`] with `claude` and the limit given.
+pub fn status_text_within(
+    claude: &std::path::Path,
+    home: Option<&std::path::Path>,
+    limit: std::time::Duration,
+) -> Option<String> {
+    let text = launch::run_within(&mut status_command(claude, home), limit).ok()??;
     (!text.trim().is_empty()).then_some(text)
 }
 
@@ -526,6 +539,76 @@ mod tests {
         assert!(!d.parent().unwrap().join("escape.json").exists());
         assert_eq!(std::fs::read_dir(&d).unwrap().count(), 0);
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A stand-in `claude` that runs `body` for `claude auth status`.
+    fn fake_claude(name: &str, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let d = scratch(name);
+        let claude = d.join("claude");
+        std::fs::write(&claude, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Another test thread may still hold the file open while it starts
+        // a process ("text file busy"): wait until it starts (and stop it).
+        for _ in 0..100 {
+            match std::process::Command::new(&claude)
+                .stdout(std::process::Stdio::null())
+                .spawn()
+            {
+                Err(e) if e.raw_os_error() == Some(26) => {
+                    std::thread::sleep(std::time::Duration::from_millis(20))
+                }
+                Ok(mut child) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break;
+                }
+                Err(_) => break,
+            }
+        }
+        claude
+    }
+
+    #[test]
+    fn a_status_that_does_not_answer_is_stopped() {
+        let claude = fake_claude("status-hangs", "sleep 30");
+        let started = std::time::Instant::now();
+        assert_eq!(
+            status_text_within(&claude, None, std::time::Duration::from_millis(500)),
+            None
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        // Read as no Console profile and not signed in, as today.
+        assert!(!parse_status("").profile);
+        assert!(!parse_status("").signed_in);
+        let _ = std::fs::remove_dir_all(claude.parent().unwrap());
+    }
+
+    #[test]
+    fn a_status_that_answers_is_read() {
+        let claude = fake_claude(
+            "status-answers",
+            "printf 'Login method: Claude Max Account\\nEmail: alex@example.com\\n'",
+        );
+        let text = status_text_within(&claude, None, std::time::Duration::from_secs(10));
+        assert!(text.as_deref().is_some_and(|t| parse_status(t).own_login()));
+        // Nothing printed is no answer, as before.
+        let quiet = fake_claude("status-quiet", "true");
+        assert_eq!(
+            status_text_within(&quiet, None, std::time::Duration::from_secs(10)),
+            None
+        );
+        // Nor is a `claude` that cannot be started.
+        assert_eq!(
+            status_text_within(
+                Path::new("/nonexistent/claude"),
+                None,
+                std::time::Duration::from_secs(1)
+            ),
+            None
+        );
+        let _ = std::fs::remove_dir_all(claude.parent().unwrap());
+        let _ = std::fs::remove_dir_all(quiet.parent().unwrap());
     }
 
     #[test]

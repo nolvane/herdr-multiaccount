@@ -98,6 +98,13 @@ All notable changes to this project are documented here. The format follows
   a few minutes in all), and the list shows the command that signs it out
   by hand. The same holds when an account added for a sign-in that did not
   finish is dropped again.
+- Adding a subscription (`a`), signing an account in again (`l`) and the
+  end of a sign-in no longer freeze the list while Claude Code is asked
+  about the login: the list shows "Checking the main login…" or "Checking
+  the sign-in…" and keeps redrawing, `q` closes it without waiting, and
+  `Esc` cancels the check before a sign-in. Every `claude auth status` that
+  does not answer within 30 seconds is stopped and counts as no answer, as
+  before (no Console profile, not signed in), also in the launcher.
 
 ## [1.0.0] - 2026-11-09
 
