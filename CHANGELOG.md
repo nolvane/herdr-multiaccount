@@ -103,9 +103,11 @@ All notable changes to this project are documented here. The format follows
   about the login: the list shows "Checking the main login…" or "Checking
   the sign-in…" and keeps redrawing, `q` closes it without waiting, and
   `Esc` cancels the check before a sign-in. Every `claude auth status` that
-  does not answer within 30 seconds is stopped and counts as no answer, as
-  before (no Console profile, not signed in), also in the launcher; one
-  still running when the list closes is stopped then.
+  does not answer within 30 seconds is stopped. When it gave no answer, no
+  claude.ai sign-in starts (a note says so, since it could sign out a
+  Console main login), and an account that was just signed in stays, with
+  a note that its sign-in could not be checked. A check still running when
+  the list closes is stopped then.
 
 ## [1.0.0] - 2026-11-09
 

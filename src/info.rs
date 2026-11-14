@@ -124,8 +124,33 @@ pub fn status_text_within(
     home: Option<&std::path::Path>,
     limit: std::time::Duration,
 ) -> Option<String> {
-    let text = launch::run_within(&mut status_command(claude, home), limit).ok()??;
-    (!text.trim().is_empty()).then_some(text)
+    match status_answer_within(claude, home, limit) {
+        Answer::Text(text) => (!text.trim().is_empty()).then_some(text),
+        Answer::NoAnswer => None,
+    }
+}
+
+/// `claude auth status --text` for the main login (`None`) or an account
+/// folder, telling an answer (even an empty one) from none. Read only, so
+/// a list that closes may stop it (`launch::stop_running`).
+pub fn status_answer_within(
+    claude: &std::path::Path,
+    home: Option<&std::path::Path>,
+    limit: std::time::Duration,
+) -> Answer {
+    match launch::run_stoppable_within(&mut status_command(claude, home), limit) {
+        Ok(Some(text)) => Answer::Text(text),
+        _ => Answer::NoAnswer,
+    }
+}
+
+/// [`status_answer_within`] with the `claude` on PATH and
+/// [`STATUS_LIMIT`]; no `claude` is no answer.
+fn status_answer(home: Option<&std::path::Path>) -> Answer {
+    match launch::find_claude() {
+        Some(claude) => status_answer_within(&claude, home, STATUS_LIMIT),
+        None => Answer::NoAnswer,
+    }
 }
 
 /// What `claude auth status` said within a time limit.
@@ -255,7 +280,23 @@ fn same_folder(a: &Path, b: &Path) -> bool {
 /// sign-in anywhere on the machine signs that profile out (Claude Code does
 /// this), so the list refuses to add a subscription while it is in use.
 pub fn main_uses_profile() -> bool {
-    status_text(None).is_some_and(|t| parse_status(&t).profile)
+    main_login_profile().unwrap_or(false)
+}
+
+/// [`main_uses_profile`] for the list, which tells no answer apart:
+/// `None` when Claude Code did not answer (within [`STATUS_LIMIT`]), so no
+/// claude.ai sign-in starts that could sign the Console profile out (the
+/// owner's decision on #32).
+pub fn main_login_profile() -> Option<bool> {
+    profile_in(status_answer(None))
+}
+
+/// Whether an answer of `claude auth status` names the Console profile.
+fn profile_in(answer: Answer) -> Option<bool> {
+    match answer {
+        Answer::Text(t) => Some(parse_status(&t).profile),
+        Answer::NoAnswer => None,
+    }
 }
 
 /// The plan from the account fields Claude Code keeps in `.claude.json`.
@@ -303,15 +344,20 @@ fn oauth_of(path: &std::path::Path) -> Option<Value> {
     o.is_object().then_some(o)
 }
 
-/// Looks the account up. Takes up to a second (it starts Claude Code's
-/// command line), so the list calls it off the main thread.
-pub fn read(account: &Account) -> Info {
+/// Looks the account up, and tells whether Claude Code answered (an
+/// account it is not asked about counts as answered); no answer reads as
+/// not signed in. Takes up to a second (it starts Claude Code's command
+/// line), so the list calls it off the main thread.
+pub fn read_checked(account: &Account) -> (Info, bool) {
     match account.kind {
-        Kind::ApiKey => Info {
-            signed_in: secret::exists(&account.id),
-            plan: Some("API key".into()),
-            ..Info::default()
-        },
+        Kind::ApiKey => (
+            Info {
+                signed_in: secret::exists(&account.id),
+                plan: Some("API key".into()),
+                ..Info::default()
+            },
+            true,
+        ),
         Kind::Main | Kind::Subscription => {
             let home = (account.kind == Kind::Subscription).then(|| mirror::folder(&account.id));
             // A new folder that is not there yet (or only an old link of
@@ -320,14 +366,19 @@ pub fn read(account: &Account) -> Info {
                 if *h != mirror::home_of(&account.id)
                     && mirror::real_new_dir(&mirror::home_of(&account.id)).is_none()
                 {
-                    return Info::default();
+                    return (Info::default(), true);
                 }
             }
             let json = match &home {
                 Some(h) => h.join(".claude.json"),
                 None => paths::main_claude_json(),
             };
-            let text = status_text(home.as_deref()).unwrap_or_default();
+            let answer = status_answer(home.as_deref());
+            let answered = matches!(answer, Answer::Text(_));
+            let text = match answer {
+                Answer::Text(t) => t,
+                Answer::NoAnswer => String::new(),
+            };
             let mut info = parse_status(&text);
             if account.kind == Kind::Main {
                 // Whatever the main login is, it is its own.
@@ -352,7 +403,7 @@ pub fn read(account: &Account) -> Info {
                     }
                 }
             }
-            info
+            (info, answered)
         }
     }
 }
@@ -575,9 +626,19 @@ mod tests {
             None
         );
         assert!(started.elapsed() < std::time::Duration::from_secs(10));
-        // Read as no Console profile and not signed in, as today.
-        assert!(!parse_status("").profile);
-        assert!(!parse_status("").signed_in);
+        // No answer, told apart from an answer (the owner's decision on #32).
+        assert_eq!(
+            status_answer_within(&claude, None, std::time::Duration::from_millis(500)),
+            Answer::NoAnswer
+        );
+        assert_eq!(profile_in(Answer::NoAnswer), None);
+        assert_eq!(profile_in(Answer::Text(String::new())), Some(false));
+        assert_eq!(
+            profile_in(Answer::Text(
+                "Profile: credentials-file · user_oauth · profile default\n".into()
+            )),
+            Some(true)
+        );
         let _ = std::fs::remove_dir_all(claude.parent().unwrap());
     }
 

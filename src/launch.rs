@@ -427,9 +427,11 @@ pub fn clean_env(cmd: &mut Command) {
     cmd.env_remove(ENV_SET);
 }
 
-/// The process groups `run_within` has running, so a list that closes can
-/// stop them (`stop_running`): they run in groups of their own, which a
-/// closed pane's hangup does not reach.
+/// The process groups `run_stoppable_within` has running, so a list that
+/// closes can stop them (`stop_running`): they run in groups of their own,
+/// which a closed pane's hangup does not reach. Only read-only calls
+/// (`claude auth status`) are noted here; a sign-out's `claude auth logout`
+/// and a limit reading are never stopped half-way by a list that closes.
 static RUNNING: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
 
 /// Takes a group off `RUNNING` when its `run_within` returns, on every
@@ -453,9 +455,9 @@ fn stop_group(id: u32) {
         .status();
 }
 
-/// Stops every call of `run_within` that still runs, for a list that
-/// closes while a check waits on a `claude` that hangs: its thread ends
-/// with the list and could no longer stop it at the limit.
+/// Stops every call of `run_stoppable_within` that still runs, for a list
+/// that closes while a check waits on a `claude` that hangs: its thread
+/// ends with the list and could no longer stop it at the limit.
 pub fn stop_running() {
     let ids = RUNNING.lock().map(|r| r.clone()).unwrap_or_default();
     for id in ids {
@@ -472,6 +474,23 @@ pub fn run_within(
     cmd: &mut Command,
     limit: std::time::Duration,
 ) -> std::io::Result<Option<String>> {
+    run_limited(cmd, limit, false)
+}
+
+/// [`run_within`] for a read-only call that a list that closes may stop
+/// (`stop_running`).
+pub fn run_stoppable_within(
+    cmd: &mut Command,
+    limit: std::time::Duration,
+) -> std::io::Result<Option<String>> {
+    run_limited(cmd, limit, true)
+}
+
+fn run_limited(
+    cmd: &mut Command,
+    limit: std::time::Duration,
+    stoppable: bool,
+) -> std::io::Result<Option<String>> {
     use std::io::Read;
     use std::os::unix::process::CommandExt;
     let deadline = std::time::Instant::now() + limit;
@@ -479,10 +498,12 @@ pub fn run_within(
         .stdout(std::process::Stdio::piped())
         .process_group(0)
         .spawn()?;
-    if let Ok(mut r) = RUNNING.lock() {
-        r.push(child.id());
-    }
-    let _running = Running(child.id());
+    let _running = stoppable.then(|| {
+        if let Ok(mut r) = RUNNING.lock() {
+            r.push(child.id());
+        }
+        Running(child.id())
+    });
     let stop = |child: &mut std::process::Child| {
         // The whole group: a wrapper script's `claude` too.
         stop_group(child.id());
@@ -902,31 +923,62 @@ mod tests {
         .is_err());
     }
 
+    /// The group of a running `sh -c <script>` in `RUNNING`, waiting up to
+    /// `wait` for it to show up.
+    fn noted(script: &str, wait: std::time::Duration) -> Option<u32> {
+        let until = std::time::Instant::now() + wait;
+        loop {
+            let ids = RUNNING.lock().unwrap().clone();
+            let mine = ids.into_iter().find(|id| {
+                let out = Command::new("ps")
+                    .args(["-o", "args=", "-p", &id.to_string()])
+                    .output()
+                    .unwrap();
+                String::from_utf8_lossy(&out.stdout).trim() == format!("sh -c {script}")
+            });
+            if mine.is_some() || std::time::Instant::now() >= until {
+                return mine;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn only_read_only_calls_are_stopped_with_the_list() {
+        // A sign-out's logout or a limit reading runs through `run_within`:
+        // never noted, so a list that closes never stops it half-way.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut cmd = Command::new("sh");
+            cmd.args(["-c", "sleep 2; echo logged-out"]);
+            let _ = tx.send(run_within(&mut cmd, std::time::Duration::from_secs(20)));
+        });
+        // It runs (its output comes after 2 seconds) but is not noted.
+        assert_eq!(
+            noted(
+                "sleep 2; echo logged-out",
+                std::time::Duration::from_secs(1)
+            ),
+            None
+        );
+        let out = rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+        assert_eq!(out.unwrap().as_deref(), Some("logged-out\n"));
+    }
+
     #[test]
     fn a_closing_list_can_stop_what_still_runs() {
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let mut cmd = Command::new("sh");
             cmd.args(["-c", "sleep 30"]);
-            let _ = tx.send(run_within(&mut cmd, std::time::Duration::from_secs(60)));
+            let _ = tx.send(run_stoppable_within(
+                &mut cmd,
+                std::time::Duration::from_secs(60),
+            ));
         });
         // Its group is noted while it runs. Only this one is stopped here:
         // `stop_running` would stop other tests' calls too.
-        let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        let id = loop {
-            let mine = RUNNING.lock().unwrap().iter().copied().find(|id| {
-                let out = Command::new("ps")
-                    .args(["-o", "args=", "-p", &id.to_string()])
-                    .output()
-                    .unwrap();
-                String::from_utf8_lossy(&out.stdout).trim() == "sh -c sleep 30"
-            });
-            if let Some(id) = mine {
-                break id;
-            }
-            assert!(std::time::Instant::now() < until, "never noted");
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        };
+        let id = noted("sleep 30", std::time::Duration::from_secs(10)).expect("never noted");
         let started = std::time::Instant::now();
         stop_group(id);
         assert!(rx.recv_timeout(std::time::Duration::from_secs(10)).is_ok());

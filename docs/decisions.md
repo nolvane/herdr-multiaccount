@@ -861,29 +861,46 @@ subscription), and the check of who an account is signed in as when its
 sign-in ended. The list froze for about a second, or for good when
 `claude` hung. Now:
 
-- `info::status_text` runs through `launch::run_within` with a 30-second
-  limit (`info::STATUS_LIMIT`, the same as each call of a sign-out). No
-  answer is `None`, as before, so every caller keeps its meaning: no
-  Console profile, not signed in, and for the launcher's start check
-  "could not ask, start anyway". The launcher's start check gets the limit
-  too, since it uses the same function; what it decides does not change;
+- every `claude auth status` runs through `launch::run_stoppable_within`
+  with a 30-second limit (`info::STATUS_LIMIT`, the same as each call of a
+  sign-out). `info::status_answer_within` tells an answer (even an empty
+  one) from none; `info::status_text` keeps `None` for both, so the
+  launcher's start check keeps its meaning ("could not ask, start
+  anyway") and only gains the limit;
+- no answer is not read as "no" in the list (the owner's decision on #32:
+  a slow `claude` never costs a working login). Before a claude.ai
+  sign-in, no answer (`info::main_login_profile` gives `None`) shows the
+  note "Could not check the main login" and starts no sign-in, which could
+  sign out a Console main login. After a sign-in, no answer
+  (`info::read_checked` says it got none) keeps the account, new or not,
+  without a sign-out, and the flash says its sign-in could not be checked;
+  the refresh that follows shows on its row whether it is signed in. A
+  check whose thread ends without an answer counts as no answer too;
 - the Console-profile check runs in a thread, like the sign-out of #16. A
   small dialog ("Checking the main login…") stays in front until it
-  answers; `Esc` cancels it, `q` asks to close the list as anywhere. Then
-  the list goes on as before: today's note for a Console main login, else
-  the name field or the sign-in. A check that ends without an answer counts
-  as no Console profile;
+  answers; `q` asks to close the list as anywhere. `Esc` cancels it: the
+  answer is dropped, while its `claude auth status` runs on until it ends
+  or reaches its limit (it is read only, and a list closed meanwhile stops
+  it); stopping it at once would need the thread to hand its process group
+  back, for a call that is harmless and at most 30 seconds long;
 - after a sign-in that ended well, the check of who it signed in as runs in
   a thread too, and the sign-in dialog stays open with "Checking the
   sign-in…" in place of its waiting line (no code field and no `Esc`, since
   the sign-in itself has ended; `q` still closes the list). A sign-in that
-  failed asks nothing, as before.
+  failed asks nothing, as before;
 - an answer that comes while the close question is asked over one of these
   dialogs waits until the question is answered, as the sign-out's does;
-- a list that closes while such a call runs stops it (`launch::stop_running`,
-  which stops every process group `run_within` still has running): the
-  thread that would stop it at its limit ends with the list, and a call in
-  a process group of its own gets no hangup from the closed pane.
+- a list that closes stops the read-only checks that still run
+  (`launch::stop_running`, on every way out of `App::run` through a drop
+  guard): the thread that would stop one at its limit ends with the list,
+  and a call in a process group of its own gets no hangup from the closed
+  pane. Only `claude auth status` calls are noted for this. A sign-out's
+  `claude auth logout` and a limit reading (`claude -p /usage`) run through
+  plain `launch::run_within` and are never stopped half-way by a closing
+  list: a logout cut off could leave a login behind that the list then
+  believes gone. Closing the list during a sign-out still keeps the
+  account (#16), and a logout that hangs after the list closed runs on as
+  before this change.
 
 Staying in the normal view with only a footer line while the
 Console-profile check runs was rejected: its answer would either replace a
