@@ -434,7 +434,7 @@ pub fn old_folder_notice(
 /// starts inside it (a subagent, a headless run), which belongs to a session
 /// that was told already.
 pub fn tells_in_herdr(inside: bool, source: &Source, terminal: bool) -> bool {
-    inside && *source != Source::Inherited && terminal
+    inside && may_ask(terminal, source)
 }
 
 /// Variables to set and variables to remove for a session.
@@ -621,20 +621,26 @@ pub fn run(args: Vec<String>, moved: bool) -> i32 {
     // A named account is for this start only; sessions inside it inherit
     // the account through ENV_ID and may still fall back.
     cmd.env_remove(ENV_USE);
-    match session_env(&store, &choice.id) {
+    // The folder the session runs on, as the environment hands it over.
+    let config_dir = match session_env(&store, &choice.id) {
         Ok((set, remove)) => {
             for v in remove {
                 cmd.env_remove(v);
             }
+            let dir = set
+                .iter()
+                .find(|(k, _)| k == "CLAUDE_CONFIG_DIR")
+                .map(|(_, v)| PathBuf::from(v));
             for (k, v) in set {
                 cmd.env(k, v);
             }
+            dir
         }
         Err(e) => {
             eprintln!("herdr-multiaccount: {e}");
             return 1;
         }
-    }
+    };
 
     // Label the pane in Herdr's sidebar: only for the session the user
     // started there, not for ones Claude Code starts inside it.
@@ -644,14 +650,11 @@ pub fn run(args: Vec<String>, moved: bool) -> i32 {
         std::io::stdin().is_terminal(),
     ) {
         // Once for every session on the old folder, before its first prompt.
-        if let Some((title, body)) = store.account(&choice.id).and_then(|a| {
-            old_folder_notice(
-                a.kind,
-                &mirror::folder(&a.id),
-                &mirror::home_of(&a.id),
-                &a.name,
-            )
-        }) {
+        let notice = store
+            .account(&choice.id)
+            .zip(config_dir)
+            .and_then(|(a, dir)| old_folder_notice(a.kind, &dir, &mirror::home_of(&a.id), &a.name));
+        if let Some((title, body)) = notice {
             herdr::notify(&title, &body);
         }
         if let Ok(pane) = std::env::var("HERDR_PANE_ID") {
