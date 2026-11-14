@@ -1728,7 +1728,7 @@ impl App {
                 "Signed in as {who}{}.",
                 info.plan
                     .as_deref()
-                    .map(|p| format!(" ({p})"))
+                    .map(|p| format!(" ({})", theme::plain(p)))
                     .unwrap_or_default()
             )];
             // The browser often signs in with whatever account it already
@@ -1851,7 +1851,8 @@ impl App {
                         lines: vec![
                             "The keychain did not delete its API key, so the account stays in the list.".into(),
                             format!(
-                                "Delete the item \"{id}\" (service herdr-multiaccount) in Keychain Access, then remove the account again."
+                                "Delete the item \"{}\" (service herdr-multiaccount) in Keychain Access, then remove the account again.",
+                                theme::plain(id)
                             ),
                         ],
                         good: false,
@@ -2687,7 +2688,7 @@ fn sign_out_failed(dirs: &[PathBuf]) -> Mode {
     for dir in dirs {
         lines.push(format!(
             "CLAUDE_CONFIG_DIR=\"{}\" command claude auth logout",
-            dir.display()
+            theme::plain(&dir.display().to_string())
         ));
     }
     Mode::Message {
@@ -2700,6 +2701,20 @@ fn sign_out_failed(dirs: &[PathBuf]) -> Mode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_folder_path_in_a_message_never_has_the_key_look() {
+        // A folder name is text from outside: a key mark in it is dropped.
+        let dir = PathBuf::from(format!("/tmp/a{0}b{0}c", theme::KEY_MARK));
+        let Mode::Message { lines, .. } = sign_out_failed(&[dir]) else {
+            panic!("not a message");
+        };
+        assert!(
+            lines.iter().all(|l| !l.contains(theme::KEY_MARK)),
+            "{lines:?}"
+        );
+        assert!(lines.iter().any(|l| l.contains("/tmp/abc")), "{lines:?}");
+    }
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
