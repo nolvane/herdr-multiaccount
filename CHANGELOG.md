@@ -16,6 +16,11 @@ All notable changes to this project are documented here. The format follows
   warns when one is working or waiting for an answer, names the worktree
   spaces that close with a repository's main checkout, and says when the
   list closes too. The space's account choice is forgotten.
+- An account that still runs on its 1.0.0 folder is hard to miss: inside
+  Herdr every session started on it shows a notification before Claude Code
+  starts, naming the account, what Claude asks about (skills, `CLAUDE.md`,
+  memory) and `l` to stop it. Its row keeps the notice also while the
+  account is at its limit.
 
 ### Changed
 
@@ -35,6 +40,13 @@ All notable changes to this project are documented here. The format follows
   again. The question names what carries over, and scrolls when it is
   taller than the pane.
 - The Sessions tab is called Agents, the word Herdr's sidebar uses.
+- The open list starts far fewer Claude Code processes for its limit
+  checks: it checks an account only when its last reading is older than
+  `check_limits`, now 300 seconds by default (was 60). A session that
+  answered in that time (its status line brings the limits), a check from
+  another open list and a check of an
+  account with the same login count as a reading. No checks start while
+  the list is not in front in Herdr; `r` still checks every account.
 - Every key the list names is bold and in the accent colour, as in the
   other Herdr plugins: in the footer, the dialogs' footers, the `?` help,
   on grey buttons and inside a sentence ("not signed in · `l` signs in").
@@ -70,6 +82,14 @@ All notable changes to this project are documented here. The format follows
 - `o` in the sign-in dialog says when the browser opener could not be
   started, and opened links no longer leave an ended opener process behind
   while the list is open.
+- A `paste-cache` (or `image-cache`) folder that Claude Code made in an
+  account folder no longer makes every start print that it is not linked:
+  the next start moves its files into `~/.claude` (a clashing file goes to
+  `backups/`) and links it again. Other folders that are not linked still
+  get a start line, which now says how to share them.
+- After a `/login` inside a session put another entry's login into an
+  account's folder, sessions on that account say so at start and name `l`
+  to sign it in again; they still start.
 - Removing a subscription account no longer freezes the list while it is
   signed out: the sign-out runs in the background, the account's row says
   "signing out…" until it is gone, and closing the list meanwhile keeps the

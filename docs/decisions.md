@@ -33,7 +33,8 @@ copied.
 Some programs save a file by writing a new one over the path, which turns a
 link into a copy. The shell function and the status line put such files
 back: the newer content wins, the other goes to `backups/`, the link is made
-again. Folders that turned into real folders are left alone and reported.
+again. Folders that turned into real folders are left alone and reported
+(caches excepted since 2026-11-14, see below).
 All changes to an account folder hold a lock on it (`homes/<id>.lock`), the
 healed file is written into the real file behind `~/.claude` (never copied
 onto itself), and nothing is replaced unless its backup succeeded. Removing
@@ -199,6 +200,25 @@ Checks run only while the list is open, one account after the other, once a
 minute by default (`check_limits`, at least 30 seconds): enough to see a
 window fill up, little load, and nothing runs in the background when nobody
 looks. API keys and logins without limits are skipped.
+
+Changed on 2026-11-14 (#23): one check a minute per account was a full
+Claude Code start per account and minute, also for accounts whose running
+session already reports its limits through the status line. Now an account
+is checked only when its freshest reading (the status line's `limits_at`,
+set only by a call that carried limits after a new answer, which the
+session's cost changing shows, since an idle session repeats its last
+answer's windows; or `/usage`'s `probed_at` from any open list; among
+accounts with the same login) is older than `check_limits`, whose default
+became 300 seconds. The list looks at this on every tick rather than on one
+fixed timer, so while checks work and the list is in view a reading is
+never older than the interval plus one check; a check that failed is tried
+again after the interval. Checks also wait while the list is not in front:
+Herdr's `workspace list` (`focused`, `active_tab_id`) and `pane list` (each
+pane's tab) tell whether its space and tab are shown, polled every 5
+seconds already. Herdr's focus events were not used: a split list is
+visible while you type in the pane next to it. When Herdr cannot tell, the
+list counts as in view; Herdr does not say whether a client is attached or
+another pane of the tab is zoomed, so checks still run then.
 
 ## 2026-11-09: Sessions tab
 
@@ -673,6 +693,67 @@ reach the config directory through different paths (a link above it), so
 the folders are also compared resolved. Only the
 list writes notes: the launcher writing its own live result would make
 starts fast with the list closed too, but the issue left that out.
+
+## 2026-11-14: Cache folders that turned real are merged back
+
+"One setup through linked folders" left every real folder in an account
+folder alone and reported it at each start. Claude Code makes such a folder
+when it needs one before `~/.claude` has it: a `/login` inside a session
+pastes its code into `paste-cache`, and once `~/.claude/paste-cache` exists
+too, every start printed that it was not linked, for good (#21).
+
+Now folders that only hold Claude Code's caches (`mirror::is_cache`:
+`paste-cache` and `image-cache`, pasted text and images) are merged at the
+next start, under the account folder's lock: a plain file `~/.claude`'s
+folder lacks is moved there (a hard link, or a copy on another disk, never
+replacing anything or leaving half a file), the same file is dropped, and a file of the same name
+with other content goes to `backups/` first so `~/.claude`'s version stays.
+Once the folder is empty it becomes a link. Links and subfolders inside it
+are never followed or moved; the folder then stays and is reported. A
+failure while merging never stops the session. Every other real folder
+(`skills`, `projects` and the rest) is still left alone, since merging could
+mix two setups; its start line now says how to share it by hand. The scope,
+caches only, was the owner's choice. In `~/.claude` it only adds files,
+never replaces one.
+
+## 2026-11-14: A login shared after `/login` is named at start
+
+A `/login` inside a session on a subscription account signs that account's
+folder in to whatever account is chosen; the plugin does not block or wrap
+Claude Code's own command. When the folder then holds the same login as
+another entry (`login::same_as`), each session started on it at a terminal
+(not starts nested inside a session or run by scripts) prints one line
+naming that entry and `l` to sign it in again, and starts anyway; the list
+already marks both rows `same login as …`. Refusing to start was rejected
+(owner's choice): the login works, its limits are shared as twins, and the
+switch may have been meant. Right after the launcher's own sign-in the line
+is left out, since the sign-in already said it.
+
+## 2026-11-14: The old-folder notice is a Herdr notification from the launcher
+
+The line a session on an account's old folder printed (#14) went to stderr
+right before Claude Code took over the screen, so it was easy to miss, and
+the list row dropped it while the account was at its limit (#17). Now the
+launcher also sends a Herdr notification for every session that starts on
+the old folder (the owner's choice over once a day or once per account),
+under the same condition as labelling the pane: inside Herdr, at a
+terminal, not a start nested inside another Claude Code session. The row
+shows the notice in front of the limit text, since the limit also shows in
+its own column.
+
+The launcher runs exactly once per session and knows the folder before
+Claude Code starts, so the notice arrives before the first edit prompt and
+needs no record of who was told. Sending it from the status line was
+rejected: it would need a claim per session in `accounts.json` so that
+refreshes and two runs at once do not repeat it, and it would come only
+after Claude Code's first status line. The `notify` setting is not
+consulted; it is about fallback only.
+
+Whether memory edits through an account's links still ask on the new
+folder is not changed here: Claude Code checks both the requested and the
+resolved path of a write through a link, and every way around it found so
+far is undocumented or gives up shared memory. It is checked by hand, and a
+remaining prompt becomes its own issue.
 
 ## 2026-11-14: Removing an account signs it out in the background, with a time limit
 

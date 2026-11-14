@@ -33,8 +33,9 @@ to the next account when one is at its limit.
   Sessions that already run keep their account.
 - **Limits.** The 5-hour and 7-day windows of each subscription with the time
   until they reset, a gateway's spend limit, and this month's cost per
-  account as Claude Code prices it. While the list is open it reads each
-  subscription's limits every minute, also for accounts no session uses.
+  account as Claude Code prices it. While the list is in view it reads the
+  limits of each subscription that has no reading from the last 5 minutes,
+  also for accounts no session uses.
 - **Spaces.** In the Spaces tab, `⏎` on a space picks its account. New
   sessions in that space use it; the sidebar shows it next to the space.
   `d` closes a space after asking, with its tabs and everything running in
@@ -175,15 +176,29 @@ session starts.
 - **Accounts from version 1.0.0** were kept in `homes/<account>/` itself.
   Claude Code ties a login to its folder's path, so these accounts sign in
   once more after the update: their row says `l signs in again to stop edit
-  prompts`, and sessions started on them say the same. Until then they keep
-  working on their old folder, where Claude asks before every edit in
-  `~/.claude`. Removing the account signs out and deletes both folders.
+  prompts` (also when the account is at its limit), and each session started
+  on them says the same, in Herdr as a notification before Claude Code
+  starts. Until then they keep working on their old folder, where Claude
+  asks before every edit in `~/.claude` (skills, `CLAUDE.md`, memory).
+  Removing the account signs out and deletes both folders.
 - **API keys** go into the system keychain (macOS Keychain, or the Secret
   Service through `secret-tool` on Linux). You paste the key into a field
   that shows dots; the plugin reads it only to start Claude Code with
   `ANTHROPIC_API_KEY`.
 - **The main login** is what `~/.claude` holds; the plugin does not touch it.
   Sign it in again with `/login` in Claude Code.
+- **`/login` inside a session** on a subscription account signs that
+  account's folder in to whatever account you choose, as Claude Code always
+  does. When that is the login of another entry, both rows say `same login
+  as …` and every new session on the account says so at start; it still
+  starts. `l` on the account signs it in to its own login again.
+- **Real folders where a link belongs.** Claude Code sometimes makes a folder
+  in an account folder before `~/.claude` has one of that name. For its
+  caches of pasted text and images (`paste-cache`, `image-cache`) the next
+  start moves the files into `~/.claude`'s folder (a file of the same name
+  with other content goes to `backups/` first, `~/.claude`'s stays) and
+  links the folder again. Any other such folder is left alone, and each
+  start names it and says how to share it.
 
 Two things outside Herdr make it work. Setup (`S` in the list) adds both,
 backs up each file first, and `herdr-multiaccount setup --undo` takes them back:
@@ -202,12 +217,18 @@ backs up each file first, and `herdr-multiaccount setup --undo` takes them back:
    (Claude Code's session id) each pane holds, so `m` can move it.
 
 While the list is open, it also runs Claude Code's own `/usage` command for
-each signed-in subscription once a minute (`claude -p /usage` in the
-account's folder, with `--safe-mode` and `--no-session-persistence`, so no
-hooks, plugins or MCP servers start and no session is saved). That uses no
-model and costs nothing; Claude Code asks with its own login, as when you
-type `/usage`, and the list reads the percentages and reset times from what
-it prints. `check_limits` sets how often, `0` turns it off.
+signed-in subscriptions (`claude -p /usage` in the account's folder, with
+`--safe-mode` and `--no-session-persistence`, so no hooks, plugins or MCP
+servers start and no session is saved). That uses no model and costs
+nothing; Claude Code asks with its own login, as when you type `/usage`, and
+the list reads the percentages and reset times from what it prints. It
+checks only an account whose last reading is older than `check_limits`
+(5 minutes by default; `0` turns the checks off): a running session whose
+status line brought the limits with an answer in that time, or a check from
+another open list, counts as a reading, and accounts signed in with the same login are
+checked once. While the list is not in front in Herdr (another tab or space
+is shown), no checks start; when it comes back, accounts with old readings
+are checked at once. `r` checks every account right away.
 
 The plugin makes no network requests of its own and never asks Anthropic for
 anything; all numbers come from Claude Code.
@@ -296,7 +317,7 @@ Optional. Copy `config.toml.example` to the directory
 | `threshold` | `95` | Used share (50 to 100 %) from which an account counts as at its limit |
 | `notify` | `true` | A Herdr notification when fallback starts moving sessions |
 | `remind` | `true` | A Herdr popup when a session can go back to the account fallback moved it away from |
-| `check_limits` | `60` | Seconds between limit checks while the list is open (at least 30); `0` turns them off |
+| `check_limits` | `300` | Seconds a limit reading stays current while the list is open (at least 30): an account is checked only when its last reading, from `/usage` or a session's status line, is older; `0` turns the checks off |
 | `placement` | `overlay` | `overlay` over the tab, `split` next to the focused pane, or `tab` |
 | `split_direction` | `down` | Where a split goes: `down` or `right` |
 | `icons` | `nerd` | `plain` for terminals without a Nerd Font (or press `i`) |
