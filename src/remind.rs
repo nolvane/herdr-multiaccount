@@ -124,7 +124,7 @@ pub fn pane() -> i32 {
     let label = herdr::pane_label(pane).unwrap_or_else(|| pane.to_string());
     let (title, body) = texts(&label, &store.name_of(back), &store.name_of(now_on));
     let mut terminal = crate::enter_terminal();
-    let go = dialog(&mut terminal, &title, &body, " Esc later ").unwrap_or(false);
+    let go = dialog(&mut terminal, &title, &body, " `Esc` later ").unwrap_or(false);
     crate::leave_terminal();
     if go {
         if let Some(tab) = herdr::pane_tab(pane) {
@@ -135,75 +135,24 @@ pub fn pane() -> i32 {
 }
 
 /// Draws the dialog until a button is chosen: true for "Go to session",
-/// false for the other button (`other`, its text). Also the popup of a
-/// failed move (`relocate::moved_pane`).
+/// false for the other button (`other`, its text, with its key between
+/// backticks as for `theme::keys`). Also the popup of a failed move
+/// (`relocate::moved_pane`).
 pub fn dialog(
     terminal: &mut ratatui::DefaultTerminal,
     title: &str,
     body: &str,
     other: &str,
 ) -> std::io::Result<bool> {
-    use crate::theme::{self, ACCENT, BORDER, MUTED, TEXT};
     use ratatui::crossterm::event::{
         self, Event, KeyCode, KeyEventKind, MouseButton, MouseEventKind,
     };
     use ratatui::layout::Rect;
-    use ratatui::style::{Modifier, Style};
-    use ratatui::text::{Line, Span, Text};
-    use ratatui::widgets::{Clear, Paragraph};
 
     let mut go_area = Rect::default();
     let mut later_area = Rect::default();
     loop {
-        terminal.draw(|f| {
-            // Herdr draws the popup's border; this fills its inside.
-            let area = f.area();
-            let inner = Rect::new(
-                area.x + 1,
-                area.y,
-                area.width.saturating_sub(2),
-                area.height,
-            );
-            let mut text = vec![
-                Line::from(Span::styled(
-                    title.to_string(),
-                    Style::new().fg(ACCENT).add_modifier(Modifier::BOLD),
-                )),
-                Line::from(""),
-            ];
-            for l in crate::ui::wrap(body, inner.width as usize) {
-                text.push(Line::from(Span::styled(l, Style::new().fg(TEXT))));
-            }
-            f.render_widget(Clear, area);
-            f.render_widget(
-                Paragraph::new(Text::from(text)),
-                Rect::new(
-                    inner.x,
-                    inner.y,
-                    inner.width,
-                    inner.height.saturating_sub(2),
-                ),
-            );
-            let y = inner.y + inner.height.saturating_sub(1);
-            let go = " ⏎ Go to session ";
-            let later = other;
-            go_area = Rect::new(inner.x, y, go.chars().count() as u16, 1);
-            later_area = Rect::new(go_area.x + go_area.width + 1, y, later.len() as u16, 1);
-            f.render_widget(
-                Paragraph::new(Line::from(vec![
-                    Span::styled(
-                        go,
-                        Style::new()
-                            .fg(theme::on(ACCENT))
-                            .bg(ACCENT)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::raw(" "),
-                    Span::styled(later, Style::new().fg(MUTED).bg(BORDER)),
-                ])),
-                Rect::new(inner.x, y, inner.width, 1),
-            );
-        })?;
+        terminal.draw(|f| (go_area, later_area) = draw_dialog(f, title, body, other))?;
         match event::read()? {
             Event::Key(k) if k.kind != KeyEventKind::Release => match k.code {
                 KeyCode::Enter | KeyCode::Char('g') => return Ok(true),
@@ -227,6 +176,75 @@ pub fn dialog(
             _ => {}
         }
     }
+}
+
+/// One frame of [`dialog`]; gives the places of its two buttons.
+fn draw_dialog(
+    f: &mut ratatui::Frame,
+    title: &str,
+    body: &str,
+    other: &str,
+) -> (ratatui::layout::Rect, ratatui::layout::Rect) {
+    use crate::theme::{self, ACCENT, BORDER, MUTED, TEXT};
+    use ratatui::layout::Rect;
+    use ratatui::style::{Modifier, Style};
+    use ratatui::text::{Line, Span, Text};
+    use ratatui::widgets::{Clear, Paragraph};
+    use unicode_width::UnicodeWidthStr;
+
+    // Herdr draws the popup's border; this fills its inside.
+    let area = f.area();
+    let inner = Rect::new(
+        area.x + 1,
+        area.y,
+        area.width.saturating_sub(2),
+        area.height,
+    );
+    let mut text = vec![
+        Line::from(Span::styled(
+            title.to_string(),
+            Style::new().fg(ACCENT).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+    ];
+    for l in crate::ui::wrap(body, inner.width as usize) {
+        text.push(Line::from(Span::styled(l, Style::new().fg(TEXT))));
+    }
+    f.render_widget(Clear, area);
+    f.render_widget(
+        Paragraph::new(Text::from(text)),
+        Rect::new(
+            inner.x,
+            inner.y,
+            inner.width,
+            inner.height.saturating_sub(2),
+        ),
+    );
+    let y = inner.y + inner.height.saturating_sub(1);
+    let go = " ⏎ Go to session ";
+    let later = theme::keys(other);
+    let go_area = Rect::new(inner.x, y, go.width() as u16, 1);
+    let later_area = Rect::new(go_area.x + go_area.width + 1, y, later.width() as u16, 1);
+    // The accent button stays one block; the grey one shows its key.
+    let mut buttons = vec![
+        Span::styled(
+            go,
+            Style::new()
+                .fg(theme::on(ACCENT))
+                .bg(ACCENT)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" "),
+    ];
+    buttons.extend(crate::ui::with_keys(
+        &later,
+        Style::new().fg(MUTED).bg(BORDER),
+    ));
+    f.render_widget(
+        Paragraph::new(Line::from(buttons)),
+        Rect::new(inner.x, y, inner.width, 1),
+    );
+    (go_area, later_area)
 }
 
 #[cfg(test)]
@@ -292,5 +310,46 @@ mod tests {
         let (title, body) = texts("acme › claude", "Max", "Key");
         assert_eq!(title, "Max has room again");
         assert!(body.contains("/exit") && body.contains("claude --continue"));
+    }
+
+    #[test]
+    fn the_grey_button_shows_its_key_and_the_notification_holds_no_mark() {
+        use crate::theme::{ACCENT, BORDER, KEY_MARK};
+        use ratatui::backend::TestBackend;
+        use ratatui::style::Modifier;
+        let (title, body) = texts("acme › claude", "`d`", "Key");
+        // A Herdr notification shows text as it is: no marks in it.
+        assert!(!title.contains(KEY_MARK) && !body.contains(KEY_MARK));
+        for other in [" `Esc` later ", " `Esc` close "] {
+            let mut t = ratatui::Terminal::new(TestBackend::new(64, 12)).unwrap();
+            let mut areas = Default::default();
+            t.draw(|f| areas = draw_dialog(f, &title, &body, other))
+                .unwrap();
+            let (go, later) = areas;
+            let buf = t.backend().buffer();
+            let key = |x: u16| {
+                let c = &buf[(x, later.y)];
+                c.fg == ACCENT && c.modifier.contains(Modifier::BOLD)
+            };
+            // " Esc later ": the key on the grey, the word not.
+            assert_eq!(later.width as usize, other.len() - 2, "{other}");
+            for x in later.x..later.x + later.width {
+                assert_eq!(buf[(x, later.y)].bg, BORDER, "{other}");
+                let in_key = (later.x + 1..later.x + 4).contains(&x);
+                assert_eq!(key(x), in_key, "{other} at {x}");
+            }
+            // The accent button stays one block.
+            for x in go.x..go.x + go.width {
+                assert_eq!(buf[(x, go.y)].bg, ACCENT);
+                assert_ne!(buf[(x, go.y)].fg, ACCENT);
+            }
+            // The title keeps its bold accent (the owner's decision).
+            assert!(key_at(buf, 1, 0));
+        }
+    }
+
+    fn key_at(buf: &ratatui::buffer::Buffer, x: u16, y: u16) -> bool {
+        let c = &buf[(x, y)];
+        c.fg == crate::theme::ACCENT && c.modifier.contains(ratatui::style::Modifier::BOLD)
     }
 }

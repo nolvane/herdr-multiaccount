@@ -12,6 +12,7 @@ use crate::secret;
 use crate::setup;
 use crate::signin::SignIn;
 use crate::store::{Account, Kind, Store, MAIN_ID};
+use crate::theme;
 use crate::time;
 use crate::ui;
 use crate::usage::Usage;
@@ -262,14 +263,15 @@ pub enum Mode {
 
 type HerdrState = (Option<Vec<Workspace>>, Option<Vec<Pane>>);
 
-/// How the list works, shown on first open and under `?`.
+/// How the list works, shown on first open and under `?`. Keys stand
+/// between backticks (`theme::keys`).
 pub const INTRO: [&str; 6] = [
     "Main login is the login Claude Code already has in ~/.claude, the one /login sets. This list never changes it; to switch it, run /login in Claude Code.",
     "Every other account sits next to it in a folder of its own with its own login, and shares your settings, skills, plugins and history.",
-    "New sessions start on the active account; choose it with ⏎. Running sessions keep theirs, and a space can have an account of its own (Spaces).",
-    "When an account is at its limit, new sessions go to the next account in the list that has room (fallback, F).",
+    "New sessions start on the active account; choose it with `⏎`. Running sessions keep theirs, and a space can have an account of its own (Spaces).",
+    "When an account is at its limit, new sessions go to the next account in the list that has room (fallback, `F`).",
     "Limits come from Claude Code: its /usage, read every minute while this list is open, and the status line of running sessions.",
-    "Agents shows which account each Claude Code session runs on. ? shows all keys and this note again.",
+    "Agents shows which account each Claude Code session runs on. `?` shows all keys and this note again.",
 ];
 
 /// The field an API key is pasted into.
@@ -828,10 +830,10 @@ impl App {
         }
         let group = Self::space_group(&now, &first.id);
         if let Some(new) = group.iter().find(|w| !named.iter().any(|n| n.id == w.id)) {
-            self.flash(
-                format!(
-                    "{} opened since; nothing was closed. Press d again",
-                    Self::space_name(new)
+            self.flash_keys(
+                theme::named(
+                    &Self::space_name(new),
+                    " opened since; nothing was closed. Press `d` again",
                 ),
                 crate::theme::YELLOW,
             );
@@ -851,8 +853,11 @@ impl App {
             .filter(|p| group.iter().any(|w| w.id == p.workspace) && self.is_session(p))
             .any(|p| !counted.contains(&p.id) || (Self::busy(p) && !warned.contains(&p.id)));
         if changed {
-            self.flash(
-                format!("{label} changed since the question; nothing was closed. Press d again"),
+            self.flash_keys(
+                theme::named(
+                    label,
+                    " changed since the question; nothing was closed. Press `d` again",
+                ),
                 crate::theme::YELLOW,
             );
             self.workspaces = now;
@@ -893,11 +898,17 @@ impl App {
                         s.assign(id, name, Some(account));
                     }
                 });
-            self.flash(
+            self.flash_keys(
                 if back {
-                    format!("Herdr could not close {label}")
+                    format!("Herdr could not close {}", theme::plain(label))
                 } else {
-                    format!("Herdr could not close {label}, and its account choice is lost: choose it again with ⏎")
+                    format!(
+                        "Herdr could not close {}",
+                        theme::named(
+                            label,
+                            ", and its account choice is lost: choose it again with `⏎`"
+                        )
+                    )
                 },
                 crate::theme::RED,
             );
@@ -999,7 +1010,7 @@ impl App {
             self.mode = Mode::Message {
                 title: format!("Which conversation {label} holds is not known"),
                 lines: vec![
-                    "Its status line notes it (every 30 seconds while it runs), and only once setup (S) is done. Try again in a moment.".into(),
+                    theme::keys("Its status line notes it (every 30 seconds while it runs), and only once setup (`S`) is done. Try again in a moment."),
                     format!(
                         "To move it by hand: type /exit in it, then {}=<account> claude --resume and pick the conversation.",
                         launch::ENV_USE
@@ -1132,7 +1143,13 @@ impl App {
 
     /// The user answered yes and waits for an outcome: a refusal gets the
     /// dialog a failed move gets, not a note in the footer.
+    /// `why` often holds a name or an error, so any key mark is taken out.
     fn move_refused(&mut self, label: &str, why: String) {
+        self.move_refused_keys(label, theme::plain(&why));
+    }
+
+    /// `move_refused` for a reason of the list's own that names a key.
+    fn move_refused_keys(&mut self, label: &str, why: String) {
         self.mode = Mode::Message {
             title: format!("{label} was not moved"),
             lines: vec![why],
@@ -1164,18 +1181,24 @@ impl App {
         let Some(held) = (self.conversation_of)(&s.pane)
             .filter(|h| h.session_id == s.session_id && h.pid == s.pid)
         else {
-            self.move_refused(
+            self.move_refused_keys(
                 &label,
-                format!("{label} holds another conversation now. Press m again to move that one."),
+                theme::named(
+                    &label,
+                    " holds another conversation now. Press `m` again to move that one.",
+                ),
             );
             return;
         };
         // The question named the model; a /model since then would move it
         // on another. A model noted only since is the one it runs on.
         if s.carry.model.is_some() && held.carry.model != s.carry.model {
-            self.move_refused(
+            self.move_refused_keys(
                 &label,
-                format!("{label}'s model changed since the question. Press m again to move it on the new one."),
+                theme::named(
+                    &label,
+                    "'s model changed since the question. Press `m` again to move it on the new one.",
+                ),
             );
             return;
         }
@@ -1255,9 +1278,10 @@ impl App {
                 relocate::State::Done(Err(e)) => (format!("{} was not moved", p.label), e),
                 _ => relocate::stopped_text(p),
             };
+            // The report holds names and errors: no key marks.
             self.mode = Mode::Message {
                 title,
-                lines: vec![line],
+                lines: vec![theme::plain(&line)],
                 good: false,
             };
         }
@@ -1278,8 +1302,16 @@ impl App {
         self.next_probe = Instant::now();
     }
 
+    /// A note in the footer for 5 seconds. It often holds a name or an
+    /// error, so any key mark is taken out: no part of it looks like a key.
     pub fn flash(&mut self, text: impl Into<String>, color: Color) {
-        self.flash = Some((text.into(), color, Instant::now() + Duration::from_secs(5)));
+        self.flash_keys(theme::plain(&text.into()), color);
+    }
+
+    /// `flash` for a note of the list's own that names a key, marked with
+    /// `theme::keys`; a name in it goes through `theme::plain` first.
+    fn flash_keys(&mut self, text: String, color: Color) {
+        self.flash = Some((text, color, Instant::now() + Duration::from_secs(5)));
     }
 
     /// Changes the stored accounts (locked, on a fresh read) and takes the
@@ -1691,11 +1723,12 @@ impl App {
                 .clone()
                 .or(info.organization.clone())
                 .unwrap_or_else(|| "an account".into());
+            let who = theme::plain(&who);
             let mut lines = vec![format!(
                 "Signed in as {who}{}.",
                 info.plan
                     .as_deref()
-                    .map(|p| format!(" ({p})"))
+                    .map(|p| format!(" ({})", theme::plain(p)))
                     .unwrap_or_default()
             )];
             // The browser often signs in with whatever account it already
@@ -1818,7 +1851,8 @@ impl App {
                         lines: vec![
                             "The keychain did not delete its API key, so the account stays in the list.".into(),
                             format!(
-                                "Delete the item \"{id}\" (service herdr-multiaccount) in Keychain Access, then remove the account again."
+                                "Delete the item \"{}\" (service herdr-multiaccount) in Keychain Access, then remove the account again.",
+                                theme::plain(id)
                             ),
                         ],
                         good: false,
@@ -1935,8 +1969,8 @@ impl App {
             return;
         }
         if !self.setup.shell {
-            self.flash(
-                "Set up first (S): the claude function picks the account",
+            self.flash_keys(
+                theme::keys("Set up first (`S`): the claude function picks the account"),
                 crate::theme::YELLOW,
             );
             return;
@@ -2482,7 +2516,7 @@ impl App {
         if self.update(|s| s.intro_seen = true) {
             self.mode = Mode::Message {
                 title: "How this list works".into(),
-                lines: INTRO.iter().map(|l| l.to_string()).collect(),
+                lines: INTRO.iter().map(|l| theme::keys(l)).collect(),
                 good: true,
             };
         }
@@ -2654,7 +2688,7 @@ fn sign_out_failed(dirs: &[PathBuf]) -> Mode {
     for dir in dirs {
         lines.push(format!(
             "CLAUDE_CONFIG_DIR=\"{}\" command claude auth logout",
-            dir.display()
+            theme::plain(&dir.display().to_string())
         ));
     }
     Mode::Message {
@@ -2667,6 +2701,20 @@ fn sign_out_failed(dirs: &[PathBuf]) -> Mode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_folder_path_in_a_message_never_has_the_key_look() {
+        // A folder name is text from outside: a key mark in it is dropped.
+        let dir = PathBuf::from(format!("/tmp/a{0}b{0}c", theme::KEY_MARK));
+        let Mode::Message { lines, .. } = sign_out_failed(&[dir]) else {
+            panic!("not a message");
+        };
+        assert!(
+            lines.iter().all(|l| !l.contains(theme::KEY_MARK)),
+            "{lines:?}"
+        );
+        assert!(lines.iter().any(|l| l.contains("/tmp/abc")), "{lines:?}");
+    }
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
@@ -2874,7 +2922,7 @@ mod tests {
                 .collect();
             assert_eq!(with.len(), 1, "only Personal's row: {}", rows.join("\n"));
             assert!(
-                with[0].contains(ui::OLD_FOLDER_NOTICE),
+                with[0].contains(&ui::OLD_FOLDER_NOTICE.replace('`', "")),
                 "whole notice: {}",
                 with[0]
             );
@@ -4468,8 +4516,12 @@ mod tests {
         p.items.iter().map(|i| i.label.clone()).collect()
     }
 
+    /// The footer note's words, without the marks of its keys.
     fn flash_text(a: &App) -> String {
-        a.flash.as_ref().map(|f| f.0.clone()).unwrap_or_default()
+        a.flash
+            .as_ref()
+            .map(|f| theme::plain(&f.0))
+            .unwrap_or_default()
     }
 
     /// Waits for the move started in the background.
@@ -4796,7 +4848,7 @@ mod tests {
         match &a.mode {
             Mode::Message { title, lines, .. } => {
                 assert!(title.contains("not known"), "{title}");
-                let text = lines.join(" ");
+                let text = theme::plain(&lines.join(" "));
                 assert!(text.contains("/exit"), "{text}");
                 assert!(text.contains("claude --resume"), "{text}");
                 assert!(text.contains("setup (S)"), "{text}");
@@ -5465,5 +5517,493 @@ mod tests {
                 assert!(whole, "{w}x{h}: {word} cut off\n{screen}");
             }
         }
+    }
+
+    // ---- the key look (#18) ------------------------------------------
+
+    /// The drawn frame: each row's text, and the buffer for its looks.
+    fn drawn(a: &mut App, w: u16, h: u16) -> (Vec<String>, ratatui::buffer::Buffer) {
+        let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+        t.draw(|f| ui::draw(f, a)).unwrap();
+        let buf = t.backend().buffer().clone();
+        let rows = (0..h)
+            .map(|y| (0..w).map(|x| buf[(x, y)].symbol().to_string()).collect())
+            .collect();
+        (rows, buf)
+    }
+
+    fn is_key(buf: &ratatui::buffer::Buffer, x: u16, y: u16) -> bool {
+        let c = &buf[(x, y)];
+        c.fg == theme::ACCENT && c.modifier.contains(ratatui::style::Modifier::BOLD)
+    }
+
+    /// Where `text` starts on screen (one cell per character), searched
+    /// from row `from` on.
+    fn spot_from(rows: &[String], text: &str, from: usize) -> (u16, u16) {
+        rows.iter()
+            .enumerate()
+            .skip(from)
+            .find_map(|(y, r)| {
+                r.find(text)
+                    .map(|i| (r[..i].chars().count() as u16, y as u16))
+            })
+            .unwrap_or_else(|| panic!("{text:?} not on screen:\n{}", rows.join("\n")))
+    }
+
+    /// Checks one text on screen: the characters between backticks in
+    /// `marked` have the key look, every other character has not.
+    fn looks_from(rows: &[String], buf: &ratatui::buffer::Buffer, marked: &str, from: usize) {
+        let shown = marked.replace('`', "");
+        let (x0, y) = spot_from(rows, &shown, from);
+        let mut key = false;
+        let mut x = x0;
+        for c in marked.chars() {
+            if c == '`' {
+                key = !key;
+                continue;
+            }
+            assert_eq!(
+                is_key(buf, x, y),
+                key,
+                "{c:?} at {x} in {marked:?}: {:?}\n{}",
+                buf[(x, y)],
+                rows[y as usize]
+            );
+            x += 1;
+        }
+    }
+
+    fn looks(rows: &[String], buf: &ratatui::buffer::Buffer, marked: &str) {
+        looks_from(rows, buf, marked, 0)
+    }
+
+    #[test]
+    fn footer_keys_have_the_key_look_and_click_where_they_are() {
+        let footers: [(Section, &[&str]); 3] = [
+            (
+                Section::Accounts,
+                &[
+                    "`⏎` make active",
+                    "`a` add",
+                    "`c` start Claude",
+                    "`?` all keys",
+                    "`q` close",
+                ],
+            ),
+            (
+                Section::Spaces,
+                &[
+                    "`⏎` choose account",
+                    "`x` use active",
+                    "`d` close space",
+                    "`?` all keys",
+                ],
+            ),
+            (
+                Section::Sessions,
+                &[
+                    "`⏎` go to session",
+                    "`m` move",
+                    "`d` end session",
+                    "`?` all keys",
+                ],
+            ),
+        ];
+        for (section, hints) in footers {
+            let mut a = app();
+            a.section = section;
+            a.info_loading = false;
+            let (rows, buf) = drawn(&mut a, 160, 30);
+            for hint in hints {
+                looks_from(&rows, &buf, hint, 29);
+            }
+            looks_from(&rows, &buf, "`r` refresh", 29);
+            // Every key the footer lets click starts at its key.
+            for (r, h) in a.hits.iter().filter(|(r, _)| r.y == 29) {
+                if let Hit::Key(_) = h {
+                    assert!(is_key(&buf, r.x, 29), "{h:?} at {}: {}", r.x, rows[29]);
+                }
+            }
+        }
+        // A click on a key does what it did before.
+        let mut a = app();
+        a.info_loading = false;
+        let (rows, _) = drawn(&mut a, 160, 30);
+        let (x, y) = spot_from(&rows, "a add", 29);
+        a.click(x, y);
+        assert!(matches!(a.mode, Mode::Pick(_)), "{:?}", a.mode);
+        let mut a = app();
+        let (rows, _) = drawn(&mut a, 160, 30);
+        let (x, y) = spot_from(&rows, "? all keys", 29);
+        a.click(x, y);
+        assert_eq!(a.mode, Mode::Help);
+        // A narrow footer still drops whole hints from the right.
+        let mut a = app();
+        let (rows, buf) = drawn(&mut a, 60, 30);
+        assert!(!rows[29].contains("close"), "{}", rows[29]);
+        assert!(!a.hits.iter().any(|(_, h)| *h == Hit::Key('q')));
+        looks_from(&rows, &buf, "`⏎` make active", 29);
+    }
+
+    #[test]
+    fn status_lines_show_only_their_key_in_the_key_look() {
+        let mut a = app();
+        a.info_loading = false;
+        a.setup = setup::State {
+            shell: true,
+            statusline: true,
+        };
+        // One-letter and backtick names are names, never keys.
+        a.store.accounts[1].name = "d".into();
+        a.store.accounts.push(Account {
+            id: "key".into(),
+            name: "`x`".into(),
+            kind: Kind::ApiKey,
+            sso: false,
+            fallback: true,
+        });
+        a.store.accounts.push(Account {
+            id: "work".into(),
+            name: "Work".into(),
+            kind: Kind::Subscription,
+            sso: false,
+            fallback: true,
+        });
+        a.info.insert(MAIN_ID.into(), signed_in("Max"));
+        a.info.insert("personal".into(), Info::default());
+        a.info.insert("key".into(), Info::default());
+        a.info.insert(
+            "work".into(),
+            Info {
+                old_folder: true,
+                ..signed_in("Pro")
+            },
+        );
+        let (rows, buf) = drawn(&mut a, 160, 30);
+        looks(&rows, &buf, "not signed in · `l` signs in");
+        looks(&rows, &buf, "no key stored · `l` adds it");
+        looks(&rows, &buf, "`l` signs in again to stop edit prompts");
+        let (x, y) = spot_from(&rows, "not signed in", 0);
+        assert_eq!(buf[(x, y)].fg, theme::RED, "the rest stays red");
+        let (x, y) = spot_from(&rows, "signs in again", 0);
+        assert_eq!(buf[(x, y)].fg, theme::YELLOW, "the rest stays yellow");
+        // "active" is no longer bold accent; the accent mark stays.
+        looks(&rows, &buf, "active");
+        let (x, y) = spot_from(&rows, "active", 0);
+        assert!(
+            (0..x).any(|cx| buf[(cx, y - 1)].fg == theme::ACCENT),
+            "{}",
+            rows[y as usize - 1]
+        );
+        // Names: the backticks show, nothing is a key.
+        let (x, y) = spot_from(&rows, "`x`", 0);
+        for dx in 0..3 {
+            assert!(!is_key(&buf, x + dx, y), "{}", rows[y as usize]);
+        }
+        let (x, y) = spot_from(&rows, " d ", 0);
+        assert!(!is_key(&buf, x + 1, y), "{}", rows[y as usize]);
+    }
+
+    #[test]
+    fn the_setup_notice_shows_s_as_a_key() {
+        let mut a = app();
+        a.setup = setup::State {
+            shell: false,
+            statusline: true,
+        };
+        let (rows, buf) = drawn(&mut a, 160, 30);
+        looks(&rows, &buf, "`S` set up");
+    }
+
+    #[test]
+    fn notes_and_messages_show_the_keys_they_name() {
+        // A note in the footer.
+        let mut a = app();
+        a.flash_keys(
+            format!(
+                "{}{}",
+                theme::plain("fix-login"),
+                theme::keys(" changed since the question; nothing was closed. Press `d` again")
+            ),
+            theme::YELLOW,
+        );
+        let (rows, buf) = drawn(&mut a, 160, 30);
+        looks(&rows, &buf, "nothing was closed. Press `d` again");
+        // A plain note never gets the look, not even from a marked name.
+        let mut a = app();
+        a.flash(
+            format!("Renamed to a{}d{}", theme::KEY_MARK, theme::KEY_MARK),
+            theme::ACCENT,
+        );
+        assert_eq!(flash_text(&a), "Renamed to ad");
+        let (rows, buf) = drawn(&mut a, 160, 30);
+        looks(&rows, &buf, "Renamed to ad");
+        // Setup named in a note.
+        let mut a = app();
+        a.in_herdr = true;
+        a.setup = setup::State {
+            shell: false,
+            statusline: true,
+        };
+        press(&mut a, KeyCode::Char('c'));
+        let (rows, buf) = drawn(&mut a, 160, 30);
+        looks_from(&rows, &buf, "Set up first (`S`): the claude", 29);
+        // A session label with a mark of its own in a refused move: plain.
+        let mut a = movable();
+        a.panes[0].label = format!("Fix{}the{}bug", theme::KEY_MARK, theme::KEY_MARK);
+        set_fresh(Some(a.panes.clone()));
+        press(&mut a, KeyCode::Char('m'));
+        press(&mut a, KeyCode::Enter);
+        set_fresh(Some(vec![shell("w91:p1", "w91:t1")]));
+        press(&mut a, KeyCode::Char('y'));
+        let (rows, buf) = drawn(&mut a, 120, 40);
+        looks(&rows, &buf, "Fixthebug has ended.");
+        // Setup named in a message.
+        let mut a = movable();
+        a.conversation_of = knows_nothing;
+        press(&mut a, KeyCode::Char('m'));
+        let (rows, buf) = drawn(&mut a, 120, 40);
+        looks(&rows, &buf, "setup (`S`) is done");
+        // A move refused after yes.
+        let mut a = movable();
+        press(&mut a, KeyCode::Char('m'));
+        press(&mut a, KeyCode::Enter);
+        a.conversation_of = knows_another;
+        press(&mut a, KeyCode::Char('y'));
+        let (rows, buf) = drawn(&mut a, 120, 40);
+        looks(&rows, &buf, "Press `m` again");
+        // The note after a sign-in with another account's login: marked for
+        // the list, plain for a terminal, names as they are.
+        let names = vec!["`d`".to_string()];
+        let note = crate::login::same_login_note(&names);
+        assert!(note.contains("`d`"), "{note}");
+        assert!(
+            note.contains(&theme::keys("press `l` to sign in")),
+            "{note}"
+        );
+        // What the launcher prints (`launch.rs`).
+        let terminal = theme::plain(&note);
+        assert!(terminal.contains("as `d`. If") && terminal.contains("press l to"));
+        let mut a = app();
+        a.mode = Mode::Message {
+            title: "Work is signed in".into(),
+            lines: vec!["Work is signed in.".into(), note],
+            good: false,
+        };
+        let (rows, buf) = drawn(&mut a, 120, 40);
+        let (x, y) = spot_from(&rows, "same login as `d`", 0);
+        for dx in 14..17 {
+            assert!(!is_key(&buf, x + dx, y), "{}", rows[y as usize]);
+        }
+        looks(&rows, &buf, "press `l` to sign");
+        // The note on how the list works, first as a message.
+        let mut a = app();
+        a.store.intro_seen = false;
+        STORED.with(|s| s.borrow_mut().intro_seen = false);
+        a.show_intro();
+        let (rows, buf) = drawn(&mut a, 120, 50);
+        looks(&rows, &buf, "choose it with `⏎`.");
+        looks(&rows, &buf, "(fallback, `F`)");
+        looks(&rows, &buf, "`?` shows");
+        // Commands are no keys.
+        looks(&rows, &buf, "/login");
+        looks(&rows, &buf, "/usage");
+    }
+
+    #[test]
+    fn help_keys_have_the_key_look_and_headings_do_not() {
+        let (_, rows, area, t) = help_on(160, 60, opens);
+        let buf = t.backend().buffer();
+        // The key column is 18 wide; its padding is no key.
+        let entry =
+            |k: &str, what: &str| format!("`{k}`{}{what}", " ".repeat(18 - k.chars().count()));
+        looks(&rows, buf, &entry("⏎  Space", "make active"));
+        looks(&rows, buf, &entry("K J  Shift+↑ ↓", "move up / down"));
+        looks(&rows, buf, &entry("n  Esc", "no"));
+        looks(&rows, buf, "`any other key` leaves the question open");
+        for heading in [
+            "Accounts",
+            "Spaces",
+            "Agents",
+            "Questions",
+            "List",
+            "How it works",
+        ] {
+            let (x, y) = spot_from(&rows, heading, area.y as usize + 1);
+            let c = &buf[(x, y)];
+            assert_eq!(c.fg, theme::TEXT, "{heading}");
+            assert!(
+                c.modifier.contains(ratatui::style::Modifier::BOLD),
+                "{heading}"
+            );
+        }
+        looks(&rows, buf, "choose it with `⏎`.");
+        looks(&rows, buf, "`?` shows");
+        looks(&rows, buf, "/login");
+        // The title in the border keeps its bold accent.
+        let (x, y) = spot_from(&rows, " Keys ", 0);
+        assert!(is_key(buf, x + 1, y));
+        // Taller than the pane: the scroll hint's keys too.
+        let (_, rows, _, t) = help_on(80, 20, opens);
+        looks(&rows, t.backend().buffer(), "`↑ ↓` scroll ·");
+    }
+
+    #[test]
+    fn dialog_footers_show_their_keys() {
+        let mut a = app();
+        press(&mut a, KeyCode::Char('a'));
+        let (rows, buf) = drawn(&mut a, 120, 40);
+        looks(&rows, &buf, "`⏎` choose  `Esc` back");
+        press(&mut a, KeyCode::Char('3'));
+        let (rows, buf) = drawn(&mut a, 120, 40);
+        looks(&rows, &buf, "`⏎` ok  `Esc` cancel");
+        let mut a = app();
+        a.signin = Some(SignIn::showing("https://example.com/sign-in"));
+        a.mode = Mode::SignIn {
+            code: String::new(),
+        };
+        let (rows, buf) = drawn(&mut a, 120, 40);
+        looks(&rows, &buf, "`o` open again  `y` copy link  `Esc` cancel");
+    }
+
+    #[test]
+    fn grey_buttons_show_their_keys_coloured_buttons_stay_one_block() {
+        let mut a = movable();
+        press(&mut a, KeyCode::Char('m'));
+        press(&mut a, KeyCode::Enter);
+        for (w, no) in [(120, "`Esc` `n` no"), (24, "`n` no")] {
+            let (rows, buf) = drawn(&mut a, w, 40);
+            looks(&rows, &buf, no);
+            let (no_x, y) = spot_from(&rows, &no.replace('`', ""), 0);
+            assert_eq!(buf[(no_x, y)].bg, theme::BORDER, "the key keeps the grey");
+            // The yes button: one green block, no key look.
+            let (x, y) = spot_from(&rows, "y yes", 0);
+            for dx in 0..5 {
+                assert_eq!(buf[(x + dx, y)].bg, theme::GREEN);
+                assert!(!is_key(&buf, x + dx, y));
+            }
+            // A click on the no button still answers no.
+            let hit = a
+                .hits
+                .iter()
+                .find_map(|(r, h)| (*h == Hit::Key('n')).then_some(*r))
+                .unwrap();
+            assert_eq!(hit.x + 1, no_x, "{w}: {}", rows[y as usize]);
+        }
+        // The quit question.
+        let mut a = app();
+        press(&mut a, KeyCode::Char('q'));
+        let (rows, buf) = drawn(&mut a, 120, 30);
+        looks(&rows, &buf, "`any other key` stays");
+        let (x, y) = spot_from(&rows, "y close", 29);
+        for dx in 0..7 {
+            assert_eq!(buf[(x + dx, y)].bg, theme::RED);
+            assert!(!is_key(&buf, x + dx, y));
+        }
+        let (x, y) = spot_from(&rows, "any other key", 29);
+        a.click(x, y);
+        assert_eq!(a.mode, Mode::Normal);
+        assert!(!a.quit);
+    }
+
+    #[test]
+    fn a_long_question_scrolls_with_its_keys_named() {
+        let mut a = app();
+        a.mode = Mode::Confirm(Confirm {
+            question: "Set up the accounts?".into(),
+            lines: vec!["word ".repeat(300)],
+            purpose: ConfirmFor::Setup,
+        });
+        let (rows, buf) = drawn(&mut a, 60, 16);
+        looks(&rows, &buf, "`↑ ↓` scroll ·");
+    }
+
+    #[test]
+    fn only_keys_and_titles_are_bold_accent() {
+        // Every main view (with the setup notice, a signed-out account, the
+        // active one and a note naming a key) and the help: below the header
+        // and outside a dialog's top border, each stretch of bold accent
+        // cells is one of the keys the list names, never a word.
+        let keys = [
+            "⏎",
+            "a",
+            "c",
+            "?",
+            "q",
+            "r",
+            "S",
+            "l",
+            "x",
+            "d",
+            "m",
+            "F",
+            "f",
+            "n",
+            "y",
+            "i",
+            "K J  Shift+↑ ↓",
+            "⏎  Space",
+            "n  Esc",
+            "Esc",
+            "↑ ↓  j k",
+            "← →  Tab  1 2 3",
+            "any other key",
+        ];
+        let runs = |rows: &[String], buf: &ratatui::buffer::Buffer| {
+            let mut out = vec![];
+            for (y, row) in rows.iter().enumerate().skip(1) {
+                if row.contains('╭') {
+                    continue;
+                }
+                let mut run = String::new();
+                for (x, c) in row.chars().enumerate() {
+                    if is_key(buf, x as u16, y as u16) {
+                        run.push(c);
+                    } else if !run.is_empty() {
+                        out.push((y, std::mem::take(&mut run)));
+                    }
+                }
+                if !run.is_empty() {
+                    out.push((y, run));
+                }
+            }
+            out
+        };
+        let mut seen = 0;
+        for section in Section::ORDER {
+            let mut a = movable();
+            a.section = section;
+            a.setup = setup::State {
+                shell: false,
+                statusline: false,
+            };
+            a.info.insert("work".into(), Info::default());
+            a.flash_keys(
+                theme::named(
+                    "notes",
+                    " opened since; nothing was closed. Press `d` again",
+                ),
+                theme::YELLOW,
+            );
+            let (rows, buf) = drawn(&mut a, 160, 40);
+            for (y, run) in runs(&rows, &buf) {
+                assert!(
+                    keys.contains(&run.trim()),
+                    "{run:?} on row {y}: {}",
+                    rows[y]
+                );
+                seen += 1;
+            }
+        }
+        let (_, rows, _, t) = help_on(160, 60, opens);
+        for (y, run) in runs(&rows, t.backend().buffer()) {
+            assert!(
+                keys.contains(&run.trim()),
+                "{run:?} on row {y}: {}",
+                rows[y]
+            );
+            seen += 1;
+        }
+        assert!(seen > 30, "{seen} keys seen");
     }
 }
