@@ -268,7 +268,7 @@ pub const INTRO: [&str; 6] = [
     "Every other account sits next to it in a folder of its own with its own login, and shares your settings, skills, plugins and history.",
     "New sessions start on the active account; choose it with ⏎. Running sessions keep theirs, and a space can have an account of its own (Spaces).",
     "When an account is at its limit, new sessions go to the next account in the list that has room (fallback, F).",
-    "Limits come from Claude Code: its /usage, read every minute while this list is open, and the status line of running sessions.",
+    "Limits come from Claude Code: the status line of running sessions, and its /usage, read while this list is in view for accounts without a reading from the last 5 minutes.",
     "Agents shows which account each Claude Code session runs on. ? shows all keys and this note again.",
 ];
 
@@ -346,7 +346,14 @@ pub struct App {
     /// Limit checks through Claude Code's `/usage` (`probe.rs`).
     probe_rx: Option<Receiver<()>>,
     pub probing: bool,
-    next_probe: Instant,
+    /// When this list last tried each account's check, so one that fails
+    /// is not tried again before the interval is over.
+    probe_tried: HashMap<String, Instant>,
+    /// `r` asked for a check of every account, fresh or not.
+    force_probe: bool,
+    /// Whether the list is in front in Herdr (its space and tab); checks
+    /// wait while it is not. True when Herdr cannot tell.
+    pub in_view: bool,
     last_click: Option<(Instant, Hit)>,
 }
 
@@ -408,7 +415,9 @@ impl App {
             next_info: Instant::now(),
             probe_rx: None,
             probing: false,
-            next_probe: Instant::now(),
+            probe_tried: HashMap::new(),
+            force_probe: false,
+            in_view: true,
             last_click: None,
         }
     }
@@ -466,6 +475,7 @@ impl App {
             self.session_sel = self
                 .session_sel
                 .min(self.sessions().len().saturating_sub(1));
+            self.in_view = in_view(self.own_pane.as_deref(), &self.panes, &self.workspaces);
             self.herdr_rx = None;
         }
     }
@@ -523,21 +533,91 @@ impl App {
             .collect()
     }
 
-    /// Reads the limits of every account through Claude Code's `/usage`,
-    /// one after another in the background.
+    /// Whether an account's limits are older than the check interval: the
+    /// freshest reading of the account and its twins (same login) counts,
+    /// whether the status line or `/usage` (from any open list) took it.
+    fn limits_due(&self, id: &str, now: i64) -> bool {
+        self.one_login(id)
+            .iter()
+            .filter_map(|i| self.usage.get(i).and_then(Usage::limits_read_at))
+            .max()
+            .is_none_or(|t| now - t >= self.config.check_limits as i64)
+    }
+
+    /// Notes a check of an account as tried for its whole login.
+    fn mark_tried(&mut self, id: &str, at: Instant) {
+        for i in self.one_login(id) {
+            self.probe_tried.insert(i, at);
+        }
+    }
+
+    /// An account and the others signed in with the same login.
+    fn one_login(&self, id: &str) -> Vec<String> {
+        let twins = self.twins.get(id).into_iter().flatten().cloned();
+        std::iter::once(id.to_string()).chain(twins).collect()
+    }
+
+    /// The accounts to check now: those whose limits are due and that this
+    /// list has not tried within the interval, one per login. Nothing while
+    /// the list is out of view; `r` checks every account.
+    fn probe_round(&self, now: i64, at: Instant) -> Vec<(String, Option<PathBuf>)> {
+        if !self.in_view && !self.force_probe {
+            return vec![];
+        }
+        let every = Duration::from_secs(self.config.check_limits);
+        let mut round: Vec<(String, Option<PathBuf>)> = vec![];
+        for (id, home) in self.probe_targets() {
+            if !self.force_probe {
+                let tried = self.probe_tried.get(&id);
+                if tried.is_some_and(|t| at.saturating_duration_since(*t) < every)
+                    || !self.limits_due(&id, now)
+                {
+                    continue;
+                }
+            }
+            let twins = self.twins.get(&id).into_iter().flatten();
+            if twins.clone().any(|t| round.iter().any(|(r, _)| r == t)) {
+                continue;
+            }
+            round.push((id, home));
+        }
+        round
+    }
+
+    /// Reads the limits of the accounts that are due through Claude Code's
+    /// `/usage`, one after another in the background.
     fn start_probe(&mut self) {
         if self.config.check_limits == 0 || self.probe_rx.is_some() || self.info_loading {
             return;
         }
-        self.next_probe = Instant::now() + Duration::from_secs(self.config.check_limits);
-        let targets = self.probe_targets();
+        let at = Instant::now();
+        let targets = self.probe_round(time::now(), at);
+        let force = std::mem::take(&mut self.force_probe);
         if targets.is_empty() {
             return;
         }
+        // A check counts as tried for the whole login, so a failing one is
+        // not tried again at once through a twin.
+        let targets: Vec<_> = targets
+            .into_iter()
+            .map(|(id, home)| (self.one_login(&id), id, home))
+            .collect();
+        for (_, id, _) in &targets {
+            self.mark_tried(id, at);
+        }
+        let interval = self.config.check_limits as i64;
         let cwd = paths::config_dir().join("probe");
         let (tx, rx) = channel();
         std::thread::spawn(move || {
-            for (id, home) in targets {
+            for (login, id, home) in targets {
+                // Another open list may have read it in the meantime.
+                let read = login
+                    .iter()
+                    .filter_map(|i| Usage::load(i).limits_read_at())
+                    .max();
+                if !force && read.is_some_and(|t| time::now() - t < interval) {
+                    continue;
+                }
                 if let Ok(reading) = crate::probe::run(home.as_deref(), &cwd) {
                     let now = time::now();
                     let _ = Usage::update(&id, |u| u.record_probe(&reading, now));
@@ -1274,8 +1354,7 @@ impl App {
         self.setup = setup::state();
         self.start_herdr();
         self.start_info();
-        // The limits follow once the accounts are checked.
-        self.next_probe = Instant::now();
+        // The limits that are due follow once the accounts are checked.
     }
 
     pub fn flash(&mut self, text: impl Into<String>, color: Color) {
@@ -1713,6 +1792,8 @@ impl App {
                 );
             }
             self.info.insert(s.id.clone(), info);
+            // Its readings may be from the login it had before.
+            self.force_probe = true;
             self.mode = Mode::Message {
                 title: format!("{} is signed in", s.name),
                 lines,
@@ -2271,6 +2352,7 @@ impl App {
             KeyCode::Enter | KeyCode::Char(' ') => self.enter(),
             KeyCode::Char('r') => {
                 self.refresh_all();
+                self.force_probe = true;
                 self.flash("Refreshing", crate::theme::MUTED);
             }
             KeyCode::Char('F') => self.toggle_fallback(),
@@ -2496,9 +2578,7 @@ impl App {
             self.receive_info();
             self.receive_probe();
             self.receive_move();
-            if Instant::now() >= self.next_probe {
-                self.start_probe();
-            }
+            self.start_probe();
             if Instant::now() >= self.next_files {
                 self.reload_files();
             }
@@ -2522,6 +2602,26 @@ impl App {
             }
         }
         Ok(())
+    }
+}
+
+/// Whether the list's own pane is in front in Herdr: its space is the one
+/// shown and its tab that space's active tab. Anything unknown (outside
+/// Herdr, no answer, an older Herdr) counts as in view, so checks run as
+/// before.
+fn in_view(own: Option<&str>, panes: &[Pane], spaces: &[Workspace]) -> bool {
+    let Some(me) = own.and_then(|id| panes.iter().find(|p| p.id == id)) else {
+        return true;
+    };
+    let Some(space) = spaces.iter().find(|w| w.id == me.workspace) else {
+        return true;
+    };
+    if !space.focused {
+        return false;
+    }
+    match &space.active_tab {
+        Some(tab) if !me.tab.is_empty() => *tab == me.tab,
+        _ => true,
     }
 }
 
@@ -2735,6 +2835,7 @@ mod tests {
             label: "acme-app".into(),
             number: 1,
             focused: true,
+            active_tab: None,
             worktree: None,
         }];
         STORED.with(|s| *s.borrow_mut() = a.store.clone());
@@ -3712,6 +3813,7 @@ mod tests {
             label: label.into(),
             number,
             focused: false,
+            active_tab: None,
             worktree: tree.map(|(key, linked)| herdr::Worktree {
                 repo_key: key.into(),
                 linked,
@@ -5465,5 +5567,174 @@ mod tests {
                 assert!(whole, "{w}x{h}: {word} cut off\n{screen}");
             }
         }
+    }
+
+    /// Personal and Work, both subscriptions signed in with their own
+    /// login, checks every 300 seconds, readings from `ago` seconds back.
+    fn probing(ago: Option<i64>) -> (App, i64) {
+        let mut a = app();
+        a.store.accounts.push(Account {
+            id: "work".into(),
+            name: "Work".into(),
+            kind: Kind::Subscription,
+            sso: false,
+            fallback: true,
+        });
+        for id in ["personal", "work"] {
+            a.info.insert(id.into(), signed_in("Max"));
+        }
+        let now = 1_794_225_600;
+        if let Some(ago) = ago {
+            for id in ["personal", "work"] {
+                a.usage.insert(
+                    id.into(),
+                    Usage {
+                        probed_at: Some(now - ago),
+                        ..Usage::default()
+                    },
+                );
+            }
+        }
+        (a, now)
+    }
+
+    fn round(a: &App, now: i64) -> Vec<String> {
+        a.probe_round(now, Instant::now())
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect()
+    }
+
+    #[test]
+    fn a_fresh_status_line_reading_skips_the_check() {
+        let (mut a, now) = probing(Some(400));
+        assert_eq!(a.config.check_limits, 300);
+        // A running session on Work reported its limits with an answer a
+        // minute ago.
+        let mut u = Usage {
+            probed_at: Some(now - 400),
+            ..Usage::default()
+        };
+        u.record(
+            &serde_json::json!({"session_id": "s1", "cost": {"total_cost_usd": 0.4},
+                "rate_limits": {"five_hour": {"used_percentage": 40.0, "resets_at": now + 3600}}}),
+            now - 60,
+        );
+        a.usage.insert("work".into(), u);
+        assert_eq!(round(&a, now), vec!["personal"]);
+        // Once that report is older than the interval, Work is due again.
+        assert_eq!(round(&a, now + 241), vec!["personal", "work"]);
+    }
+
+    #[test]
+    fn a_status_line_call_without_limits_does_not_count() {
+        let (mut a, now) = probing(Some(400));
+        let mut u = Usage {
+            probed_at: Some(now - 400),
+            ..Usage::default()
+        };
+        // Before a session's first answer: no rate_limits yet.
+        u.record(&serde_json::json!({"session_id": "s1"}), now - 10);
+        a.usage.insert("work".into(), u);
+        assert_eq!(round(&a, now), vec!["personal", "work"]);
+    }
+
+    #[test]
+    fn checks_run_once_per_interval() {
+        // A new list with old readings checks at once.
+        let (mut a, now) = probing(Some(301));
+        assert_eq!(round(&a, now), vec!["personal", "work"]);
+        // Never read: due too.
+        let (b, now_b) = probing(None);
+        assert_eq!(round(&b, now_b), vec!["personal", "work"]);
+        // A reading younger than the interval: nothing to do.
+        a.usage.get_mut("personal").unwrap().probed_at = Some(now - 299);
+        a.usage.get_mut("work").unwrap().probed_at = Some(now - 299);
+        assert!(round(&a, now).is_empty());
+        // A check this list just tried (and that failed: no new reading) is
+        // not tried again before the interval is over.
+        a.usage.get_mut("work").unwrap().probed_at = Some(now - 600);
+        let tried = Instant::now();
+        a.probe_tried.insert("work".into(), tried);
+        assert!(round(&a, now).is_empty());
+        let later = |s| {
+            a.probe_round(now, tried + Duration::from_secs(s))
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect::<Vec<_>>()
+        };
+        assert!(later(299).is_empty());
+        assert_eq!(later(301), vec!["work"]);
+        // `r` checks every account, fresh or not.
+        a.probe_tried.clear();
+        a.usage.get_mut("work").unwrap().probed_at = Some(now - 1);
+        a.force_probe = true;
+        assert_eq!(round(&a, now), vec!["personal", "work"]);
+    }
+
+    #[test]
+    fn a_check_by_another_list_counts() {
+        let (mut a, now) = probing(Some(400));
+        // Another open list read Personal's /usage 20 seconds ago; this
+        // list sees it with its next read of the usage files.
+        a.usage.get_mut("personal").unwrap().probed_at = Some(now - 20);
+        assert_eq!(round(&a, now), vec!["work"]);
+    }
+
+    #[test]
+    fn twins_are_checked_once() {
+        let (mut a, now) = probing(Some(400));
+        a.twins.insert("personal".into(), vec!["work".into()]);
+        a.twins.insert("work".into(), vec!["personal".into()]);
+        assert_eq!(round(&a, now), vec!["personal"], "one login, one check");
+        // A check of one counts as tried for both: a failing login is not
+        // tried again at once through its twin.
+        a.mark_tried("personal", Instant::now());
+        assert!(round(&a, now).is_empty());
+        a.probe_tried.clear();
+        assert_eq!(a.one_login("personal"), vec!["personal", "work"]);
+        // A fresh reading of one counts for the other.
+        a.usage.get_mut("personal").unwrap().probed_at = Some(now - 5);
+        assert!(round(&a, now).is_empty());
+    }
+
+    #[test]
+    fn no_checks_while_out_of_view() {
+        let (mut a, now) = probing(Some(400));
+        a.own_pane = Some("w1:p9".into());
+        a.panes = vec![shell("w1:p9", "w1:t2")];
+        a.workspaces[0].active_tab = Some("w1:t1".into());
+        a.workspaces.push(Workspace {
+            id: "w2".into(),
+            label: "notes".into(),
+            number: 2,
+            focused: false,
+            active_tab: Some("w2:t1".into()),
+            worktree: None,
+        });
+        let view = |a: &App| in_view(a.own_pane.as_deref(), &a.panes, &a.workspaces);
+        // Another tab of its space is in front.
+        assert!(!view(&a));
+        // Its tab is in front.
+        a.workspaces[0].active_tab = Some("w1:t2".into());
+        assert!(view(&a));
+        // Another space is in front.
+        a.workspaces[0].focused = false;
+        a.workspaces[1].focused = true;
+        assert!(!view(&a));
+        a.in_view = view(&a);
+        assert!(round(&a, now).is_empty(), "nothing starts while hidden");
+        // Back in front: the accounts with old readings are due at once.
+        a.workspaces[0].focused = true;
+        a.workspaces[1].focused = false;
+        a.in_view = view(&a);
+        assert_eq!(round(&a, now), vec!["personal", "work"]);
+        // Herdr cannot tell: counts as in view.
+        assert!(in_view(None, &a.panes, &a.workspaces));
+        assert!(in_view(Some("w1:p1"), &a.panes, &a.workspaces));
+        a.workspaces[0].active_tab = None;
+        a.workspaces[0].focused = true;
+        assert!(view(&a));
+        assert!(in_view(Some("w1:p9"), &a.panes, &[]));
     }
 }

@@ -200,6 +200,25 @@ minute by default (`check_limits`, at least 30 seconds): enough to see a
 window fill up, little load, and nothing runs in the background when nobody
 looks. API keys and logins without limits are skipped.
 
+Changed on 2026-11-14 (#23): one check a minute per account was a full
+Claude Code start per account and minute, also for accounts whose running
+session already reports its limits through the status line. Now an account
+is checked only when its freshest reading (the status line's `limits_at`,
+set only by a call that carried limits after a new answer, which the
+session's cost changing shows, since an idle session repeats its last
+answer's windows; or `/usage`'s `probed_at` from any open list; among
+accounts with the same login) is older than `check_limits`, whose default
+became 300 seconds. The list looks at this on every tick rather than on one
+fixed timer, so while checks work and the list is in view a reading is
+never older than the interval plus one check; a check that failed is tried
+again after the interval. Checks also wait while the list is not in front:
+Herdr's `workspace list` (`focused`, `active_tab_id`) and `pane list` (each
+pane's tab) tell whether its space and tab are shown, polled every 5
+seconds already. Herdr's focus events were not used: a split list is
+visible while you type in the pane next to it. When Herdr cannot tell, the
+list counts as in view; Herdr does not say whether a client is attached or
+another pane of the tab is zoomed, so checks still run then.
+
 ## 2026-11-09: Sessions tab
 
 Renamed to the Agents tab on 2026-11-10 (see "Ending a session from the
