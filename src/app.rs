@@ -2885,6 +2885,45 @@ mod tests {
 
     #[test]
     fn a_limit_still_shows_on_an_account_on_its_old_folder() {
+        for w in [160, 100] {
+            let mut a = app();
+            a.info.insert(
+                "personal".into(),
+                Info {
+                    old_folder: true,
+                    ..signed_in("Pro")
+                },
+            );
+            let now = a.now();
+            a.usage.insert("personal".into(), full_at(97.0, now));
+            let mut t = Terminal::new(TestBackend::new(w, 30)).unwrap();
+            t.draw(|f| ui::draw(f, &mut a)).unwrap();
+            let buf = t.backend().buffer();
+            let rows: Vec<String> = (0..30)
+                .map(|y| (0..w).map(|x| buf[(x, y)].symbol().to_string()).collect())
+                .collect();
+            let screen = rows.join("\n");
+            if std::env::var("SHOW_SCREEN").is_ok() {
+                println!("{screen}");
+            }
+            // The sign-in-again notice on Personal's row, and the limit
+            // next to it where there is room (its column shows it anyway).
+            let row = rows
+                .iter()
+                .find(|r| r.contains(ui::OLD_FOLDER_NOTICE))
+                .unwrap_or_else(|| panic!("notice shown at {w}: {screen}"));
+            assert!(
+                screen.contains("97%"),
+                "limit in its column at {w}: {screen}"
+            );
+            if w == 160 {
+                assert!(row.contains("at its 5-hour limit"), "{screen}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_shared_login_still_shows_the_old_folder_notice() {
         let mut a = app();
         a.info.insert(
             "personal".into(),
@@ -2893,18 +2932,18 @@ mod tests {
                 ..signed_in("Pro")
             },
         );
-        let now = a.now();
-        a.usage.insert("personal".into(), full_at(97.0, now));
+        a.twins.insert("personal".into(), vec![MAIN_ID.into()]);
         let mut t = Terminal::new(TestBackend::new(160, 30)).unwrap();
         t.draw(|f| ui::draw(f, &mut a)).unwrap();
-        let screen: String = t
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(|c| c.symbol())
+        let buf = t.backend().buffer();
+        let rows: Vec<String> = (0..30)
+            .map(|y| (0..160).map(|x| buf[(x, y)].symbol().to_string()).collect())
             .collect();
-        assert!(screen.contains("at its 5-hour limit"), "{screen}");
+        let row = rows
+            .iter()
+            .find(|r| r.contains("same login as"))
+            .unwrap_or_else(|| panic!("{}", rows.join("\n")));
+        assert!(row.contains(ui::OLD_FOLDER_NOTICE), "{row}");
     }
 
     #[test]

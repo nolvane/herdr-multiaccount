@@ -41,6 +41,11 @@ All notable changes to this project are documented here. The format follows
   the main login. Accounts added with 1.0.0 have to sign in once more (`l`);
   their row and their sessions say so, and they keep working on their old
   folder until then. Nothing in `~/.claude` changes.
+- An account that still runs on its 1.0.0 folder is hard to miss: inside
+  Herdr every session started on it shows a notification before Claude Code
+  starts, naming the account, what Claude asks about (skills, `CLAUDE.md`,
+  memory) and `l` to stop it. Its row keeps the notice also while the
+  account is at its limit.
 - Closing the list while a session is being moved no longer stops the move
   halfway and leaves the session ended without a word: the move runs in a
   process of its own and finishes; a failure shows in the next list, or as

@@ -297,7 +297,7 @@ fn status_line(app: &App, a: &Account) -> Line<'static> {
     }
     if let Some(l) = limit {
         let choice = app.effective(&a.id);
-        let text = if choice.id != a.id && app.config.fallback {
+        let mut text = if choice.id != a.id && app.config.fallback {
             format!(
                 "at its {} limit · new sessions use {}",
                 l.window,
@@ -306,6 +306,11 @@ fn status_line(app: &App, a: &Account) -> Line<'static> {
         } else {
             format!("at its {} limit", l.window)
         };
+        // The limit never hides why Claude keeps asking: the notice comes
+        // first, since the limit also shows in its own column.
+        if info.is_some_and(|i| i.old_folder) {
+            text = format!("{OLD_FOLDER_NOTICE} · {text}");
+        }
         spans.push(Span::styled(text, Style::new().fg(YELLOW)));
         return Line::from(spans);
     }
