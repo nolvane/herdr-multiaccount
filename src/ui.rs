@@ -16,6 +16,48 @@ use ratatui::widgets::{Block, BorderType, Borders, Cell, Clear, Paragraph, Row, 
 use ratatui::Frame;
 use unicode_width::UnicodeWidthStr;
 
+/// The look of a key, wherever the list names one: bold and in the accent
+/// colour. Nothing else in a text has it (titles stand alone in a border).
+pub fn key_style() -> Style {
+    Style::new().fg(ACCENT).add_modifier(Modifier::BOLD)
+}
+
+/// A text with its keys (marked by `theme::keys`) in the look of a key
+/// and the rest in `style`. A text without marks comes back as it is.
+pub fn with_keys(text: impl AsRef<str>, style: Style) -> Vec<Span<'static>> {
+    // A key keeps the background of the text it stands in (a button).
+    let key = style.patch(key_style());
+    text.as_ref()
+        .split(theme::KEY_MARK)
+        .enumerate()
+        .filter(|(_, part)| !part.is_empty())
+        .map(|(i, part)| Span::styled(part.to_string(), if i % 2 == 1 { key } else { style }))
+        .collect()
+}
+
+/// `text` wrapped to `width`, with its keys drawn as keys. A key that the
+/// wrap splits (one with a space in it) stays a key on both lines.
+fn wrap_with_keys(text: &str, width: usize, style: Style) -> Vec<Line<'static>> {
+    let mut open = false;
+    wrap(text, width)
+        .into_iter()
+        .map(|l| {
+            let l = if open {
+                format!("{}{l}", theme::KEY_MARK)
+            } else {
+                l
+            };
+            open = l.matches(theme::KEY_MARK).count() % 2 == 1;
+            Line::from(with_keys(l, style))
+        })
+        .collect()
+}
+
+/// `with_keys` for a text in one colour.
+pub fn keyed(text: impl AsRef<str>, color: ratatui::style::Color) -> Vec<Span<'static>> {
+    with_keys(text, Style::new().fg(color))
+}
+
 pub fn draw(frame: &mut Frame, app: &mut App) {
     app.hits.clear();
     let icons = Icons {
@@ -131,7 +173,7 @@ fn draw_setup_notice(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect
     let line = Line::from(vec![
         Span::styled(format!(" {} ", icons.warning()), Style::new().fg(YELLOW)),
         Span::styled(format!("Not set up: {missing}.  "), Style::new().fg(TEXT)),
-        Span::styled("S", Style::new().fg(YELLOW).add_modifier(Modifier::BOLD)),
+        Span::styled("S", key_style()),
         Span::styled(" set up", Style::new().fg(MUTED)),
     ]);
     app.hits.push((area, Hit::Key('S')));
@@ -252,15 +294,18 @@ fn window_cell(w: Option<Window>, usage: &Usage, kind: Kind, now: i64) -> Text<'
 
 /// The row of an account that still runs on the folder an older version
 /// made.
-pub const OLD_FOLDER_NOTICE: &str = "l signs in again to stop edit prompts";
+/// `l` is a key (`theme::keys`).
+pub const OLD_FOLDER_NOTICE: &str = "`l` signs in again to stop edit prompts";
 
 /// The second line under an account's name: where it stands.
 fn status_line(app: &App, a: &Account) -> Line<'static> {
     let mut spans: Vec<Span<'static>> = Vec::new();
     if app.store.active == a.id {
+        // White, not the accent: bold accent means a key; the accent `●`
+        // in front of the row marks the active account.
         spans.push(Span::styled(
             "active",
-            Style::new().fg(ACCENT).add_modifier(Modifier::BOLD),
+            Style::new().fg(TEXT).add_modifier(Modifier::BOLD),
         ));
         spans.push(Span::styled(" · ", Style::new().fg(FAINT)));
     }
@@ -281,10 +326,10 @@ fn status_line(app: &App, a: &Account) -> Line<'static> {
         }
         Some(i) if !i.signed_in => {
             let text = match a.kind {
-                Kind::ApiKey => "no key stored · l adds it",
-                _ => "not signed in · l signs in",
+                Kind::ApiKey => "no key stored · `l` adds it",
+                _ => "not signed in · `l` signs in",
             };
-            spans.push(Span::styled(text, Style::new().fg(RED)));
+            spans.extend(keyed(theme::keys(text), RED));
             return Line::from(spans);
         }
         _ => {}
@@ -316,10 +361,7 @@ fn status_line(app: &App, a: &Account) -> Line<'static> {
     // Signed in on the folder an older version made: Claude asks before
     // every edit in ~/.claude until it signs in again in its new folder.
     if info.is_some_and(|i| i.old_folder) {
-        spans.push(Span::styled(
-            OLD_FOLDER_NOTICE.to_string(),
-            Style::new().fg(YELLOW),
-        ));
+        spans.extend(keyed(theme::keys(OLD_FOLDER_NOTICE), YELLOW));
         return Line::from(spans);
     }
     let mut parts: Vec<String> = Vec::new();
@@ -823,7 +865,8 @@ fn draw_footer(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
     if app.mode == Mode::AskQuit {
         let question = " Close the accounts list? ";
         let qw = question.width() as u16;
-        let line = Line::from(vec![
+        // The red button stays one block; the grey one shows its key.
+        let mut spans = vec![
             Span::styled(question, Style::new().fg(TEXT).add_modifier(Modifier::BOLD)),
             Span::styled(
                 " y close ",
@@ -833,8 +876,12 @@ fn draw_footer(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw(" "),
-            Span::styled(" any other key stays ", Style::new().fg(TEXT).bg(BORDER)),
-        ]);
+        ];
+        spans.extend(with_keys(
+            theme::keys(" `any other key` stays "),
+            Style::new().fg(TEXT).bg(BORDER),
+        ));
+        let line = Line::from(spans);
         app.hits
             .push((Rect::new(area.x + qw, area.y, 9, 1), Hit::Key('y')));
         app.hits
@@ -842,47 +889,48 @@ fn draw_footer(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
         frame.render_widget(Paragraph::new(line), area);
         return;
     }
-    let right = if let Some((text, color, _)) = &app.flash {
-        Span::styled(format!("{text} "), Style::new().fg(*color))
+    let right: Vec<Span> = if let Some((text, color, _)) = &app.flash {
+        keyed(format!("{text} "), *color)
     } else if let Some(m) = &app.moving {
         // For the whole move, not only a flash's 5 seconds; a long session
         // name is cut so the keys keep a third of the footer.
         let rest = format!(" to {}… ", m.to);
         let room = (area.width as usize * 2 / 3).saturating_sub("Moving ".len() + rest.width());
-        Span::styled(
+        vec![Span::styled(
             format!("Moving {}{rest}", shorten(&m.label, room.max(8))),
             Style::new().fg(ACCENT),
-        )
+        )]
     } else if app.info_loading {
-        Span::styled(
+        vec![Span::styled(
             format!("{} checking accounts… ", icons.refresh()),
             Style::new().fg(YELLOW),
-        )
+        )]
     } else if app.probing {
-        Span::styled(
+        vec![Span::styled(
             format!("{} reading limits… ", icons.refresh()),
             Style::new().fg(FAINT),
-        )
+        )]
     } else {
-        Span::styled(
+        vec![Span::styled(
             format!(
                 "{} read {} ago ",
                 icons.refresh(),
                 time::short(app.read_at.elapsed().as_secs() as i64)
             ),
             Style::new().fg(FAINT),
-        )
+        )]
     };
     let refresh = if app.flash.is_none() && app.moving.is_none() && !app.info_loading {
         vec![
-            Span::styled("r", Style::new().fg(MUTED).add_modifier(Modifier::BOLD)),
+            Span::styled("r", key_style()),
             Span::styled(" refresh  ", Style::new().fg(FAINT)),
         ]
     } else {
         vec![]
     };
     let key_w: u16 = refresh.iter().map(|s| s.width() as u16).sum();
-    let right_w = (right.width() as u16 + key_w).min(area.width);
+    let right_w: u16 = right.iter().map(|s| s.width() as u16).sum();
+    let right_w = (right_w + key_w).min(area.width);
     let [left_area, right_area] =
         Layout::horizontal([Constraint::Fill(1), Constraint::Length(right_w)]).areas(area);
     if key_w > 0 {
@@ -892,7 +940,7 @@ fn draw_footer(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
         ));
     }
     let mut rs = refresh;
-    rs.push(right);
+    rs.extend(right);
     frame.render_widget(
         Paragraph::new(Line::from(rs)).alignment(Alignment::Right),
         right_area,
@@ -932,10 +980,7 @@ fn draw_footer(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
         app.hits
             .push((Rect::new(x, area.y, width - 2, 1), Hit::Key(click)));
         x += width;
-        spans.push(Span::styled(
-            key,
-            Style::new().fg(MUTED).add_modifier(Modifier::BOLD),
-        ));
+        spans.push(Span::styled(key, key_style()));
         spans.push(Span::styled(text, Style::new().fg(FAINT)));
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), left_area);
@@ -1018,9 +1063,9 @@ fn draw_picker(frame: &mut Frame, app: &mut App, p: &crate::app::Picker) {
     );
     frame.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled("⏎", Style::new().fg(MUTED).add_modifier(Modifier::BOLD)),
+            Span::styled("⏎", key_style()),
             Span::styled(" choose  ", Style::new().fg(FAINT)),
-            Span::styled("Esc", Style::new().fg(MUTED).add_modifier(Modifier::BOLD)),
+            Span::styled("Esc", key_style()),
             Span::styled(" back", Style::new().fg(FAINT)),
         ])),
         foot,
@@ -1072,9 +1117,9 @@ fn draw_input(frame: &mut Frame, i: &crate::app::Input) {
     );
     frame.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled("⏎", Style::new().fg(MUTED).add_modifier(Modifier::BOLD)),
+            Span::styled("⏎", key_style()),
             Span::styled(" ok  ", Style::new().fg(FAINT)),
-            Span::styled("Esc", Style::new().fg(MUTED).add_modifier(Modifier::BOLD)),
+            Span::styled("Esc", key_style()),
             Span::styled(" cancel", Style::new().fg(FAINT)),
         ])),
         foot,
@@ -1123,41 +1168,45 @@ fn draw_confirm(frame: &mut Frame, app: &mut App, c: &crate::app::Confirm) {
     if hint {
         let left = app.confirm_max - app.confirm_scroll;
         let hint = if left == 0 {
-            "↑ ↓ scroll · end".to_string()
+            theme::keys("`↑ ↓` scroll · end")
         } else {
-            format!("↑ ↓ scroll · {left} more lines")
+            theme::keys(&format!("`↑ ↓` scroll · {left} more lines"))
         };
         frame.render_widget(
-            Paragraph::new(Span::styled(hint, Style::new().fg(FAINT))),
+            Paragraph::new(Line::from(keyed(hint, FAINT))),
             Rect::new(inner.x, inner.y + top + visible, inner.width, 1),
         );
     }
     let y = inner.y + inner.height.saturating_sub(1);
     // The buttons name the keys that answer; on a narrow pane the short
     // ones, so the no button shows whole.
+    // The no button is grey, so its keys show in the key look on it (the
+    // marks take no width); the green yes button stays one block.
     let full_yes = if c.enter_says_yes() {
         " ⏎ y yes "
     } else {
         " y yes "
     };
-    let (yes, no) = if full_yes.width() + 1 + " Esc n no ".width() <= inner.width as usize {
-        (full_yes, " Esc n no ")
+    let full_no = theme::keys(" `Esc` `n` no ");
+    let (yes, no) = if full_yes.width() + 1 + full_no.width() <= inner.width as usize {
+        (full_yes, full_no)
     } else {
-        (" y yes ", " n no ")
+        (" y yes ", theme::keys(" `n` no "))
     };
     let (yes_w, no_w) = (yes.width() as u16, no.width() as u16);
+    let mut buttons = vec![
+        Span::styled(
+            yes,
+            Style::new()
+                .fg(theme::on(GREEN))
+                .bg(GREEN)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" "),
+    ];
+    buttons.extend(with_keys(&no, Style::new().fg(TEXT).bg(BORDER)));
     frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(
-                yes,
-                Style::new()
-                    .fg(theme::on(GREEN))
-                    .bg(GREEN)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" "),
-            Span::styled(no, Style::new().fg(TEXT).bg(BORDER)),
-        ])),
+        Paragraph::new(Line::from(buttons)),
         Rect::new(inner.x, y, inner.width, 1),
     );
     let right = inner.x + inner.width;
@@ -1169,7 +1218,7 @@ fn draw_confirm(frame: &mut Frame, app: &mut App, c: &crate::app::Confirm) {
 
 fn key_hint(key: &'static str, what: &'static str) -> [Span<'static>; 2] {
     [
-        Span::styled(key, Style::new().fg(MUTED).add_modifier(Modifier::BOLD)),
+        Span::styled(key, key_style()),
         Span::styled(what, Style::new().fg(FAINT)),
     ]
 }
@@ -1200,9 +1249,9 @@ fn draw_sign_in(frame: &mut Frame, app: &mut App, code: &str) {
     lines.push(Line::from(""));
     let asks = s.output.to_lowercase().contains("paste code");
     if asks {
-        lines.push(Line::from(Span::styled(
-            "If the page shows a code, paste it here and press Enter:",
-            Style::new().fg(MUTED),
+        lines.push(Line::from(keyed(
+            theme::keys("If the page shows a code, paste it here and press `Enter`:"),
+            MUTED,
         )));
     }
     let spin = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -1285,9 +1334,7 @@ fn draw_message(frame: &mut Frame, app: &mut App, title: &str, text: &[String], 
         } else {
             Style::new().fg(if good { MUTED } else { YELLOW })
         };
-        for l in wrap(t, width.saturating_sub(6) as usize) {
-            lines.push(Line::from(Span::styled(l, style)));
-        }
+        lines.extend(wrap_with_keys(t, width.saturating_sub(6) as usize, style));
     }
     let area = centered(frame.area(), width, lines.len() as u16 + 5);
     let inner = dialog(frame, area, title);
@@ -1383,7 +1430,7 @@ fn draw_help(frame: &mut Frame, app: &mut App) {
                 ("y", "yes"),
                 ("n  Esc", "no"),
                 ("⏎", "yes on the move question; nothing on the others"),
-                ("", "any other key leaves the question open"),
+                ("", "`any other key` leaves the question open"),
             ],
         ),
         (
@@ -1405,36 +1452,39 @@ fn draw_help(frame: &mut Frame, app: &mut App) {
         if gi > 0 {
             lines.push(Line::from(""));
         }
+        // Headings in white: in the help, the accent colour means a key.
         lines.push(Line::from(Span::styled(
             *title,
-            Style::new().fg(ACCENT).add_modifier(Modifier::BOLD),
+            Style::new().fg(TEXT).add_modifier(Modifier::BOLD),
         )));
         for (k, what) in keys.iter() {
             if k.is_empty() {
-                lines.push(Line::from(Span::styled(*what, Style::new().fg(MUTED))));
+                lines.push(Line::from(keyed(theme::keys(what), MUTED)));
             } else {
-                lines.push(Line::from(vec![
-                    Span::styled(
-                        format!("{k:<18}"),
-                        Style::new().fg(TEXT).add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(*what, Style::new().fg(MUTED)),
-                ]));
+                // The key in the key look, the padding after it plain.
+                let mut spans = vec![
+                    Span::styled(k.to_string(), key_style()),
+                    Span::raw(" ".repeat(18usize.saturating_sub(k.width()))),
+                ];
+                spans.extend(keyed(theme::keys(what), MUTED));
+                lines.push(Line::from(spans));
             }
         }
     }
     let how = |width: usize| -> Vec<Line<'static>> {
         let mut out = vec![Line::from(Span::styled(
             "How it works",
-            Style::new().fg(ACCENT).add_modifier(Modifier::BOLD),
+            Style::new().fg(TEXT).add_modifier(Modifier::BOLD),
         ))];
         for (i, p) in crate::app::INTRO.iter().enumerate() {
             if i > 0 {
                 out.push(Line::from(""));
             }
-            for l in wrap(p, width) {
-                out.push(Line::from(Span::styled(l, Style::new().fg(MUTED))));
-            }
+            out.extend(wrap_with_keys(
+                &theme::keys(p),
+                width,
+                Style::new().fg(MUTED),
+            ));
         }
         out
     };
@@ -1523,12 +1573,15 @@ fn draw_help(frame: &mut Frame, app: &mut App) {
     if overflow {
         let at_end = app.help_scroll >= app.help_max;
         let hint = if at_end {
-            "↑ ↓ scroll · end".to_string()
+            theme::keys("`↑ ↓` scroll · end")
         } else {
-            format!("↑ ↓ scroll · {} more lines", app.help_max - app.help_scroll)
+            theme::keys(&format!(
+                "`↑ ↓` scroll · {} more lines",
+                app.help_max - app.help_scroll
+            ))
         };
         frame.render_widget(
-            Paragraph::new(Span::styled(hint, Style::new().fg(FAINT))),
+            Paragraph::new(Line::from(keyed(hint, FAINT))),
             Rect::new(inner.x, inner.y + visible, inner.width, 1),
         );
     }
@@ -1556,6 +1609,54 @@ mod tests {
         assert_eq!(
             wrap("run /a/very/long/path/name now", 10),
             vec!["run", "/a/very/lo", "ng/path/na", "me now"]
+        );
+    }
+
+    #[test]
+    fn marked_keys_wrap_where_the_plain_text_wraps() {
+        for p in crate::app::INTRO {
+            for width in [20, 37, 52, 72] {
+                let marked: Vec<String> = wrap(&theme::keys(p), width)
+                    .iter()
+                    .map(|l| theme::plain(l))
+                    .collect();
+                assert_eq!(marked, wrap(&p.replace('`', ""), width), "{width}: {p}");
+            }
+        }
+        // A key keeps the background of the button it stands on.
+        let grey = Style::new().fg(TEXT).bg(BORDER);
+        let spans = with_keys(theme::keys(" `n` no "), grey);
+        let shown: Vec<&str> = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(shown, vec![" ", "n", " no "]);
+        assert_eq!(spans[1].style.bg, Some(BORDER));
+        assert_eq!(spans[1].style.fg, Some(ACCENT));
+        assert_eq!(spans[2].style, grey);
+        assert_eq!(keyed("no keys", MUTED).len(), 1);
+    }
+
+    #[test]
+    fn a_key_split_by_the_wrap_stays_a_key_on_both_lines() {
+        let lines = wrap_with_keys(
+            &theme::keys("press `any other key` to stay here"),
+            12,
+            Style::new().fg(MUTED),
+        );
+        let looks: Vec<Vec<(String, bool)>> = lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| (s.content.to_string(), s.style.fg == Some(ACCENT)))
+                    .collect()
+            })
+            .collect();
+        assert_eq!(
+            looks,
+            vec![
+                vec![("press ".into(), false), ("any".into(), true)],
+                vec![("other key".into(), true), (" to".into(), false)],
+                vec![("stay here".into(), false)],
+            ]
         );
     }
 
