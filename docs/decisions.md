@@ -308,10 +308,15 @@ numbers could hide a twin's new `/usage` check. Twins now rank by
 `Usage::limits_read_at` (the newest check or status line answer that brought
 limits). A reading without that time (a file from before it was stored)
 ranks below every reading with one, and among such readings `updated_at`
-still decides; an account without any windows shares nothing. Falling back
-to `updated_at` per account was rejected: the list checks one account per
-login, so the other twin would never get a limits time of its own and could
-hide the checks for good.
+still decides; an account without any windows shares nothing. A window the
+freshest reading lacks (a `/usage` check never reads a spend limit) comes
+from the next freshest twin that has it, instead of being cleared. Falling
+back to `updated_at` per account was rejected: the list checks one account
+per login, so the other twin would never get a limits time of its own and
+could hide the checks for good. Merging each window across twins by its
+reset time and share (`usage::newer`) was rejected too: `/usage` prints
+reset times rounded, so the same window from a check and from the status
+line can look like two windows.
 
 ## 2026-11-09: Hardening after a source-only security audit
 

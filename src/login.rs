@@ -124,31 +124,35 @@ pub fn twins(store: &Store, logins: &HashMap<String, Login>) -> HashMap<String, 
 /// moves forward, also one that brings no limits; among such readings alone
 /// it still decides.
 fn read_at(u: &Usage) -> Option<(bool, i64)> {
+    if !u.has_windows() {
+        return None;
+    }
     match u.limits_read_at() {
         Some(t) => Some((true, t)),
-        None if u.has_windows() => u.updated_at.map(|t| (false, t)),
-        None => None,
+        None => u.updated_at.map(|t| (false, t)),
     }
 }
 
-/// Gives every account the limits of the freshest reading among its twins.
-/// Costs stay each account's own.
+/// Gives every account the limits of the freshest reading among its twins;
+/// a window that reading lacks (`/usage` shows no spend limit) comes from
+/// the next freshest that has it. Costs stay each account's own.
 pub fn share_limits(usage: &mut HashMap<String, Usage>, twins: &HashMap<String, Vec<String>>) {
     let before = usage.clone();
-    let empty = Usage::default();
     for (id, others) in twins {
-        let freshest = std::iter::once(id)
+        let mut readings: Vec<(Option<(bool, i64)>, &Usage)> = std::iter::once(id)
             .chain(others)
-            .map(|i| before.get(i).unwrap_or(&empty))
-            .max_by_key(|u| read_at(u))
-            .unwrap_or(&empty);
-        if read_at(freshest).is_none() {
+            .filter_map(|i| before.get(i))
+            .map(|u| (read_at(u), u))
+            .filter(|(at, _)| at.is_some())
+            .collect();
+        if readings.is_empty() {
             continue;
         }
+        readings.sort_by_key(|(at, _)| std::cmp::Reverse(*at));
         let u = usage.entry(id.clone()).or_default();
-        u.five_hour = freshest.five_hour;
-        u.seven_day = freshest.seven_day;
-        u.spend = freshest.spend.clone();
+        u.five_hour = readings.iter().find_map(|(_, r)| r.five_hour);
+        u.seven_day = readings.iter().find_map(|(_, r)| r.seven_day);
+        u.spend = readings.iter().find_map(|(_, r)| r.spend.clone());
     }
 }
 
@@ -320,6 +324,40 @@ mod tests {
         a.record(&answer(10.0, 1.0), T - 100);
         a.record(&answer(95.0, 1.5), T + 30);
         let usage = shared(a, checked());
+        assert_eq!(usage["a"].five_hour.unwrap().used, 95.0);
+        assert_eq!(usage["b"].five_hour.unwrap().used, 95.0);
+    }
+
+    #[test]
+    fn a_window_the_freshest_reading_lacks_comes_from_the_next() {
+        use crate::probe::Reading;
+        // A's answer brought a spend limit; B's newer check reads only the
+        // 5-hour and 7-day windows, which `/usage` shows.
+        let mut a = Usage::default();
+        a.record(
+            &json!({"session_id": "s1", "cost": {"total_cost_usd": 1.0},
+                "rate_limits": {"spend_limit": {"used_percentage": 100.0, "resets_at": T + 3600}}}),
+            T - 100,
+        );
+        let usage = shared(a.clone(), checked());
+        assert_eq!(usage["a"].five_hour.unwrap().used, 90.0);
+        assert_eq!(
+            usage["b"].spend, a.spend,
+            "B's check has no spend: A's stays"
+        );
+        assert_eq!(usage["a"].spend, a.spend);
+        // A check that read no window at all shares nothing.
+        let mut a = Usage::default();
+        a.record(&answer(95.0, 1.0), T - 100);
+        let mut empty = Usage::default();
+        empty.record_probe(
+            &Reading {
+                five_hour: None,
+                seven_day: None,
+            },
+            T,
+        );
+        let usage = shared(a, empty);
         assert_eq!(usage["a"].five_hour.unwrap().used, 95.0);
         assert_eq!(usage["b"].five_hour.unwrap().used, 95.0);
     }
