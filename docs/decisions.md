@@ -649,3 +649,21 @@ picking the account, so a limit fallback never lands on a signed-out
 account either; it still asks Claude Code once per start for a subscription
 (the cost #22 is about). Ask-then-fall-back was the owner's choice over
 falling back silently or only asking.
+
+## 2026-11-14: The status line command is written with `$HOME`
+
+Setup wrote the status line command into `~/.claude/settings.json` with the
+absolute path of the binary, so a `settings.json` kept under version control
+or shared held the user name (#19). It now writes
+`"$HOME/.config/herdr/plugins/config/multiaccount/bin/herdr-multiaccount" statusline`,
+the same path the shell function already uses. Claude Code runs the command
+in a shell, which expands `$HOME` inside the double quotes; `quotable()`
+still refuses a path that would break out of them. A config directory
+outside the home folder keeps the absolute path.
+
+Both spellings count as set up everywhere (the list's banner, `status`), so
+an existing setup keeps working and nothing is rewritten on its own. Only
+setup run by hand (`S`, `herdr-multiaccount setup`) moves an absolute-path
+command of the plugin to the `$HOME` form, after the usual backup: the
+owner's choice over leaving old commands alone or rewriting them when the
+plugin starts.

@@ -58,8 +58,14 @@ pub fn rc_file() -> Option<PathBuf> {
 
 /// The binary path as the shell should write it (`$HOME/...`).
 pub(crate) fn bin_for_shell() -> String {
-    let bin = paths::installed_bin();
-    match bin.strip_prefix(paths::home()) {
+    shell_path(&paths::installed_bin(), &paths::home())
+}
+
+/// `bin` with the home folder written as `$HOME`, so files the user keeps
+/// or shares hold no user name. A path outside the home folder (a config
+/// directory set with `HERDR_PLUGIN_CONFIG_DIR`) stays absolute.
+fn shell_path(bin: &Path, home: &Path) -> String {
+    match bin.strip_prefix(home) {
         Ok(rest) => format!("$HOME/{}", rest.to_string_lossy()),
         Err(_) => bin.to_string_lossy().to_string(),
     }
@@ -166,12 +172,31 @@ fn settings_file() -> PathBuf {
     paths::claude_dir().join("settings.json")
 }
 
-/// The status line command that records usage.
-fn statusline_command() -> String {
-    format!(
-        "\"{}\" statusline",
-        paths::installed_bin().to_string_lossy()
-    )
+/// The status line command that records usage, in its two spellings: the
+/// one setup writes (`$HOME/...`, expanded by the shell Claude Code runs it
+/// in) and the absolute one earlier versions wrote. Both count as set up.
+struct Commands {
+    written: String,
+    absolute: String,
+}
+
+impl Commands {
+    fn for_bin(bin: &Path, home: &Path) -> Self {
+        let command = |path: &str| format!("\"{path}\" statusline");
+        Commands {
+            written: command(&shell_path(bin, home)),
+            absolute: command(&bin.to_string_lossy()),
+        }
+    }
+
+    fn installed() -> Self {
+        Self::for_bin(&paths::installed_bin(), &paths::home())
+    }
+
+    /// The status line command of this version, in either spelling.
+    fn is_current(&self, command: &str) -> bool {
+        command == self.written || command == self.absolute
+    }
 }
 
 /// A status line command this plugin set, also under its old name.
@@ -180,18 +205,37 @@ fn is_ours(command: &str) -> bool {
         && command.trim_end().ends_with(" statusline")
 }
 
-/// The status line command of this version.
-fn is_current(command: &str) -> bool {
-    command == statusline_command()
+/// What setup does to the status line, given the command there now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StatuslineChange {
+    /// Already the command setup writes.
+    Nothing,
+    /// Ours, but with the absolute path: setup by hand writes the `$HOME`
+    /// form. Nothing else rewrites it.
+    Move,
+    /// Not wrapped yet, or an older wrapper of ours.
+    Wrap,
+}
+
+fn statusline_change(current: Option<&str>, commands: &Commands) -> StatuslineChange {
+    match current {
+        Some(c) if c == commands.written => StatuslineChange::Nothing,
+        Some(c) if commands.is_current(c) => StatuslineChange::Move,
+        _ => StatuslineChange::Wrap,
+    }
+}
+
+fn current_command() -> Option<String> {
+    read_settings()?["statusLine"]["command"]
+        .as_str()
+        .map(str::to_string)
 }
 
 pub fn state() -> State {
     let shell = rc_file()
         .and_then(|f| std::fs::read_to_string(f).ok())
         .is_some_and(|t| t.lines().any(|l| l.trim_end() == BEGIN));
-    let statusline = read_settings()
-        .and_then(|v| v["statusLine"]["command"].as_str().map(is_current))
-        .unwrap_or(false);
+    let statusline = current_command().is_some_and(|c| Commands::installed().is_current(&c));
     State { shell, statusline }
 }
 
@@ -256,10 +300,11 @@ fn write_through(path: &Path, text: &str) -> Result<(), String> {
 
 /// The settings with the status line wrapped (or unwrapped), and the
 /// command that ran before.
-pub fn wrap_statusline(
+fn wrap_statusline(
     settings: &Value,
     original: Option<&str>,
     on: bool,
+    commands: &Commands,
 ) -> (Value, Option<String>) {
     let mut v = settings.clone();
     if !v.is_object() {
@@ -267,12 +312,13 @@ pub fn wrap_statusline(
     }
     let current = v["statusLine"]["command"].as_str().map(str::to_string);
     if on {
-        if current.as_deref().is_some_and(is_current) {
+        if current.as_deref() == Some(commands.written.as_str()) {
             return (v, original.map(str::to_string));
         }
-        // An older wrapper of ours: point it at this version, keep yours.
+        // An older wrapper of ours, or ours with the absolute path: point it
+        // at this version in the `$HOME` form, keep yours.
         if current.as_deref().is_some_and(is_ours) {
-            v["statusLine"]["command"] = json!(statusline_command());
+            v["statusLine"]["command"] = json!(commands.written);
             return (v, original.map(str::to_string));
         }
         let mut line = match v.get("statusLine") {
@@ -280,7 +326,7 @@ pub fn wrap_statusline(
             _ => serde_json::Map::new(),
         };
         line.insert("type".into(), json!("command"));
-        line.insert("command".into(), json!(statusline_command()));
+        line.insert("command".into(), json!(commands.written));
         // Re-reads at least every 30 s, so limits stay fresh while idle.
         line.entry("refreshInterval").or_insert(json!(30));
         v["statusLine"] = Value::Object(line);
@@ -344,11 +390,16 @@ pub fn plan() -> Vec<String> {
             }
         }
     }
-    if !s.statusline {
-        out.push(format!(
+    match statusline_change(current_command().as_deref(), &Commands::installed()) {
+        _ if !s.statusline => out.push(format!(
             "wraps the status line in {} (yours keeps running)",
             settings_file().display()
-        ));
+        )),
+        StatuslineChange::Move => out.push(format!(
+            "writes the status line command in {} with $HOME in place of your home folder",
+            settings_file().display()
+        )),
+        _ => {}
     }
     out
 }
@@ -374,15 +425,21 @@ pub fn apply() -> Result<String, String> {
         write_through(&rc, &new)?;
         done.push("shell");
     }
-    if !s.statusline {
-        let file = settings_file();
-        let text = read_optional(&file)?;
-        let settings: Value = serde_json::from_str(text.as_deref().unwrap_or("{}"))
-            .map_err(|_| format!("{} is not valid JSON; not changed", file.display()))?;
+    let file = settings_file();
+    let text = read_optional(&file)?;
+    let settings: Value = serde_json::from_str(text.as_deref().unwrap_or("{}"))
+        .map_err(|_| format!("{} is not valid JSON; not changed", file.display()))?;
+    let commands = Commands::installed();
+    let change = statusline_change(settings["statusLine"]["command"].as_str(), &commands);
+    if change != StatuslineChange::Nothing {
         let mut new = Value::Null;
         Store::update(|store| {
-            let (wrapped, original) =
-                wrap_statusline(&settings, store.statusline_original.as_deref(), true);
+            let (wrapped, original) = wrap_statusline(
+                &settings,
+                store.statusline_original.as_deref(),
+                true,
+                &commands,
+            );
             store.statusline_original = original;
             new = wrapped;
         })
@@ -392,7 +449,11 @@ pub fn apply() -> Result<String, String> {
         }
         let out = serde_json::to_string_pretty(&new).unwrap_or_default();
         write_through(&file, &format!("{out}\n"))?;
-        done.push("status line");
+        done.push(if change == StatuslineChange::Move {
+            "status line (now with $HOME)"
+        } else {
+            "status line"
+        });
     }
     Ok(if done.is_empty() {
         "already set up".into()
@@ -419,7 +480,12 @@ pub fn undo() -> Result<String, String> {
         let settings: Value = serde_json::from_str(&text)
             .map_err(|_| format!("{} is not valid JSON; not changed", file.display()))?;
         let store = Store::try_load().map_err(|e| e.to_string())?;
-        let (new, _) = wrap_statusline(&settings, store.statusline_original.as_deref(), false);
+        let (new, _) = wrap_statusline(
+            &settings,
+            store.statusline_original.as_deref(),
+            false,
+            &Commands::installed(),
+        );
         if new != settings {
             backup(&file)?;
             let out = serde_json::to_string_pretty(&new).unwrap_or_default();
@@ -474,33 +540,149 @@ mod tests {
         assert!(b.trim_end().ends_with(END));
     }
 
+    const HOME: &str = "/home/alex";
+    const BIN: &str = "/home/alex/.config/herdr/plugins/config/multiaccount/bin/herdr-multiaccount";
+    const HOME_CMD: &str =
+        "\"$HOME/.config/herdr/plugins/config/multiaccount/bin/herdr-multiaccount\" statusline";
+    const ABS_CMD: &str =
+        "\"/home/alex/.config/herdr/plugins/config/multiaccount/bin/herdr-multiaccount\" statusline";
+
+    fn commands() -> Commands {
+        Commands::for_bin(Path::new(BIN), Path::new(HOME))
+    }
+
+    fn with_command(cmd: &str) -> Value {
+        json!({"model": "opus", "statusLine": {"type": "command", "command": cmd, "refreshInterval": 30}})
+    }
+
     #[test]
     fn statusline_wrap_and_unwrap() {
+        let c = commands();
         let s = json!({"model": "opus", "statusLine": {"type": "command", "command": "~/.claude/sl.sh", "refreshInterval": 10}});
-        let (on, original) = wrap_statusline(&s, None, true);
+        let (on, original) = wrap_statusline(&s, None, true, &c);
         assert_eq!(original.as_deref(), Some("~/.claude/sl.sh"));
         assert!(is_ours(on["statusLine"]["command"].as_str().unwrap()));
         assert_eq!(on["statusLine"]["refreshInterval"], 10);
         assert_eq!(on["model"], "opus");
         // Wrapping twice keeps the first original.
-        let (again, kept) = wrap_statusline(&on, original.as_deref(), true);
+        let (again, kept) = wrap_statusline(&on, original.as_deref(), true, &c);
         assert_eq!(again, on);
         assert_eq!(kept.as_deref(), Some("~/.claude/sl.sh"));
-        let (off, _) = wrap_statusline(&on, original.as_deref(), false);
+        let (off, _) = wrap_statusline(&on, original.as_deref(), false, &c);
         assert_eq!(off, s);
 
         let none = json!({"model": "opus"});
-        let (on, original) = wrap_statusline(&none, None, true);
+        let (on, original) = wrap_statusline(&none, None, true, &c);
         assert_eq!(original, None);
         assert_eq!(on["statusLine"]["refreshInterval"], 30);
-        let (off, _) = wrap_statusline(&on, None, false);
+        let (off, _) = wrap_statusline(&on, None, false, &c);
         assert_eq!(off, none);
+    }
 
+    #[test]
+    fn statusline_is_written_with_home() {
+        // A new setup writes `$HOME`, never the home folder itself.
+        let c = commands();
+        let (on, _) = wrap_statusline(&json!({"model": "opus"}), None, true, &c);
+        assert_eq!(on["statusLine"]["command"], HOME_CMD);
+        assert!(!on.to_string().contains(HOME));
+        let s = json!({"statusLine": {"type": "command", "command": "~/.claude/sl.sh"}});
+        let (on, _) = wrap_statusline(&s, None, true, &c);
+        assert_eq!(on["statusLine"]["command"], HOME_CMD);
+        assert!(!on.to_string().contains(HOME));
+        assert_eq!(statusline_change(None, &c), StatuslineChange::Wrap);
+        assert_eq!(
+            statusline_change(Some("~/.claude/sl.sh"), &c),
+            StatuslineChange::Wrap
+        );
+    }
+
+    #[test]
+    fn statusline_home_form_runs_in_a_shell() {
+        // Claude Code runs the command in a shell, which expands `$HOME`.
+        let home = std::env::temp_dir().join(format!("hm-setup-home-{}", std::process::id()));
+        let bin = home.join("bin/herdr-multiaccount");
+        std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+        std::fs::write(&bin, "#!/bin/sh\necho \"ran $1\"\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let c = Commands::for_bin(&bin, &home);
+        assert!(c.written.starts_with("\"$HOME/"));
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&c.written)
+            .env("HOME", &home)
+            .output()
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&home);
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "ran statusline\n");
+    }
+
+    #[test]
+    fn statusline_absolute_form_counts_and_moves_by_hand() {
+        let c = commands();
+        assert!(c.is_current(ABS_CMD));
+        assert_eq!(statusline_change(Some(ABS_CMD), &c), StatuslineChange::Move);
+        // Setup run by hand writes the `$HOME` form and keeps the original.
+        let (on, kept) = wrap_statusline(&with_command(ABS_CMD), Some("~/.claude/sl.sh"), true, &c);
+        assert_eq!(on, with_command(HOME_CMD));
+        assert_eq!(kept.as_deref(), Some("~/.claude/sl.sh"));
+    }
+
+    #[test]
+    fn statusline_home_form_counts_and_stays() {
+        let c = commands();
+        assert!(c.is_current(HOME_CMD));
+        assert_eq!(
+            statusline_change(Some(HOME_CMD), &c),
+            StatuslineChange::Nothing
+        );
+        let (on, kept) =
+            wrap_statusline(&with_command(HOME_CMD), Some("~/.claude/sl.sh"), true, &c);
+        assert_eq!(on, with_command(HOME_CMD));
+        assert_eq!(kept.as_deref(), Some("~/.claude/sl.sh"));
+    }
+
+    #[test]
+    fn statusline_undo_from_either_form() {
+        let c = commands();
+        for cmd in [HOME_CMD, ABS_CMD] {
+            let (off, _) = wrap_statusline(&with_command(cmd), Some("~/.claude/sl.sh"), false, &c);
+            assert_eq!(off["statusLine"]["command"], "~/.claude/sl.sh");
+            assert_eq!(off["model"], "opus");
+            let (off, _) = wrap_statusline(&with_command(cmd), None, false, &c);
+            assert_eq!(off, json!({"model": "opus"}));
+        }
+    }
+
+    #[test]
+    fn statusline_old_name_moves_to_home_form() {
         // A wrapper set under the plugin's old name points at this version
         // and keeps the original.
-        let old = json!({"statusLine": {"type": "command", "command": "\"/x/accounts/bin/herdr-accounts\" statusline", "refreshInterval": 30}});
-        let (on, kept) = wrap_statusline(&old, Some("~/.claude/sl.sh"), true);
-        assert!(is_current(on["statusLine"]["command"].as_str().unwrap()));
+        let c = commands();
+        let old = with_command(
+            "\"/home/alex/.config/herdr/plugins/config/accounts/bin/herdr-accounts\" statusline",
+        );
+        assert_eq!(
+            statusline_change(old["statusLine"]["command"].as_str(), &c),
+            StatuslineChange::Wrap
+        );
+        let (on, kept) = wrap_statusline(&old, Some("~/.claude/sl.sh"), true, &c);
+        assert_eq!(on, with_command(HOME_CMD));
         assert_eq!(kept.as_deref(), Some("~/.claude/sl.sh"));
+    }
+
+    #[test]
+    fn statusline_outside_home_stays_absolute() {
+        let c = Commands::for_bin(
+            Path::new("/srv/multiaccount/bin/herdr-multiaccount"),
+            Path::new(HOME),
+        );
+        let cmd = "\"/srv/multiaccount/bin/herdr-multiaccount\" statusline";
+        assert_eq!(c.written, cmd);
+        assert_eq!(c.absolute, cmd);
+        let (on, _) = wrap_statusline(&json!({}), None, true, &c);
+        assert_eq!(on["statusLine"]["command"], cmd);
+        assert_eq!(statusline_change(Some(cmd), &c), StatuslineChange::Nothing);
     }
 }
