@@ -171,9 +171,11 @@ session starts.
 - **Accounts from version 1.0.0** were kept in `homes/<account>/` itself.
   Claude Code ties a login to its folder's path, so these accounts sign in
   once more after the update: their row says `l signs in again to stop edit
-  prompts`, and sessions started on them say the same. Until then they keep
-  working on their old folder, where Claude asks before every edit in
-  `~/.claude`. Removing the account signs out and deletes both folders.
+  prompts` (also when the account is at its limit), and each session started
+  on them says the same, in Herdr as a notification before Claude Code
+  starts. Until then they keep working on their old folder, where Claude
+  asks before every edit in `~/.claude` (skills, `CLAUDE.md`, memory).
+  Removing the account signs out and deletes both folders.
 - **API keys** go into the system keychain (macOS Keychain, or the Secret
   Service through `secret-tool` on Linux). You paste the key into a field
   that shows dots; the plugin reads it only to start Claude Code with
