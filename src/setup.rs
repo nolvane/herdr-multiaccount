@@ -63,11 +63,17 @@ pub(crate) fn bin_for_shell() -> String {
 
 /// `bin` with the home folder written as `$HOME`, so files the user keeps
 /// or shares hold no user name. A path outside the home folder (a config
-/// directory set with `HERDR_PLUGIN_CONFIG_DIR`) stays absolute.
+/// directory set with `HERDR_PLUGIN_CONFIG_DIR`) stays absolute, and so
+/// does every path when the home folder is unknown (`HOME` unset or `/`).
 fn shell_path(bin: &Path, home: &Path) -> String {
-    match bin.strip_prefix(home) {
-        Ok(rest) => format!("$HOME/{}", rest.to_string_lossy()),
-        Err(_) => bin.to_string_lossy().to_string(),
+    let rest = if home.is_absolute() && home.parent().is_some() {
+        bin.strip_prefix(home).ok()
+    } else {
+        None
+    };
+    match rest {
+        Some(rest) => format!("$HOME/{}", rest.to_string_lossy()),
+        None => bin.to_string_lossy().to_string(),
     }
 }
 
@@ -391,7 +397,7 @@ pub fn plan() -> Vec<String> {
         }
     }
     match statusline_change(current_command().as_deref(), &Commands::installed()) {
-        _ if !s.statusline => out.push(format!(
+        StatuslineChange::Wrap => out.push(format!(
             "wraps the status line in {} (yours keeps running)",
             settings_file().display()
         )),
@@ -399,7 +405,7 @@ pub fn plan() -> Vec<String> {
             "writes the status line command in {} with $HOME in place of your home folder",
             settings_file().display()
         )),
-        _ => {}
+        StatuslineChange::Nothing => {}
     }
     out
 }
@@ -599,23 +605,31 @@ mod tests {
 
     #[test]
     fn statusline_home_form_runs_in_a_shell() {
-        // Claude Code runs the command in a shell, which expands `$HOME`.
-        let home = std::env::temp_dir().join(format!("hm-setup-home-{}", std::process::id()));
-        let bin = home.join("bin/herdr-multiaccount");
-        std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
-        std::fs::write(&bin, "#!/bin/sh\necho \"ran $1\"\n").unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let c = Commands::for_bin(&bin, &home);
+        // Claude Code runs the command in a shell, which expands `$HOME`
+        // inside the double quotes: the first word is the binary's path.
+        let c = commands();
         assert!(c.written.starts_with("\"$HOME/"));
         let out = std::process::Command::new("sh")
             .arg("-c")
-            .arg(&c.written)
-            .env("HOME", &home)
+            .arg(format!(
+                "set -- {}; printf '%s|%s' \"$1\" \"$2\"",
+                c.written
+            ))
+            .env("HOME", HOME)
             .output()
             .unwrap();
-        let _ = std::fs::remove_dir_all(&home);
-        assert_eq!(String::from_utf8_lossy(&out.stdout), "ran statusline\n");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            format!("{BIN}|statusline")
+        );
+    }
+
+    #[test]
+    fn statusline_unknown_home_stays_absolute() {
+        for home in ["/", ""] {
+            let c = Commands::for_bin(Path::new(BIN), Path::new(home));
+            assert_eq!(c.written, ABS_CMD);
+        }
     }
 
     #[test]
