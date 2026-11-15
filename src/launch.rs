@@ -1071,6 +1071,50 @@ mod tests {
     }
 
     #[test]
+    fn fallback_follows_the_newest_limits_of_twins() {
+        use crate::probe::{Probed, Reading};
+        let s = store();
+        let twins: HashMap<String, Vec<String>> = [
+            ("a".to_string(), vec!["c".to_string()]),
+            ("c".to_string(), vec!["a".to_string()]),
+        ]
+        .into();
+        // a answered with low numbers, then its new session made a call
+        // without limits after c's check, which says full.
+        let mut a = Usage::default();
+        a.record(
+            &json!({"session_id": "s1", "cost": {"total_cost_usd": 1.0},
+                "rate_limits": {"five_hour": {"used_percentage": 20.0, "resets_at": NOW + 600}}}),
+            NOW - 100,
+        );
+        a.record(&json!({"session_id": "s2"}), NOW + 10);
+        let mut c = Usage::default();
+        let full = Probed {
+            used: 99.0,
+            resets_at: Some(NOW + 600),
+        };
+        c.record_probe(
+            &Reading {
+                five_hour: Some(full),
+                seven_day: None,
+            },
+            NOW,
+        );
+        let mut usage: HashMap<String, Usage> = [("a".to_string(), a), ("c".to_string(), c)].into();
+        login::share_limits(&mut usage, &twins);
+        let chosen = choose(
+            &s,
+            &Config::default(),
+            &usage,
+            &|_| true,
+            "a".into(),
+            Source::Active,
+            NOW + 20,
+        );
+        assert_eq!(chosen.id, "main", "a and c share c's full reading");
+    }
+
+    #[test]
     fn never_moves_to_the_same_login() {
         let s = store();
         // c has the same login as a and no reading of its own; a is full.
