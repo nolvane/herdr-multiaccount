@@ -98,6 +98,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Mode::Input(i) => draw_input(frame, &i),
         Mode::Confirm(c) => draw_confirm(frame, app, &c),
         Mode::SignIn { code } => draw_sign_in(frame, app, &code),
+        Mode::Checking { title, line } => draw_checking(frame, app, &title, &line),
         Mode::Message { title, lines, good } => draw_message(frame, app, &title, &lines, good),
         _ => {}
     }
@@ -1254,21 +1255,25 @@ fn draw_sign_in(frame: &mut Frame, app: &mut App, code: &str) {
         &mut lines,
     );
     lines.push(Line::from(""));
-    let asks = s.output.to_lowercase().contains("paste code");
+    // The sign-in ended and the list checks who it signed in as: no code
+    // to paste and nothing to cancel any more.
+    let checking = app.checking_sign_in();
+    let asks = !checking && s.output.to_lowercase().contains("paste code");
     if asks {
         lines.push(Line::from(keyed(
             theme::keys("If the page shows a code, paste it here and press `Enter`:"),
             MUTED,
         )));
     }
-    let spin = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-    let tick = (s.started.elapsed().as_millis() / 120) as usize % spin.len();
-    let status = if s.code_sent {
-        format!("{} Checking the code…", spin[tick])
+    let tick = (s.started.elapsed().as_millis() / 120) as usize % SPIN.len();
+    let status = if checking {
+        format!("{} Checking the sign-in…", SPIN[tick])
+    } else if s.code_sent {
+        format!("{} Checking the code…", SPIN[tick])
     } else {
         format!(
             "{} Waiting for the sign-in  {}",
-            spin[tick],
+            SPIN[tick],
             time::short(s.started.elapsed().as_secs() as i64)
         )
     };
@@ -1315,6 +1320,14 @@ fn draw_sign_in(frame: &mut Frame, app: &mut App, code: &str) {
             foot.push(k);
             foot.push(w);
         };
+    if checking {
+        hint("q", " close the list", 'q', &mut foot);
+        frame.render_widget(
+            Paragraph::new(Line::from(foot)),
+            Rect::new(inner.x, foot_y, inner.width, 1),
+        );
+        return;
+    }
     if s.url.is_some() && code.is_empty() {
         hint("o", " open again  ", 'o', &mut foot);
         hint("y", " copy link  ", 'y', &mut foot);
@@ -1327,6 +1340,43 @@ fn draw_sign_in(frame: &mut Frame, app: &mut App, code: &str) {
         Paragraph::new(Line::from(foot)),
         Rect::new(inner.x, foot_y, inner.width, 1),
     );
+}
+
+/// The frames of the spinner in a dialog that waits.
+const SPIN: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+/// A dialog that waits for Claude Code's answer (`Mode::Checking`).
+fn draw_checking(frame: &mut Frame, app: &mut App, title: &str, line: &str) {
+    let width = 60u16.min(frame.area().width.saturating_sub(2)).max(24);
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or_default();
+    let spin = SPIN[(millis / 120) as usize % SPIN.len()];
+    let lines: Vec<Line> = wrap(&format!("{spin} {line}"), width.saturating_sub(6) as usize)
+        .into_iter()
+        .map(|l| Line::from(Span::styled(l, Style::new().fg(YELLOW))))
+        .collect();
+    let area = centered(frame.area(), width, lines.len() as u16 + 5);
+    let inner = dialog(frame, area, title);
+    frame.render_widget(
+        Paragraph::new(Text::from(lines)),
+        Rect::new(
+            inner.x,
+            inner.y + 1,
+            inner.width,
+            inner.height.saturating_sub(3),
+        ),
+    );
+    let y = inner.y + inner.height.saturating_sub(1);
+    let [k, w] = key_hint("Esc", " cancel");
+    let width = (k.width() + w.width()) as u16;
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![k, w])),
+        Rect::new(inner.x, y, inner.width, 1),
+    );
+    app.hits
+        .push((Rect::new(inner.x, y, width, 1), Hit::Key('\u{1b}')));
 }
 
 fn draw_message(frame: &mut Frame, app: &mut App, title: &str, text: &[String], good: bool) {
