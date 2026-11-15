@@ -301,6 +301,23 @@ reminder and the list all see the same numbers); costs stay per entry. The
 list says "same login as …" on both. API key accounts have no login and are
 never twins.
 
+Changed on 2026-11-14 (#28): "freshest" meant the newest `updated_at` or
+`probed_at`, but `updated_at` moves on every status line call, also one that
+brings no limits or only repeats an idle session's last answer, so old
+numbers could hide a twin's new `/usage` check. Twins now rank by
+`Usage::limits_read_at` (the newest check or status line answer that brought
+limits). A reading without that time (a file from before it was stored)
+ranks below every reading with one, and among such readings `updated_at`
+still decides; an account without any windows shares nothing. A window the
+freshest reading lacks (a `/usage` check never reads a spend limit) comes
+from the next freshest twin that has it, instead of being cleared. Falling
+back to `updated_at` per account was rejected: the list checks one account
+per login, so the other twin would never get a limits time of its own and
+could hide the checks for good. Merging each window across twins by its
+reset time and share (`usage::newer`) was rejected too: `/usage` prints
+reset times rounded, so the same window from a check and from the status
+line can look like two windows.
+
 ## 2026-11-09: Hardening after a source-only security audit
 
 A source-only security audit (quick profile) found no confirmed vulnerability and three leads. These changes close them
@@ -877,3 +894,60 @@ list reads `accounts.json` with
 note, instead of falling back to the main login alone. An account added
 for a sign-in that fails is still removed (the owner's decision on #25),
 and the dialog says so.
+
+## 2026-11-14: Sign-in checks in the background, and a limit for every `claude auth status`
+
+Two calls of `claude auth status` still ran on the thread that draws the
+list, with no time limit (#32): the check whether the main login is a
+Console profile before a claude.ai sign-in (`a` → subscription, `l` on a
+subscription), and the check of who an account is signed in as when its
+sign-in ended. The list froze for about a second, or for good when
+`claude` hung. Now:
+
+- every `claude auth status` runs through `launch::run_stoppable_within`
+  with a 30-second limit (`info::STATUS_LIMIT`, the same as each call of a
+  sign-out). `info::status_answer_within` tells an answer (even an empty
+  one) from none; `info::status_text` keeps `None` for both, so the
+  launcher's start check keeps its meaning ("could not ask, start
+  anyway") and only gains the limit;
+- no answer is not read as "no" in the list (the owner's decision on #32:
+  a slow `claude` never costs a working login). Before a claude.ai
+  sign-in, no answer (`info::main_login_profile` gives `None`) shows the
+  note "Could not check the main login" and starts no sign-in, which could
+  sign out a Console main login. After a sign-in, no answer
+  (`info::read_checked` says it got none) keeps the account, new or not,
+  without a sign-out, and the flash says its sign-in could not be checked;
+  the refresh that follows shows on its row whether it is signed in. A
+  check whose thread ends without an answer counts as no answer too;
+- the Console-profile check runs in a thread, like the sign-out of #16. A
+  small dialog ("Checking the main login…") stays in front until it
+  answers; `q` asks to close the list as anywhere. `Esc` cancels it: the
+  answer is dropped, while its `claude auth status` runs on until it ends
+  or reaches its limit (it is read only, and a list closed meanwhile stops
+  it); stopping it at once would need the thread to hand its process group
+  back, for a call that is harmless and at most 30 seconds long;
+- after a sign-in that ended well, the check of who it signed in as runs in
+  a thread too, and the sign-in dialog stays open with "Checking the
+  sign-in…" in place of its waiting line (no code field and no `Esc`, since
+  the sign-in itself has ended; `q` still closes the list). A sign-in that
+  failed asks nothing, as before;
+- an answer that comes while the close question is asked over one of these
+  dialogs waits until the question is answered, as the sign-out's does;
+- a list that closes stops the read-only checks that still run
+  (`launch::stop_running`, on every way out of `App::run` through a drop
+  guard): the thread that would stop one at its limit ends with the list,
+  and a call in a process group of its own gets no hangup from the closed
+  pane. Only `claude auth status` calls are noted for this. A sign-out's
+  `claude auth logout` and a limit reading (`claude -p /usage`) run through
+  plain `launch::run_within` and are never stopped half-way by a closing
+  list: a logout cut off could leave a login behind that the list then
+  believes gone. Closing the list during a sign-out still keeps the
+  account (#16), and a logout that hangs after the list closed runs on as
+  before this change.
+
+Staying in the normal view with only a footer line while the
+Console-profile check runs was rejected: its answer would either replace a
+dialog opened meanwhile or have to wait for it, and nothing would show why
+`a` did not go on. Both checks are fields of the list (`profile_checker`,
+`info_reader`, as `signer` is), so the tests never reach Claude Code; the
+sign-in refresh uses `info_reader` too.

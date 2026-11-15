@@ -105,6 +105,38 @@ pub type Signer = fn(&Account) -> Vec<PathBuf>;
 pub type FolderRemover = fn(&str) -> std::io::Result<Vec<String>>;
 pub type UsageRemover = fn(&str);
 
+/// Whether the main login is the machine-wide Console profile
+/// (`info::main_login_profile`, `None` for no answer), and who an account
+/// is signed in as with whether Claude Code answered (`info::read_checked`);
+/// fields so tests never reach Claude Code.
+pub type ProfileChecker = fn() -> Option<bool>;
+pub type InfoReader = fn(&Account) -> (Info, bool);
+
+/// What waits for the Console-profile check before a claude.ai sign-in.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AfterCheck {
+    /// The name of a new subscription is asked next (`a`).
+    Add(AddKind),
+    /// The account with this id signs in again (`l`).
+    SignIn(String),
+}
+
+/// The Console-profile check, running in the background so the list never
+/// waits on Claude Code.
+struct ProfileCheck {
+    then: AfterCheck,
+    rx: Receiver<Option<bool>>,
+}
+
+/// The check of who an account is signed in as after its sign-in ended
+/// well, running in the background; the sign-in dialog stays open until
+/// it answers.
+struct SignInCheck {
+    rx: Receiver<(Info, bool)>,
+    /// The account still ran on its old folder when the sign-in ended.
+    was_old: bool,
+}
+
 /// An account's sign-out, running in the background before the account
 /// goes, so the list never waits on Claude Code.
 pub struct SigningOut {
@@ -272,6 +304,12 @@ pub enum Mode {
     SignIn {
         code: String,
     },
+    /// Claude Code is asked something before the list goes on
+    /// (`App::profile_check`); `Esc` cancels.
+    Checking {
+        title: String,
+        line: String,
+    },
     /// A note to read, closed with Enter or Esc.
     Message {
         title: String,
@@ -397,6 +435,12 @@ pub struct App {
     /// Why `accounts.json` could not be read at the last try, while it
     /// cannot.
     store_error: Option<String>,
+    /// The Console-profile check before a claude.ai sign-in, while it runs.
+    profile_check: Option<ProfileCheck>,
+    pub profile_checker: ProfileChecker,
+    /// The check after a sign-in, while it runs.
+    sign_in_check: Option<SignInCheck>,
+    pub info_reader: InfoReader,
 }
 
 impl App {
@@ -482,6 +526,10 @@ impl App {
             },
             store_loader: Store::try_load,
             store_error: None,
+            profile_check: None,
+            profile_checker: info::main_login_profile,
+            sign_in_check: None,
+            info_reader: info::read_checked,
         };
         if let Some(e) = unread {
             app.store_unreadable(e, false);
@@ -583,15 +631,16 @@ impl App {
         self.next_info = Instant::now() + Duration::from_secs(600);
         let (tx, rx) = channel();
         self.begin_info();
+        let reader = self.info_reader;
         for account in self.store.accounts.clone() {
             let tx = tx.clone();
             std::thread::spawn(move || {
-                // Before `info::read`, which asks about this same folder: a
+                // Before the reader, which asks about this same folder: a
                 // sign-in that moves the account to its new folder throws
                 // the note away anyway (`forget_check`).
                 let folder =
                     (account.kind == Kind::Subscription).then(|| mirror::folder(&account.id));
-                let _ = tx.send((account.id.clone(), info::read(&account), folder));
+                let _ = tx.send((account.id.clone(), reader(&account).0, folder));
             });
         }
         self.info_rx = Some(rx);
@@ -1714,26 +1763,11 @@ impl App {
                     1 => AddKind::SubscriptionSso,
                     _ => AddKind::ApiKey,
                 };
-                if kind != AddKind::ApiKey && !self.subscription_allowed() {
-                    return;
+                if kind == AddKind::ApiKey {
+                    self.ask_name(kind);
+                } else {
+                    self.check_main_login(AfterCheck::Add(kind));
                 }
-                let suggestion = match kind {
-                    AddKind::ApiKey => "API key",
-                    _ => "Personal",
-                };
-                self.mode = Mode::Input(Input {
-                    title: "Name of the account".into(),
-                    hint: match kind {
-                        AddKind::ApiKey => {
-                            "Next you paste the key; it goes straight into the keychain."
-                        }
-                        _ => "Next Claude Code opens the browser: sign in with this account.",
-                    }
-                    .into(),
-                    text: suggestion.into(),
-                    purpose: InputFor::NewAccount(kind),
-                    secret: false,
-                });
             }
             PickFor::MoveSession(session) => {
                 if let Some(id) = item.value.as_deref() {
@@ -1757,6 +1791,25 @@ impl App {
                 );
             }
         }
+    }
+
+    /// The field for a new account's name.
+    fn ask_name(&mut self, kind: AddKind) {
+        let suggestion = match kind {
+            AddKind::ApiKey => "API key",
+            _ => "Personal",
+        };
+        self.mode = Mode::Input(Input {
+            title: "Name of the account".into(),
+            hint: match kind {
+                AddKind::ApiKey => "Next you paste the key; it goes straight into the keychain.",
+                _ => "Next Claude Code opens the browser: sign in with this account.",
+            }
+            .into(),
+            text: suggestion.into(),
+            purpose: InputFor::NewAccount(kind),
+            secret: false,
+        });
     }
 
     fn entered(&mut self, input: Input) {
@@ -1866,20 +1919,72 @@ impl App {
     }
 
     /// A claude.ai sign-in signs out the machine-wide Console profile, so
-    /// none starts while the main login is one.
-    fn subscription_allowed(&mut self) -> bool {
-        if !info::main_uses_profile() {
-            return true;
-        }
-        self.mode = Mode::Message {
-            title: "First change the main login".into(),
-            lines: vec![
-                "Your main login is a Claude Console sign-in without an API key. Claude Code keeps that one for the whole computer, and signing in any claude.ai account (Pro, Max, Team, Enterprise) signs it out.".into(),
-                "Sign the main login in again with an API key: in a terminal run claude auth login --console and choose \"Create an API key\". Then add the subscription here.".into(),
-            ],
-            good: false,
+    /// none starts while the main login is one. Asking Claude Code takes a
+    /// second (or up to `info::STATUS_LIMIT` when it hangs), so it is asked
+    /// in a thread; `receive_profile_check` goes on with `then`.
+    fn check_main_login(&mut self, then: AfterCheck) {
+        let (tx, rx) = channel();
+        let checker = self.profile_checker;
+        std::thread::spawn(move || {
+            let _ = tx.send(checker());
+        });
+        let title = match &then {
+            AfterCheck::Add(_) => "Add an account".to_string(),
+            AfterCheck::SignIn(id) => format!("Sign in {}", self.store.name_of(id)),
         };
-        false
+        self.profile_check = Some(ProfileCheck { then, rx });
+        self.mode = Mode::Checking {
+            title,
+            line: "Checking the main login…".into(),
+        };
+    }
+
+    /// Goes on once the Console-profile check answered: the note when the
+    /// main login is one, else the name field or the sign-in. Only while
+    /// its dialog is in front, so the close question asked over it stays.
+    fn receive_profile_check(&mut self) {
+        if !matches!(self.mode, Mode::Checking { .. }) {
+            return;
+        }
+        let Some(c) = &self.profile_check else {
+            return;
+        };
+        let console = match c.rx.try_recv() {
+            Ok(console) => console,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => None,
+        };
+        let then = self.profile_check.take().expect("checked above").then;
+        match console {
+            Some(false) => {}
+            Some(true) => {
+                self.mode = console_main_login();
+                return;
+            }
+            // No answer: no sign-in starts, since it could sign out a
+            // Console main login (the owner's decision on #32).
+            None => {
+                self.mode = main_login_unchecked();
+                return;
+            }
+        }
+        match then {
+            AfterCheck::Add(kind) => self.ask_name(kind),
+            AfterCheck::SignIn(id) => {
+                self.mode = Mode::Normal;
+                // It may have gone meanwhile (another list removed it).
+                if let Some(a) = self.store.account(&id).cloned() {
+                    if !self.is_signing_out(&id) {
+                        self.start_sign_in(&a, false);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Whether the check after a sign-in runs.
+    pub fn checking_sign_in(&self) -> bool {
+        self.sign_in_check.is_some()
     }
 
     fn start_sign_in(&mut self, account: &Account, new_account: bool) {
@@ -1988,8 +2093,25 @@ impl App {
         }
     }
 
-    /// Follows a running sign-in and shows how it ended.
+    /// Follows a running sign-in, checks who it signed in as when it ended
+    /// well, and shows how it ended.
     fn poll_sign_in(&mut self) {
+        if let Some(c) = &self.sign_in_check {
+            // Only while its dialog is in front, so the close question
+            // asked over it stays.
+            if !matches!(self.mode, Mode::SignIn { .. }) {
+                return;
+            }
+            let (info, answered) = match c.rx.try_recv() {
+                Ok(checked) => checked,
+                Err(std::sync::mpsc::TryRecvError::Empty) => return,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => (Info::default(), false),
+            };
+            let was_old = c.was_old;
+            self.sign_in_check = None;
+            self.finish_sign_in(info, answered, was_old, true);
+            return;
+        }
         let Some(s) = self.signin.as_mut() else {
             return;
         };
@@ -1997,21 +2119,34 @@ impl App {
         let Some(ok) = s.finished else {
             return;
         };
-        let s = self.signin.take().expect("checked above");
-        self.sign_in_ended(s, ok);
-        self.start_info();
+        let id = s.id.clone();
+        let was_old = self.info.get(&id).is_some_and(|i| i.old_folder);
+        match self.store.account(&id).cloned() {
+            // Asking Claude Code takes a second (or up to
+            // `info::STATUS_LIMIT` when it hangs): in a thread, with the
+            // dialog open until it answers.
+            Some(a) if ok => {
+                let (tx, rx) = channel();
+                let reader = self.info_reader;
+                std::thread::spawn(move || {
+                    let _ = tx.send(reader(&a));
+                });
+                self.sign_in_check = Some(SignInCheck { rx, was_old });
+            }
+            // A sign-in that failed needs no check (Claude Code may hang).
+            _ => self.finish_sign_in(Info::default(), true, was_old, ok),
+        }
     }
 
-    /// Shows how a sign-in ended (`ok`: Claude Code reported success).
-    fn sign_in_ended(&mut self, s: SignIn, ok: bool) {
-        let account = self.store.account(&s.id).cloned();
-        let was_old = self.info.get(&s.id).is_some_and(|i| i.old_folder);
-        // A sign-in that failed needs no check (Claude Code may hang).
-        let info = match &account {
-            Some(a) if ok => info::read(a),
-            _ => Info::default(),
+    /// Shows how the sign-in ended, from what the check after it found
+    /// (nothing for a sign-in that failed) and whether it answered; `ok`:
+    /// Claude Code reported success.
+    fn finish_sign_in(&mut self, info: Info, answered: bool, was_old: bool, ok: bool) {
+        let Some(s) = self.signin.take() else {
+            return;
         };
-        if ok && info.own_login() {
+        let account = self.store.account(&s.id).cloned();
+        if info.own_login() {
             // From now on the account stays on its new folder.
             mirror::mark_moved(&mirror::home_of(&s.id));
             let who = info
@@ -2049,6 +2184,18 @@ impl App {
                 lines,
                 good: same.is_empty(),
             };
+        } else if !answered {
+            // Claude Code did not answer: the sign-in may have worked, so
+            // the account stays, signed in or not, and the refresh below
+            // shows which (the owner's decision on #32).
+            self.mode = Mode::Normal;
+            self.flash(
+                format!(
+                    "{}: the sign-in could not be checked (Claude Code did not answer); the account stays",
+                    s.name
+                ),
+                crate::theme::YELLOW,
+            );
         } else {
             if s.new_account {
                 self.drop_new_account(&s.id);
@@ -2061,6 +2208,7 @@ impl App {
                 self.mode = sign_in_failed(&s, ok, kept);
             }
         }
+        self.start_info();
     }
 
     fn sign_in_again(&mut self) {
@@ -2079,11 +2227,7 @@ impl App {
                 };
             }
             Kind::ApiKey => self.mode = key_input(Some(a.id), a.name),
-            Kind::Subscription => {
-                if self.subscription_allowed() {
-                    self.start_sign_in(&a, false);
-                }
-            }
+            Kind::Subscription => self.check_main_login(AfterCheck::SignIn(a.id)),
         }
     }
 
@@ -2565,6 +2709,21 @@ impl App {
                 KeyCode::Down | KeyCode::Char('j') => self.scroll_message(1),
                 _ => {}
             },
+            Mode::Checking { .. } => match k.code {
+                KeyCode::Esc => {
+                    self.profile_check = None;
+                    self.mode = Mode::Normal;
+                }
+                KeyCode::Char('q') => self.ask_quit_over_dialog(),
+                _ => {}
+            },
+            // The sign-in ended and its check runs: nothing to cancel or
+            // paste any more, only the list to close.
+            Mode::SignIn { .. } if self.checking_sign_in() => {
+                if k.code == KeyCode::Char('q') {
+                    self.ask_quit_over_dialog();
+                }
+            }
             Mode::SignIn { mut code } => match k.code {
                 KeyCode::Esc => {
                     if let Some(s) = self.signin.as_mut() {
@@ -2605,6 +2764,12 @@ impl App {
             },
             Mode::Normal => self.normal_key(k),
         }
+    }
+
+    /// The close question over an open dialog, back to it on "stay".
+    fn ask_quit_over_dialog(&mut self) {
+        self.quit_over = Some(self.mode.clone());
+        self.mode = Mode::AskQuit;
     }
 
     fn normal_key(&mut self, k: KeyEvent) {
@@ -2784,7 +2949,7 @@ impl App {
                         input.text = input.text.chars().take(input.max_len()).collect();
                         self.mode = Mode::Input(input);
                     }
-                    Mode::SignIn { mut code } => {
+                    Mode::SignIn { mut code } if !self.checking_sign_in() => {
                         code.push_str(&clean);
                         code = code.chars().take(300).collect();
                         self.mode = Mode::SignIn { code };
@@ -2871,6 +3036,9 @@ impl App {
     }
 
     pub fn run(mut self, terminal: &mut DefaultTerminal) -> std::io::Result<()> {
+        // A check that waits on a `claude` that hangs would outlive the
+        // list: its thread, which stops it at the limit, ends with it.
+        let _stop_checks = OnExit(launch::stop_running);
         self.refresh_all();
         self.show_intro();
         while !self.quit {
@@ -2879,6 +3047,7 @@ impl App {
             self.receive_probe();
             self.receive_move();
             self.receive_sign_outs();
+            self.receive_profile_check();
             self.start_probe();
             if Instant::now() >= self.next_files {
                 self.reload_files();
@@ -2903,6 +3072,43 @@ impl App {
             }
         }
         Ok(())
+    }
+}
+
+/// The note when the main login is the machine-wide Console profile, which
+/// a claude.ai sign-in would sign out.
+fn console_main_login() -> Mode {
+    Mode::Message {
+        title: "First change the main login".into(),
+        lines: vec![
+            "Your main login is a Claude Console sign-in without an API key. Claude Code keeps that one for the whole computer, and signing in any claude.ai account (Pro, Max, Team, Enterprise) signs it out.".into(),
+            "Sign the main login in again with an API key: in a terminal run claude auth login --console and choose \"Create an API key\". Then add the subscription here.".into(),
+        ],
+        good: false,
+    }
+}
+
+/// The note when Claude Code did not say whether the main login is the
+/// Console profile: no claude.ai sign-in starts, since it could sign that
+/// profile out.
+fn main_login_unchecked() -> Mode {
+    Mode::Message {
+        title: "Could not check the main login".into(),
+        lines: vec![
+            "Claude Code did not answer within 30 seconds whether your main login is a Claude Console sign-in, which a claude.ai sign-in would sign out. So no sign-in was started.".into(),
+            "Try again in a moment. If it keeps happening, run claude auth status in a terminal to see what it waits for.".into(),
+        ],
+        good: false,
+    }
+}
+
+/// Runs its function when dropped: on every way out of a scope, also an
+/// early return through `?`.
+struct OnExit(fn());
+
+impl Drop for OnExit {
+    fn drop(&mut self) {
+        (self.0)();
     }
 }
 
@@ -3209,6 +3415,9 @@ mod tests {
         a.folder_remover = |_| Ok(vec![]);
         a.usage_remover = |_| {};
         a.store_loader = || Ok(stored());
+        // Claude Code is never asked: no Console profile, nobody signed in.
+        a.profile_checker = || Some(false);
+        a.info_reader = |_| (Info::default(), true);
         STORED.with(|s| *s.borrow_mut() = a.store.clone());
         a
     }
@@ -6448,8 +6657,20 @@ mod tests {
         a.mode = Mode::SignIn {
             code: String::new(),
         };
-        let ok = s.until_finished();
-        a.sign_in_ended(s, ok);
+        s.until_finished();
+        end_sign_in(a, s);
+    }
+
+    /// Lets the list's loop take a finished sign-in to its end, through the
+    /// check after it when it ended well.
+    fn end_sign_in(a: &mut App, s: SignIn) {
+        a.signin = Some(s);
+        let until = Instant::now() + Duration::from_secs(10);
+        while a.signin.is_some() || a.sign_in_check.is_some() {
+            assert!(Instant::now() < until, "the sign-in never ended");
+            a.poll_sign_in();
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     /// #25: a failed sign-in opens a dialog with Claude Code's whole
@@ -6554,7 +6775,7 @@ mod tests {
         let mut s = a.signin.take().unwrap();
         let ok = s.until_finished();
         assert!(!ok);
-        a.sign_in_ended(s, ok);
+        end_sign_in(&mut a, s);
         assert_eq!(a.mode, Mode::Normal);
         let flash = a.flash.as_ref().map(|f| f.0.clone()).unwrap_or_default();
         assert_eq!(flash, "Personal: sign-in cancelled");
@@ -7255,5 +7476,379 @@ mod tests {
         a.workspaces[0].focused = true;
         assert!(view(&a));
         assert!(in_view(Some("w1:p9"), &a.panes, &[]));
+    }
+
+    // ---- checks with Claude Code off the drawing thread (#32) ---------
+
+    /// Waits for a test's answer in `slot`, as a slow `claude` would (at
+    /// most 20 seconds), and keeps it for later calls.
+    fn answer_of<T: Clone>(slot: &std::sync::Mutex<Option<T>>) -> Option<T> {
+        let until = Instant::now() + Duration::from_secs(20);
+        while Instant::now() < until {
+            if let Some(v) = slot.lock().unwrap().clone() {
+                return Some(v);
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        None
+    }
+
+    /// Waits until `flag` is set, at most 10 seconds.
+    fn until_set(flag: &std::sync::atomic::AtomicBool) {
+        let end = Instant::now() + Duration::from_secs(10);
+        while !flag.load(std::sync::atomic::Ordering::SeqCst) {
+            assert!(Instant::now() < end, "the stand-in never answered");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Runs the list's loop steps until `done` holds.
+    fn until(a: &mut App, done: impl Fn(&App) -> bool) {
+        let end = Instant::now() + Duration::from_secs(10);
+        while !done(a) {
+            assert!(Instant::now() < end, "never got there: {:?}", a.mode);
+            a.receive_profile_check();
+            a.poll_sign_in();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn checking_title(a: &App) -> String {
+        match &a.mode {
+            Mode::Checking { title, line } => {
+                assert_eq!(line, "Checking the main login…");
+                title.clone()
+            }
+            m => panic!("not checking: {m:?}"),
+        }
+    }
+
+    fn message_title(a: &App) -> String {
+        match &a.mode {
+            Mode::Message { title, .. } => title.clone(),
+            m => panic!("no message: {m:?}"),
+        }
+    }
+
+    #[test]
+    fn adding_a_subscription_never_waits_for_the_profile_check() {
+        static ANSWER: std::sync::Mutex<Option<bool>> = std::sync::Mutex::new(None);
+        let mut a = app();
+        a.profile_checker = || answer_of(&ANSWER);
+        press(&mut a, KeyCode::Char('a'));
+        let started = Instant::now();
+        press(&mut a, KeyCode::Char('1'));
+        // The stand-in has not answered: a check on the drawing thread would
+        // still wait for it.
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(checking_title(&a), "Add an account");
+        let screen = screen_of(&mut a, 120, 30).join("\n");
+        assert!(screen.contains("Checking the main login…"), "{screen}");
+        assert!(screen.contains("Esc cancel"), "{screen}");
+        // The list keeps taking keys: other keys leave the dialog, the
+        // close question comes and goes back to it.
+        press(&mut a, KeyCode::Char('j'));
+        a.receive_profile_check();
+        assert_eq!(checking_title(&a), "Add an account");
+        press(&mut a, KeyCode::Char('q'));
+        assert_eq!(a.mode, Mode::AskQuit);
+        press(&mut a, KeyCode::Char('n'));
+        assert_eq!(checking_title(&a), "Add an account");
+        *ANSWER.lock().unwrap() = Some(false);
+        until(&mut a, |a| matches!(a.mode, Mode::Input(_)));
+        let Mode::Input(i) = &a.mode else {
+            unreachable!()
+        };
+        assert_eq!(i.purpose, InputFor::NewAccount(AddKind::Subscription));
+        assert!(a.profile_check.is_none());
+    }
+
+    #[test]
+    fn a_console_main_login_still_stops_a_subscription() {
+        static ANSWER: std::sync::Mutex<Option<bool>> = std::sync::Mutex::new(None);
+        let mut a = app();
+        a.profile_checker = || answer_of(&ANSWER);
+        press(&mut a, KeyCode::Char('a'));
+        press(&mut a, KeyCode::Char('2'));
+        assert_eq!(checking_title(&a), "Add an account");
+        *ANSWER.lock().unwrap() = Some(true);
+        until(&mut a, |a| matches!(a.mode, Mode::Message { .. }));
+        assert_eq!(message_title(&a), "First change the main login");
+        // An API key needs no check.
+        let mut a = app();
+        a.profile_checker = || panic!("an API key asked Claude Code");
+        press(&mut a, KeyCode::Char('a'));
+        press(&mut a, KeyCode::Char('3'));
+        assert!(matches!(a.mode, Mode::Input(_)));
+    }
+
+    #[test]
+    fn signing_in_again_never_waits_for_the_profile_check() {
+        static ANSWER: std::sync::Mutex<Option<bool>> = std::sync::Mutex::new(None);
+        let mut a = app_with("chk-again", "Again");
+        a.profile_checker = || answer_of(&ANSWER);
+        a.sign_in_starter = |a, _| {
+            let mut s = SignIn::showing("https://example.com/sign-in");
+            s.id = a.id.clone();
+            s.name = a.name.clone();
+            Ok(s)
+        };
+        let started = Instant::now();
+        press(&mut a, KeyCode::Char('l'));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(checking_title(&a), "Sign in Again");
+        assert!(a.signin.is_none(), "no sign-in before the answer");
+        *ANSWER.lock().unwrap() = Some(false);
+        until(&mut a, |a| matches!(a.mode, Mode::SignIn { .. }));
+        assert_eq!(a.signin.as_ref().unwrap().id, "chk-again");
+        if let Some(s) = a.signin.as_mut() {
+            s.cancel();
+        }
+    }
+
+    #[test]
+    fn a_profile_check_without_answer_starts_no_sign_in() {
+        // Claude Code did not answer within its limit, or the check ended
+        // without an answer: a note, and no sign-in that could sign out a
+        // Console main login (the owner's decision on #32).
+        for checker in [
+            (|| None) as ProfileChecker,
+            (|| panic!("no answer")) as ProfileChecker,
+        ] {
+            let mut a = app();
+            a.profile_checker = checker;
+            press(&mut a, KeyCode::Char('a'));
+            press(&mut a, KeyCode::Char('1'));
+            until(&mut a, |a| matches!(a.mode, Mode::Message { .. }));
+            assert_eq!(message_title(&a), "Could not check the main login");
+
+            let mut a = app_with("chk-unchecked", "Unchecked");
+            a.profile_checker = checker;
+            a.sign_in_starter = |_, _| panic!("a sign-in started without an answer");
+            press(&mut a, KeyCode::Char('l'));
+            until(&mut a, |a| matches!(a.mode, Mode::Message { .. }));
+            assert_eq!(message_title(&a), "Could not check the main login");
+            assert!(a.signin.is_none());
+        }
+    }
+
+    #[test]
+    fn esc_cancels_the_profile_check() {
+        static ANSWER: std::sync::Mutex<Option<bool>> = std::sync::Mutex::new(None);
+        static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        let mut a = app();
+        a.profile_checker = || {
+            let answer = answer_of(&ANSWER);
+            DONE.store(true, std::sync::atomic::Ordering::SeqCst);
+            answer
+        };
+        press(&mut a, KeyCode::Char('a'));
+        press(&mut a, KeyCode::Char('1'));
+        press(&mut a, KeyCode::Esc);
+        assert_eq!(a.mode, Mode::Normal);
+        assert!(!a.quit, "Esc never closes the list");
+        assert!(a.profile_check.is_none());
+        *ANSWER.lock().unwrap() = Some(false);
+        until_set(&DONE);
+        a.receive_profile_check();
+        assert_eq!(a.mode, Mode::Normal, "a late answer opens nothing");
+    }
+
+    #[test]
+    fn closing_during_the_profile_check_does_not_wait() {
+        static ANSWER: std::sync::Mutex<Option<bool>> = std::sync::Mutex::new(None);
+        let mut a = app();
+        a.profile_checker = || answer_of(&ANSWER);
+        press(&mut a, KeyCode::Char('a'));
+        let started = Instant::now();
+        press(&mut a, KeyCode::Char('1'));
+        press(&mut a, KeyCode::Char('q'));
+        press(&mut a, KeyCode::Char('y'));
+        assert!(a.quit);
+        assert!(started.elapsed() < Duration::from_secs(5));
+        *ANSWER.lock().unwrap() = Some(false);
+    }
+
+    /// `app_with` and a sign-in of that account that has just ended (`ok`),
+    /// for a new account when `new`. Only that account is in the list, so
+    /// the refresh after the sign-in looks at no folder an account of the
+    /// real config directory may have.
+    fn ended_sign_in(id: &str, name: &str, ok: bool, new: bool) -> App {
+        let mut a = app_with(id, name);
+        a.store.accounts.retain(|x| x.id == id);
+        a.sel = 0;
+        STORED.with(|s| *s.borrow_mut() = a.store.clone());
+        let account = a.store.account(id).cloned().unwrap();
+        a.sign_in_starter = |a, new| {
+            let mut s = SignIn::showing("https://example.com/sign-in");
+            s.id = a.id.clone();
+            s.name = a.name.clone();
+            s.new_account = new;
+            Ok(s)
+        };
+        a.start_sign_in(&account, new);
+        let s = a.signin.as_mut().unwrap();
+        // Stops the stand-in's process; the sign-in ended on its own, not
+        // by `Esc`.
+        s.cancel();
+        s.cancelled = false;
+        s.finished = Some(ok);
+        s.output = "Login successful.\n".into();
+        a
+    }
+
+    fn flash_of(a: &App) -> String {
+        a.flash.as_ref().map(|f| f.0.clone()).unwrap_or_default()
+    }
+
+    #[test]
+    fn the_end_of_a_sign_in_never_waits_for_its_check() {
+        static ANSWER: std::sync::Mutex<Option<(Info, bool)>> = std::sync::Mutex::new(None);
+        let mut a = ended_sign_in("chk-end", "Ended", true, false);
+        a.info_reader = |_| answer_of(&ANSWER).unwrap_or_default();
+        let started = Instant::now();
+        a.poll_sign_in();
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(a.checking_sign_in());
+        assert!(matches!(a.mode, Mode::SignIn { .. }), "the dialog stays");
+        let screen = screen_of(&mut a, 120, 40).join("\n");
+        assert!(screen.contains("Checking the sign-in…"), "{screen}");
+        assert!(!screen.contains("Esc cancel"), "{screen}");
+        // Nothing to cancel or paste any more; the list keeps redrawing.
+        press(&mut a, KeyCode::Esc);
+        press(&mut a, KeyCode::Char('x'));
+        a.event(Event::Paste("abc".into()));
+        assert_eq!(
+            a.mode,
+            Mode::SignIn {
+                code: String::new()
+            }
+        );
+        a.poll_sign_in();
+        assert!(a.checking_sign_in());
+        *ANSWER.lock().unwrap() = Some((
+            Info {
+                email: Some("alex@example.com".into()),
+                ..signed_in_info()
+            },
+            true,
+        ));
+        until(&mut a, |a| matches!(a.mode, Mode::Message { .. }));
+        let Mode::Message { title, lines, .. } = &a.mode else {
+            unreachable!()
+        };
+        assert_eq!(title, "Ended is signed in");
+        assert_eq!(lines[0], "Signed in as alex@example.com.");
+        assert!(a.signin.is_none());
+        assert!(!a.checking_sign_in());
+        assert!(a.info["chk-end"].own_login());
+    }
+
+    #[test]
+    fn a_sign_in_check_that_finds_no_login_shows_not_signed_in() {
+        let mut a = ended_sign_in("chk-out", "Out", true, true);
+        a.info_reader = |_| (Info::default(), true);
+        until(&mut a, |a| a.signin.is_none());
+        // Claude Code said it worked, the check found no login (#25's
+        // dialog).
+        let Mode::Message { title, lines, .. } = &a.mode else {
+            panic!("no notice: {:?}", a.mode)
+        };
+        assert_eq!(title, "Out was not signed in");
+        assert!(lines[0].contains("could not be confirmed"), "{lines:?}");
+        // A new account without a login goes, as before, once the notice
+        // is closed.
+        assert!(a.is_signing_out("chk-out"));
+        press(&mut a, KeyCode::Enter);
+        answer_sign_out("chk-out", vec![]);
+        until_signed_out(&mut a);
+        assert!(stored().account("chk-out").is_none());
+
+        // A sign-in that failed asks nothing.
+        let mut a = ended_sign_in("chk-failed", "Failed", false, false);
+        a.info_reader = |_| panic!("a failed sign-in asked Claude Code");
+        a.poll_sign_in();
+        assert!(a.signin.is_none());
+        assert!(!a.checking_sign_in());
+    }
+
+    #[test]
+    fn a_sign_in_check_without_answer_keeps_the_account() {
+        // Claude Code did not answer within its limit, or the check ended
+        // without an answer: the new account stays, with no sign-out (the
+        // owner's decision on #32).
+        for (id, reader) in [
+            ("chk-slow", (|_| (Info::default(), false)) as InfoReader),
+            ("chk-gone", (|_| panic!("no answer")) as InfoReader),
+        ] {
+            let mut a = ended_sign_in(id, "Slow", true, true);
+            a.info_reader = reader;
+            until(&mut a, |a| a.signin.is_none());
+            assert_eq!(a.mode, Mode::Normal);
+            assert_eq!(
+                flash_of(&a),
+                "Slow: the sign-in could not be checked (Claude Code did not answer); the account stays"
+            );
+            assert!(!a.is_signing_out(id), "{id}: no sign-out");
+            assert!(stored().account(id).is_some(), "{id}: kept");
+            assert!(!stored().retired.iter().any(|r| r == id));
+        }
+    }
+
+    #[test]
+    fn closing_during_the_sign_in_check_does_not_wait() {
+        static ANSWER: std::sync::Mutex<Option<(Info, bool)>> = std::sync::Mutex::new(None);
+        let mut a = ended_sign_in("chk-quit", "Quit", true, false);
+        a.info_reader = |_| answer_of(&ANSWER).unwrap_or_default();
+        let started = Instant::now();
+        a.poll_sign_in();
+        assert!(a.checking_sign_in());
+        press(&mut a, KeyCode::Char('q'));
+        assert_eq!(a.mode, Mode::AskQuit);
+        press(&mut a, KeyCode::Char('y'));
+        assert!(a.quit);
+        assert!(started.elapsed() < Duration::from_secs(5));
+        *ANSWER.lock().unwrap() = Some((Info::default(), true));
+    }
+
+    #[test]
+    fn an_answer_never_replaces_the_close_question() {
+        static ANSWER: std::sync::Mutex<Option<(Info, bool)>> = std::sync::Mutex::new(None);
+        static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        let mut a = ended_sign_in("chk-ask", "Asked", true, false);
+        a.info_reader = |_| {
+            let answer = answer_of(&ANSWER).unwrap_or_default();
+            DONE.store(true, std::sync::atomic::Ordering::SeqCst);
+            answer
+        };
+        a.poll_sign_in();
+        press(&mut a, KeyCode::Char('q'));
+        assert_eq!(a.mode, Mode::AskQuit);
+        *ANSWER.lock().unwrap() = Some((Info::default(), true));
+        until_set(&DONE);
+        for _ in 0..50 {
+            a.poll_sign_in();
+            assert_eq!(a.mode, Mode::AskQuit, "the question stays");
+        }
+        assert!(a.checking_sign_in());
+        // Staying: back to the dialog, and the answer that waited is shown.
+        press(&mut a, KeyCode::Char('n'));
+        until(&mut a, |a| a.signin.is_none());
+        let Mode::Message { title, .. } = &a.mode else {
+            panic!("no notice: {:?}", a.mode)
+        };
+        assert_eq!(title, "Asked was not signed in");
+    }
+
+    #[test]
+    fn what_runs_on_exit_runs_also_on_an_early_return() {
+        static RAN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        fn leaves_early() -> std::io::Result<()> {
+            let _stop = OnExit(|| RAN.store(true, std::sync::atomic::Ordering::SeqCst));
+            Err(std::io::Error::other("the terminal went away"))?;
+            Ok(())
+        }
+        assert!(leaves_early().is_err());
+        assert!(RAN.load(std::sync::atomic::Ordering::SeqCst));
     }
 }
