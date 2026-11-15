@@ -337,7 +337,7 @@ Everything lives in the plugin's config directory
 | `homes/<account>.new` | Notes that the account signed in in its new folder and never goes back to the old one |
 | `bin/herdr-multiaccount` | The copy the shell function and status line run |
 | `backups/` | Files replaced by setup or when a link was restored; only you can open it, and each copy keeps the original's permissions |
-| `probe/` | Where the limit checks run (empty) |
+| `probe/` | Where the limit checks, sign-ins, login checks and sign-outs run (empty) |
 | `sessions/<pane>.json` | The account of each session started through the plugin, removed when it ends |
 | `moving/<pane>.json` | A move that runs, with its result until a list or popup has shown it; only you can read it |
 | `conversations/<pane>.json` | Which conversation each Claude Code pane holds, from its status line; dropped after a week |

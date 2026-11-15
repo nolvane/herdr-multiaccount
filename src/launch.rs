@@ -389,7 +389,7 @@ fn sign_in_here(store: &Store, id: &str) -> bool {
 }
 
 /// The real `claude` on `PATH` (the shell function is not on `PATH`, and
-/// this binary never is called `claude`).
+/// this binary never is called `claude`), as an absolute path.
 pub fn find_claude() -> Option<PathBuf> {
     let me = std::env::current_exe()
         .ok()
@@ -407,13 +407,41 @@ pub fn find_claude() -> Option<PathBuf> {
         if candidate.canonicalize().ok() == me {
             continue;
         }
-        return Some(candidate);
+        // Absolute, since the plugin's own `claude` calls run in another
+        // folder (`in_work_dir`) than a relative PATH entry is meant for.
+        return Some(std::path::absolute(&candidate).unwrap_or(candidate));
     }
     // The installers' places, for shells whose PATH misses them.
     [".local/bin/claude", ".claude/local/claude"]
         .iter()
         .map(|p| paths::home().join(p))
         .find(|p| p.is_file())
+}
+
+/// The folder every `claude` the plugin starts for itself works in (the
+/// limit check, sign-in, `auth status`, `auth logout`), made if needed.
+/// Claude Code reads its working folder when it starts, so these never
+/// depend on where the list was opened: that folder may have been removed
+/// since, or macOS may block it. Sessions keep the folder they start in.
+/// In tests a temporary folder, never the real config directory.
+pub fn work_dir() -> PathBuf {
+    let dir = if cfg!(test) {
+        std::env::temp_dir().join(format!("hm-work-{}", std::process::id()))
+    } else {
+        paths::config_dir().join("probe")
+    };
+    let _ = std::fs::create_dir_all(&dir);
+    dir
+}
+
+/// Runs `cmd` in [`work_dir`] (where it inherits the caller's folder only
+/// when that one could not be made).
+pub fn in_work_dir(cmd: &mut Command) -> &mut Command {
+    let dir = work_dir();
+    if dir.is_dir() {
+        cmd.current_dir(dir);
+    }
+    cmd
 }
 
 /// Takes back what an outer start of this plugin set, so the account is

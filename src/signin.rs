@@ -7,6 +7,7 @@ use crate::launch;
 use crate::mirror;
 use crate::store::Account;
 use std::io::{Read, Write};
+use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{channel, Receiver};
 use std::time::Instant;
@@ -27,6 +28,11 @@ pub struct SignIn {
     pub finished: Option<bool>,
     pub started: Instant,
     pub code_sent: bool,
+    /// Ended by `cancel` (`Esc`), not by Claude Code.
+    pub cancelled: bool,
+    /// Claude Code ended (whether it reported success, and when), while
+    /// its last output may still be on the way.
+    exited: Option<(bool, Instant)>,
 }
 
 /// Text without terminal escape codes (colours, and the link markers that
@@ -92,6 +98,11 @@ fn login_command(account: &Account) -> Result<Command, String> {
     let dir = mirror::new_dir_of(&account.id);
     mirror::sync_at(&account.id, &dir).map_err(|e| format!("could not prepare its folder: {e}"))?;
     let claude = launch::find_claude().ok_or("claude was not found on PATH")?;
+    Ok(login_command_at(&claude, &dir, account.sso))
+}
+
+/// `claude auth login` with `claude`, signing in the folder `dir`.
+fn login_command_at(claude: &Path, dir: &Path, sso: bool) -> Command {
     let mut cmd = Command::new(claude);
     // Clean first, so CLAUDE_CONFIG_DIR set below stays.
     launch::clean_env(&mut cmd);
@@ -103,11 +114,12 @@ fn login_command(account: &Account) -> Result<Command, String> {
         cmd.env_remove(v);
     }
     cmd.args(["auth", "login", "--claudeai"]);
-    if account.sso {
+    if sso {
         cmd.arg("--sso");
     }
-    cmd.env("CLAUDE_CONFIG_DIR", &dir);
-    Ok(cmd)
+    cmd.env("CLAUDE_CONFIG_DIR", dir);
+    launch::in_work_dir(&mut cmd);
+    cmd
 }
 
 /// SIGINT, and the dispositions `signal` takes.
@@ -144,7 +156,16 @@ pub fn in_terminal(account: &Account) -> Result<bool, String> {
 
 impl SignIn {
     pub fn start(account: &Account, new_account: bool) -> Result<SignIn, String> {
-        let mut cmd = login_command(account)?;
+        SignIn::spawn(
+            login_command(account)?,
+            &account.id,
+            &account.name,
+            new_account,
+        )
+    }
+
+    /// Runs `cmd` as the sign-in of the account `id`.
+    fn spawn(mut cmd: Command, id: &str, name: &str, new_account: bool) -> Result<SignIn, String> {
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -179,8 +200,8 @@ impl SignIn {
             });
         }
         Ok(SignIn {
-            id: account.id.clone(),
-            name: account.name.clone(),
+            id: id.to_string(),
+            name: name.to_string(),
             new_account,
             stdin: child.stdin.take(),
             child,
@@ -190,7 +211,29 @@ impl SignIn {
             finished: None,
             started: Instant::now(),
             code_sent: false,
+            cancelled: false,
+            exited: None,
         })
+    }
+
+    /// A sign-in whose Claude Code is the shell script `script`, for tests.
+    #[cfg(test)]
+    pub fn scripted(script: &str, id: &str, name: &str, new_account: bool) -> SignIn {
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-c", script]);
+        SignIn::spawn(cmd, id, name, new_account).unwrap()
+    }
+
+    /// Polls until Claude Code ended, for tests.
+    #[cfg(test)]
+    pub fn until_finished(&mut self) -> bool {
+        let until = Instant::now() + std::time::Duration::from_secs(10);
+        while self.finished.is_none() {
+            assert!(Instant::now() < until, "the sign-in never ended");
+            self.poll();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        self.finished == Some(true)
     }
 
     /// A sign-in that shows `url`, for tests: a harmless child process
@@ -216,33 +259,50 @@ impl SignIn {
             finished: None,
             started: Instant::now(),
             code_sent: false,
+            cancelled: false,
+            exited: None,
         }
     }
 
-    /// Takes in new output and notices when Claude Code is done.
+    /// Takes in new output and notices when Claude Code is done: once it
+    /// ended and its output is in (both pipes closed, or half a second
+    /// later, since something it started may keep them open). Never waits.
     pub fn poll(&mut self) {
-        let mut raw = String::new();
-        while let Ok(chunk) = self.rx.try_recv() {
-            raw.push_str(&chunk);
+        let closed = self.take_output();
+        if self.finished.is_some() {
+            return;
         }
+        if self.exited.is_none() {
+            if let Ok(Some(status)) = self.child.try_wait() {
+                self.exited = Some((status.success(), Instant::now()));
+            }
+        }
+        if let Some((success, at)) = self.exited {
+            if closed || at.elapsed() >= std::time::Duration::from_millis(500) {
+                self.finished =
+                    Some(success && self.output.to_lowercase().contains("login successful"));
+            }
+        }
+    }
+
+    /// Takes the output that arrived since the last call, and the sign-in
+    /// link once it shows. True once both pipes are closed.
+    fn take_output(&mut self) -> bool {
+        let mut raw = String::new();
+        let closed = loop {
+            match self.rx.try_recv() {
+                Ok(chunk) => raw.push_str(&chunk),
+                Err(std::sync::mpsc::TryRecvError::Empty) => break false,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => break true,
+            }
+        };
         if !raw.is_empty() {
             if self.url.is_none() {
                 self.url = find_url(&raw);
             }
             self.output.push_str(&strip_escapes(&raw));
         }
-        if self.finished.is_none() {
-            if let Ok(Some(status)) = self.child.try_wait() {
-                // Late output still in the pipes.
-                std::thread::sleep(std::time::Duration::from_millis(50));
-                while let Ok(chunk) = self.rx.try_recv() {
-                    self.output.push_str(&strip_escapes(&chunk));
-                }
-                self.finished = Some(
-                    status.success() && self.output.to_lowercase().contains("login successful"),
-                );
-            }
-        }
+        closed
     }
 
     /// Passes a code from the sign-in page on to Claude Code.
@@ -258,24 +318,27 @@ impl SignIn {
         ok
     }
 
+    /// Stops the sign-in. One that Claude Code already ended is left to
+    /// `poll`, so its own end (and message) counts, not a cancel.
     pub fn cancel(&mut self) {
-        if self.finished.is_none() {
-            let _ = self.child.kill();
-            let _ = self.child.wait();
-            self.finished = Some(false);
+        if self.finished.is_some() {
+            return;
         }
+        if self.exited.is_some() || matches!(self.child.try_wait(), Ok(Some(_))) {
+            return;
+        }
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        self.finished = Some(false);
+        self.cancelled = true;
     }
 
-    /// The last thing Claude Code said, for a failed sign-in.
-    pub fn last_line(&self) -> String {
-        self.output
-            .lines()
-            .map(str::trim)
-            .rfind(|l| !l.is_empty())
-            .unwrap_or("")
-            .chars()
-            .take(120)
-            .collect()
+    /// Everything Claude Code printed, line by line, for a sign-in that
+    /// failed. Standard output and error are read apart, so their order is
+    /// not certain: nothing is left out on that account.
+    pub fn printed(&self) -> String {
+        let lines: Vec<&str> = self.output.lines().map(str::trim_end).collect();
+        lines.join("\n").trim_matches('\n').to_string()
     }
 }
 
@@ -300,5 +363,45 @@ mod tests {
         assert!(clean.contains("visit: https://claude.example/oauth?x=1&y=2\n"));
         assert!(clean.ends_with("prompted > ok"));
         assert!(!clean.contains('\u{1b}'));
+    }
+
+    /// #25: Claude Code reads its working folder when it starts, so the
+    /// sign-in runs in the plugin's own folder, never where the list was
+    /// opened (which may be gone or blocked by then).
+    #[test]
+    fn the_sign_in_runs_in_the_work_folder() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("hm-signin-cwd-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dir = root.join("account");
+        std::fs::create_dir_all(&dir).unwrap();
+        let claude = root.join("claude");
+        std::fs::write(
+            &claude,
+            "#!/bin/sh\npwd -P > \"$CLAUDE_CONFIG_DIR/cwd\"\necho \"$*\" > \"$CLAUDE_CONFIG_DIR/args\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Another test thread may still hold the file open while it starts
+        // a process ("text file busy"): try again for a moment.
+        let mut status = None;
+        for _ in 0..100 {
+            match login_command_at(&claude, &dir, true).status() {
+                Err(e) if e.raw_os_error() == Some(26) => {
+                    std::thread::sleep(std::time::Duration::from_millis(20))
+                }
+                other => {
+                    status = Some(other.unwrap());
+                    break;
+                }
+            }
+        }
+        assert!(status.unwrap().success());
+        let cwd = std::fs::read_to_string(dir.join("cwd")).unwrap();
+        let work = launch::work_dir().canonicalize().unwrap();
+        assert_eq!(cwd.trim(), work.to_string_lossy());
+        let args = std::fs::read_to_string(dir.join("args")).unwrap();
+        assert_eq!(args.trim(), "auth login --claudeai --sso");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

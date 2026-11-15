@@ -184,6 +184,7 @@ fn status_command(
     let mut cmd = std::process::Command::new(claude);
     // Clean first, so CLAUDE_CONFIG_DIR set below stays.
     launch::clean_env(&mut cmd);
+    launch::in_work_dir(&mut cmd);
     cmd.args(["auth", "status", "--text"])
         .stdin(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
